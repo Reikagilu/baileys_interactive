@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rsalcara — WhatsApp API</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1 class="logo">rsalcara</h1>
+      <p class="tagline">WhatsApp · Múltiplas contas e disparos</p>
+      <div class="api-key-wrap">
+        <label for="apiKey">API Key (opcional)</label>
+        <input type="password" id="apiKey" placeholder="x-api-key" autocomplete="off">
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button type="button" class="tab active" data-tab="conexoes">Conexões</button>
+      <button type="button" class="tab" data-tab="disparos">Disparos</button>
+    </nav>
+
+    <main class="main">
+      <section id="conexoes" class="panel active">
+        <div class="card">
+          <h2>Conexões salvas</h2>
+          <p class="card-hint">Clique em Conectar para abrir a sessão (QR se necessário).</p>
+          <ul id="savedList" class="saved-list"></ul>
+        </div>
+        <div class="card">
+          <h2>Conectar por nome</h2>
+          <div class="form-row">
+            <label for="connectInstanceSelect">Escolha uma conexão</label>
+            <select id="connectInstanceSelect">
+              <option value="">— Nova conexão —</option>
+            </select>
+          </div>
+          <div class="form-row" id="connectNewNameRow">
+            <label for="instanceName">Nome da nova instância</label>
+            <input type="text" id="instanceName" value="main" placeholder="ex: main, vendas">
+          </div>
+          <button type="button" id="btnConnect" class="btn btn-primary">Criar / Conectar</button>
+          <div id="qrContainer" class="qr-container hidden">
+            <p>Escaneie o QR no WhatsApp:</p>
+            <img id="qrImage" alt="QR Code" class="qr-image">
+            <p class="qr-hint">Ou abra WhatsApp → Aparelhos conectados → Conectar aparelho</p>
+          </div>
+          <div id="connectStatus" class="status hidden"></div>
+        </div>
+        <div class="card">
+          <h2>Instâncias ativas</h2>
+          <ul id="instanceList" class="instance-list"></ul>
+          <button type="button" id="btnRefreshList" class="btn btn-ghost">Atualizar lista</button>
+        </div>
+      </section>
+
+      <section id="disparos" class="panel">
+        <div class="card form-card">
+          <div class="form-row">
+            <label for="dispatchInstance">Instância</label>
+            <select id="dispatchInstance"><option value="main">main</option></select>
+          </div>
+          <div class="form-row">
+            <label for="dispatchTo">Destinatários</label>
+            <textarea id="dispatchTo" rows="4" placeholder="Um número por linha (com DDI)&#10;Ex: 553598828503&#10;5511999999999"></textarea>
+            <span class="field-hint">Use um número por linha. Para um único número, digite uma linha.</span>
+          </div>
+          <div class="form-row mailing-delay">
+            <label for="dispatchDelayMin">Intervalo entre envios (segundos)</label>
+            <div class="delay-inputs">
+              <input type="number" id="dispatchDelayMin" value="2" min="0" max="300" placeholder="Mín"> <span>a</span>
+              <input type="number" id="dispatchDelayMax" value="5" min="0" max="300" placeholder="Máx">
+            </div>
+            <span class="field-hint">Tempo aleatório entre cada envio (evita bloqueio).</span>
+          </div>
+          <div class="form-row">
+            <label for="dispatchType">Tipo de mensagem</label>
+            <select id="dispatchType">
+              <option value="menu">Menu (texto numerado)</option>
+              <option value="buttons">Botões (quick reply)</option>
+              <option value="interactive">Botões CTA (URL / Copiar / Ligar)</option>
+              <option value="list">Lista dropdown</option>
+              <option value="poll">Enquete</option>
+              <option value="carousel">Carrossel</option>
+            </select>
+          </div>
+
+          <!-- Menu -->
+          <div id="formMenu" class="dispatch-form">
+            <div class="form-row"><label>Título</label><input type="text" id="menuTitle" placeholder="Menu de Opções"></div>
+            <div class="form-row"><label>Texto</label><textarea id="menuText" rows="2" placeholder="Escolha uma opção:"></textarea></div>
+            <div class="form-row">
+              <label>Opções</label>
+              <div id="menuOptionsList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="menuOptions">+ Adicionar opção</button>
+            </div>
+            <div class="form-row"><label>Rodapé</label><input type="text" id="menuFooter" placeholder="Responda com número"></div>
+          </div>
+
+          <!-- Botões -->
+          <div id="formButtons" class="dispatch-form hidden">
+            <div class="form-row"><label>Texto</label><textarea id="buttonsText" rows="2" placeholder="Como posso ajudar?"></textarea></div>
+            <div class="form-row"><label>Rodapé</label><input type="text" id="buttonsFooter" placeholder="Atendimento 24h"></div>
+            <div class="form-row">
+              <label>Botões (máx 3)</label>
+              <div id="buttonsList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="buttons">+ Adicionar botão</button>
+            </div>
+          </div>
+
+          <!-- Interactive CTA -->
+          <div id="formInteractive" class="dispatch-form hidden">
+            <div class="form-row"><label>Texto</label><textarea id="interactiveText" rows="3" placeholder="Mensagem com CTAs"></textarea></div>
+            <div class="form-row"><label>Rodapé</label><input type="text" id="interactiveFooter"></div>
+            <div class="form-row">
+              <label>Botões CTA</label>
+              <div id="interactiveList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="interactive">+ Adicionar botão</button>
+            </div>
+          </div>
+
+          <!-- Lista -->
+          <div id="formList" class="dispatch-form hidden">
+            <div class="form-row"><label>Texto</label><textarea id="listText" rows="2" placeholder="Escolha uma categoria:"></textarea></div>
+            <div class="form-row"><label>Texto do botão</label><input type="text" id="listButtonText" value="Ver Cardápio" placeholder="Ver opções"></div>
+            <div class="form-row"><label>Rodapé</label><input type="text" id="listFooter" placeholder="Delivery grátis acima de R$ 50"></div>
+            <div class="form-row">
+              <label>Seções</label>
+              <div id="listSectionsList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="listSections">+ Adicionar seção</button>
+            </div>
+          </div>
+
+          <!-- Enquete -->
+          <div id="formPoll" class="dispatch-form hidden">
+            <div class="form-row"><label>Pergunta</label><input type="text" id="pollName" placeholder="Qual sua linguagem favorita?"></div>
+            <div class="form-row"><label>Quantas pode escolher</label><input type="number" id="pollSelectable" value="1" min="1"></div>
+            <div class="form-row">
+              <label>Opções</label>
+              <div id="pollOptionsList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="pollOptions">+ Adicionar opção</button>
+            </div>
+          </div>
+
+          <!-- Carrossel -->
+          <div id="formCarousel" class="dispatch-form hidden">
+            <div class="form-row"><label>Texto (acima dos cards)</label><input type="text" id="carouselText" placeholder="Ofertas especiais"></div>
+            <div class="form-row"><label>Rodapé</label><input type="text" id="carouselFooter"></div>
+            <div class="form-row">
+              <label>Cards</label>
+              <div id="carouselCardsList" class="dynamic-list"></div>
+              <button type="button" class="btn btn-small btn-ghost add-item" data-for="carouselCards">+ Adicionar card</button>
+            </div>
+          </div>
+
+          <button type="button" id="btnSend" class="btn btn-primary btn-send">Enviar</button>
+          <div id="sendResult" class="result hidden"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
