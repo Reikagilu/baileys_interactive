@@ -147,6 +147,10 @@ export function normalizePairingPhoneNumber(rawPhone: string, defaultCountryCode
   return digits;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function requestInstancePairingCode(
   name: string,
   phoneNumber: string
@@ -164,13 +168,51 @@ export async function requestInstancePairingCode(
     return { ok: false, error: 'pairing_code_not_supported' };
   }
 
-  try {
-    const pairingCode = await ctx.sock.requestPairingCode(phoneNumber);
-    return { ok: true, pairingCode, status: ctx.status };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: message, status: ctx.status };
+  let lastError = 'pairing_code_unavailable';
+
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const current = instances.get(name);
+    if (!current) {
+      return { ok: false, error: 'instance_not_found' };
+    }
+
+    if (current.status === 'connected') {
+      return { ok: false, error: 'instance_already_connected', status: current.status };
+    }
+
+    const requestPairingCode = current.sock.requestPairingCode;
+    if (typeof requestPairingCode !== 'function') {
+      return { ok: false, error: 'pairing_code_not_supported' };
+    }
+
+    try {
+      const pairingCode = await requestPairingCode(phoneNumber);
+      const code = String(pairingCode ?? '').trim();
+      if (code) {
+        return { ok: true, pairingCode: code, status: current.status };
+      }
+      lastError = 'empty_pairing_code';
+    } catch (err) {
+      const message = (err instanceof Error ? err.message : String(err)).trim();
+      const normalized = message.toLowerCase();
+
+      if (normalized.includes('not linked') || normalized.includes('registered') || normalized.includes('logged in')) {
+        return { ok: false, error: 'session_already_registered', status: current.status };
+      }
+
+      if (normalized.includes('connection closed') || normalized.includes('closed')) {
+        lastError = 'pairing_channel_not_ready';
+      } else {
+        lastError = message || 'pairing_code_unavailable';
+      }
+    }
+
+    if (attempt < 8) {
+      await sleep(1000);
+    }
   }
+
+  return { ok: false, error: lastError, status: instances.get(name)?.status };
 }
 
 /**
