@@ -135,6 +135,44 @@ export async function createInstance(
   }
 }
 
+export function normalizePairingPhoneNumber(rawPhone: string, defaultCountryCode: string): string {
+  const digits = rawPhone.replace(/\D/g, '');
+  if (!digits) return '';
+
+  const countryCode = defaultCountryCode.replace(/\D/g, '');
+  if (!countryCode) return digits;
+
+  if (digits.startsWith(countryCode)) return digits;
+  if (digits.length <= 11) return `${countryCode}${digits}`;
+  return digits;
+}
+
+export async function requestInstancePairingCode(
+  name: string,
+  phoneNumber: string
+): Promise<{ ok: boolean; pairingCode?: string; error?: string; status?: string }> {
+  const ctx = instances.get(name);
+  if (!ctx) {
+    return { ok: false, error: 'instance_not_found' };
+  }
+
+  if (ctx.status === 'connected') {
+    return { ok: false, error: 'instance_already_connected', status: ctx.status };
+  }
+
+  if (typeof ctx.sock.requestPairingCode !== 'function') {
+    return { ok: false, error: 'pairing_code_not_supported' };
+  }
+
+  try {
+    const pairingCode = await ctx.sock.requestPairingCode(phoneNumber);
+    return { ok: true, pairingCode, status: ctx.status };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message, status: ctx.status };
+  }
+}
+
 /**
  * Desconecta e remove a instância da memória (credenciais permanecem em disco).
  */

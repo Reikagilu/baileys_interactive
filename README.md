@@ -28,6 +28,8 @@ Variáveis em `.env`:
 | `PORT`      | Porta do servidor      | 8787   |
 | `API_KEY`   | Chave para header `x-api-key` (deixe vazio para desativar) | - |
 | `AUTH_FOLDER` | Pasta onde salvar credenciais por instância | auth |
+| `PAIRING_CODE_ENABLED` | Habilita geração de pairing code | true |
+| `PAIRING_DEFAULT_COUNTRY_CODE` | DDI padrão quando número vem sem DDI | 55 |
 
 ## Desenvolvimento
 
@@ -46,7 +48,7 @@ npm start
 
 Com o servidor rodando, acesse **http://localhost:8787**. A página inicial e os arquivos estáticos não exigem API key; apenas as rotas `/v1/*` usam o header `x-api-key` quando `API_KEY` está definida.
 
-- **Conexões**: listar conexões salvas (clique em Conectar), conectar por nome, ver QR (atualizado automaticamente), listar instâncias ativas com ações (Desconectar, Novo QR, Deletar). Status e QR são atualizados a cada 2 segundos enquanto a aba estiver aberta.
+- **Conexões**: listar conexões salvas (clique em Conectar), conectar por nome, escolher modo **QR Code** ou **Pairing Code**, ver QR/código (atualizado automaticamente), listar instâncias ativas com ações (Desconectar, Novo QR, Deletar). Status é atualizado a cada 2 segundos enquanto a aba estiver aberta.
 - **Disparos**: escolher instância, colar **lista de mailing** (um número por linha, com DDI), definir **intervalo mínimo e máximo** (em segundos) entre cada envio, escolher tipo de mensagem e preencher os campos (formulários dinâmicos com adicionar/remover). O envio é feito em lote com espera aleatória entre os números.
 
 ## Endpoints
@@ -62,6 +64,7 @@ O header **`x-api-key`** é obrigatório apenas nas rotas `/v1/*` quando `API_KE
 | GET    | `/v1/instances/saved` | Lista apenas nomes das conexões salvas (pastas em `auth/`) |
 | GET    | `/v1/instances/:name` | Status de uma instância |
 | GET    | `/v1/instances/:name/qr` | QR em base64 (quando status = qr) |
+| POST   | `/v1/instances/:name/pairing-code` | Gera pairing code (body: `{ "phoneNumber": "553598828503" }`) |
 | POST   | `/v1/instances/:name/disconnect` | Desconecta e remove da memória (credenciais ficam em disco) |
 | POST   | `/v1/instances/:name/logout` | Logout e apaga sessão em disco (próxima conexão gera novo QR) |
 | DELETE | `/v1/instances/:name` | Remove instância da memória (fecha socket) |
