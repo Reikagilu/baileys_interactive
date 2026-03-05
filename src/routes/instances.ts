@@ -151,10 +151,16 @@ router.post('/:name/pairing-code', async (req: Request, res: Response) => {
     if (result.error === 'instance_already_connected') {
       return res.status(409).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
     }
+    if (result.error === 'session_already_registered') {
+      return res.status(409).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
+    }
     if (result.error === 'instance_not_found') {
       return res.status(404).json({ ok: false, instance: name, error: result.error });
     }
-    return res.status(400).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
+    if (result.error === 'pairing_channel_not_ready' || result.error === 'empty_pairing_code' || result.error === 'pairing_code_unavailable') {
+      return res.status(503).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
+    }
+    return res.status(400).json({ ok: false, instance: name, error: result.error ?? 'pairing_code_failed', status: result.status ?? ctx.status });
   }
 
   return res.json({

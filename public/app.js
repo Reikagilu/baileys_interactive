@@ -110,20 +110,44 @@
     if (!rawPhone) {
       return { ok: false, error: 'Informe o número para gerar o pairing code.' };
     }
-    try {
-      const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/pairing-code`, {
-        method: 'POST',
-        headers: headers(),
-        body: JSON.stringify({ phoneNumber: rawPhone }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        return { ok: false, error: data.error || 'Erro ao gerar pairing code.' };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/pairing-code`, {
+          method: 'POST',
+          headers: headers(),
+          body: JSON.stringify({ phoneNumber: rawPhone }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          if (res.status === 503 && attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            continue;
+          }
+
+          const msgByCode = {
+            session_already_registered: 'Essa sessão já está autenticada. Use "Novo QR" para limpar e tentar de novo.',
+            pairing_channel_not_ready: 'Canal do WhatsApp ainda iniciando. Tente novamente em alguns segundos.',
+            empty_pairing_code: 'O WhatsApp não retornou código de pareamento. Tente novamente.',
+            pairing_code_unavailable: 'Não foi possível gerar o pairing code agora. Tente novamente em alguns segundos.',
+            pairing_code_disabled: 'Pairing code está desabilitado no servidor.',
+          };
+          return { ok: false, error: msgByCode[data.error] || data.error || 'Erro ao gerar pairing code.' };
+        }
+
+        if (!data.pairingCode) {
+          return { ok: false, error: 'Não foi possível obter o pairing code. Tente novamente.' };
+        }
+
+        return { ok: true, pairingCode: data.pairingCode, phoneNumber: data.phoneNumber || '' };
+      } catch (e) {
+        if (attempt >= 2) {
+          return { ok: false, error: e.message || 'Erro de rede ao gerar pairing code.' };
+        }
       }
-      return { ok: true, pairingCode: data.pairingCode || '', phoneNumber: data.phoneNumber || '' };
-    } catch (e) {
-      return { ok: false, error: e.message || 'Erro de rede ao gerar pairing code.' };
     }
+
+    return { ok: false, error: 'Não foi possível gerar pairing code.' };
   }
 
   async function doConnect(name) {
