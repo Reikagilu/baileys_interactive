@@ -6,7 +6,9 @@ import {
   createInstance,
   getInstance,
   getAllInstances,
+  normalizePairingPhoneNumber,
   removeInstance,
+  requestInstancePairingCode,
   disconnectInstance,
   logoutInstance,
 } from '../services/whatsapp.js';
@@ -108,6 +110,60 @@ router.get('/:name/qr', async (req: Request, res: Response) => {
   }
   const qrBase64 = await QRCode.toDataURL(ctx.qr, { width: 400, margin: 2 });
   return res.json({ ok: true, instance: name, qr: qrBase64 });
+});
+
+/**
+ * POST /v1/instances/:name/pairing-code
+ * Gera um pairing code para conectar sem QR.
+ */
+router.post('/:name/pairing-code', async (req: Request, res: Response) => {
+  if (!config.pairing.enabled) {
+    return res.status(403).json({ ok: false, error: 'pairing_code_disabled' });
+  }
+
+  const { name } = req.params;
+  const body = (req.body ?? {}) as { phoneNumber?: string; number?: string };
+  const rawPhone = String(body.phoneNumber ?? body.number ?? '').trim();
+  if (!rawPhone) {
+    return res.status(400).json({ ok: false, error: 'phone_number_required' });
+  }
+
+  const phoneNumber = normalizePairingPhoneNumber(rawPhone, config.pairing.defaultCountryCode);
+  if (!phoneNumber) {
+    return res.status(400).json({ ok: false, error: 'invalid_phone_number' });
+  }
+
+  let ctx = getInstance(name);
+  if (!ctx) {
+    const created = await createInstance(name, config.authFolder);
+    if (!created.ok) {
+      return res.status(500).json({ ok: false, instance: name, error: created.error ?? 'instance_create_failed' });
+    }
+    ctx = getInstance(name);
+  }
+
+  if (!ctx) {
+    return res.status(500).json({ ok: false, instance: name, error: 'instance_not_available' });
+  }
+
+  const result = await requestInstancePairingCode(name, phoneNumber);
+  if (!result.ok) {
+    if (result.error === 'instance_already_connected') {
+      return res.status(409).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
+    }
+    if (result.error === 'instance_not_found') {
+      return res.status(404).json({ ok: false, instance: name, error: result.error });
+    }
+    return res.status(400).json({ ok: false, instance: name, error: result.error, status: result.status ?? ctx.status });
+  }
+
+  return res.json({
+    ok: true,
+    instance: name,
+    status: result.status ?? ctx.status,
+    phoneNumber,
+    pairingCode: result.pairingCode,
+  });
 });
 
 /**

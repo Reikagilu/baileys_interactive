@@ -35,6 +35,18 @@
         <div class="card">
           <h2>Conectar por nome</h2>
           <div class="form-row">
+            <label for="connectMode">Modo de conexão</label>
+            <select id="connectMode">
+              <option value="qr">QR Code</option>
+              <option value="pairing">Pairing Code</option>
+            </select>
+          </div>
+          <div class="form-row hidden" id="connectPhoneRow">
+            <label for="pairingPhone">Número para Pairing Code</label>
+            <input type="text" id="pairingPhone" placeholder="553598828503">
+            <span class="field-hint">Digite com DDI. Ex: 55 + DDD + número.</span>
+          </div>
+          <div class="form-row">
             <label for="connectInstanceSelect">Escolha uma conexão</label>
             <select id="connectInstanceSelect">
               <option value="">— Nova conexão —</option>
@@ -45,6 +57,11 @@
             <input type="text" id="instanceName" value="main" placeholder="ex: main, vendas">
           </div>
           <button type="button" id="btnConnect" class="btn btn-primary">Criar / Conectar</button>
+          <div id="pairingContainer" class="qr-container hidden">
+            <p>Digite este código no WhatsApp:</p>
+            <p id="pairingCodeValue" class="logo"></p>
+            <p class="qr-hint">WhatsApp → Aparelhos conectados → Conectar aparelho → Conectar com número de telefone.</p>
+          </div>
           <div id="qrContainer" class="qr-container hidden">
             <p>Escaneie o QR no WhatsApp:</p>
             <img id="qrImage" alt="QR Code" class="qr-image">

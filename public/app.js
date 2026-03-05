@@ -44,6 +44,20 @@
 
   // Instância que estamos conectando (para atualizar QR e status em tempo real)
   let connectingInstanceName = null;
+  let connectingMode = 'qr';
+
+  const connectModeEl = document.getElementById('connectMode');
+  const connectPhoneRowEl = document.getElementById('connectPhoneRow');
+  const pairingContainerEl = document.getElementById('pairingContainer');
+  const pairingCodeValueEl = document.getElementById('pairingCodeValue');
+
+  connectModeEl.addEventListener('change', () => {
+    const isPairing = connectModeEl.value === 'pairing';
+    show(connectPhoneRowEl, isPairing);
+    if (!isPairing) {
+      show(pairingContainerEl, false);
+    }
+  });
 
   // --- Conexões: listar salvas e conectar ao clicar ---
   function renderSavedList(saved) {
@@ -91,12 +105,36 @@
     });
   }
 
+  async function requestPairingCode(name) {
+    const rawPhone = document.getElementById('pairingPhone').value.trim();
+    if (!rawPhone) {
+      return { ok: false, error: 'Informe o número para gerar o pairing code.' };
+    }
+    try {
+      const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/pairing-code`, {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ phoneNumber: rawPhone }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { ok: false, error: data.error || 'Erro ao gerar pairing code.' };
+      }
+      return { ok: true, pairingCode: data.pairingCode || '', phoneNumber: data.phoneNumber || '' };
+    } catch (e) {
+      return { ok: false, error: e.message || 'Erro de rede ao gerar pairing code.' };
+    }
+  }
+
   async function doConnect(name) {
     connectingInstanceName = name;
+    connectingMode = connectModeEl.value === 'pairing' ? 'pairing' : 'qr';
     const statusEl = document.getElementById('connectStatus');
     const qrContainer = document.getElementById('qrContainer');
     const qrImage = document.getElementById('qrImage');
     show(statusEl, false);
+    show(qrContainer, false);
+    show(pairingContainerEl, false);
     try {
       const res = await fetch(`${API}/v1/instances`, {
         method: 'POST',
@@ -111,13 +149,32 @@
         connectingInstanceName = null;
         return;
       }
+      if (connectingMode === 'pairing') {
+        const pairing = await requestPairingCode(name);
+        if (!pairing.ok) {
+          statusEl.textContent = pairing.error || 'Erro ao gerar pairing code';
+          statusEl.className = 'status error';
+          show(statusEl, true);
+          return;
+        }
+        pairingCodeValueEl.textContent = pairing.pairingCode;
+        show(pairingContainerEl, true);
+        show(qrContainer, false);
+        statusEl.textContent = `Pairing code gerado para ${pairing.phoneNumber || 'o número informado'}.`;
+        statusEl.className = 'status success';
+        show(statusEl, true);
+        refreshInstanceList();
+        return;
+      }
       if (data.qr) {
         qrImage.src = data.qr;
         show(qrContainer, true);
+        show(pairingContainerEl, false);
         statusEl.textContent = 'Escaneie o QR no WhatsApp.';
         statusEl.className = 'status success';
       } else if (data.status === 'connected') {
         show(qrContainer, false);
+        show(pairingContainerEl, false);
         statusEl.textContent = 'Conectado.';
         statusEl.className = 'status success';
         connectingInstanceName = null;
@@ -196,6 +253,7 @@
               document.getElementById('qrImage').src = data.qr;
               document.getElementById('instanceName').value = name;
               show(document.getElementById('qrContainer'), true);
+              show(pairingContainerEl, false);
               show(document.getElementById('connectStatus'), false);
             }
           } else if (action === 'disconnect') {
@@ -249,25 +307,34 @@
         if (connectingInstanceName) {
           const inst = data.instances.find((i) => i.instance === connectingInstanceName);
           if (inst) {
-            if (inst.status === 'qr') {
+            if (inst.status === 'qr' && connectingMode === 'qr') {
               try {
                 const qrRes = await fetch(`${API}/v1/instances/${encodeURIComponent(connectingInstanceName)}/qr`, { headers: headers() });
                 const qrData = await qrRes.json();
                 if (qrData.qr) {
                   qrImage.src = qrData.qr;
                   show(qrContainer, true);
+                  show(pairingContainerEl, false);
                   statusEl.textContent = 'Escaneie o QR no WhatsApp.';
                   statusEl.className = 'status success';
                   show(statusEl, true);
                 }
               } catch (_) {}
+            } else if (inst.status !== 'connected' && connectingMode === 'pairing') {
+              show(qrContainer, false);
+              show(pairingContainerEl, true);
+              statusEl.textContent = 'Digite o pairing code no WhatsApp para concluir a conexão.';
+              statusEl.className = 'status success';
+              show(statusEl, true);
             } else if (inst.status === 'connected') {
               show(qrContainer, false);
+              show(pairingContainerEl, false);
               statusEl.textContent = 'Conectado.';
               statusEl.className = 'status success';
               show(statusEl, true);
               connectingInstanceName = null;
             } else if (inst.status === 'disconnected') {
+              show(pairingContainerEl, false);
               statusEl.textContent = 'Desconectado. Clique em Conectar novamente.';
               statusEl.className = 'status error';
               show(statusEl, true);
@@ -283,6 +350,7 @@
   }
 
   document.getElementById('btnRefreshList').addEventListener('click', refreshInstanceList);
+  show(connectPhoneRowEl, false);
   refreshInstanceList();
 
   // Polling ativo: atualizar lista, QR e status a cada 2s quando a aba Conexões estiver visível
