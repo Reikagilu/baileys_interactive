@@ -159,6 +159,25 @@
     show(statusEl, false);
     show(qrContainer, false);
     show(pairingContainerEl, false);
+
+    if (connectingMode === 'pairing') {
+      const pairing = await requestPairingCode(name);
+      if (!pairing.ok) {
+        statusEl.textContent = pairing.error || 'Erro ao gerar pairing code';
+        statusEl.className = 'status error';
+        show(statusEl, true);
+        return;
+      }
+      pairingCodeValueEl.textContent = pairing.pairingCode;
+      show(pairingContainerEl, true);
+      show(qrContainer, false);
+      statusEl.textContent = `Pairing code gerado para ${pairing.phoneNumber || 'o número informado'}.`;
+      statusEl.className = 'status success';
+      show(statusEl, true);
+      refreshInstanceList();
+      return;
+    }
+
     try {
       const res = await fetch(`${API}/v1/instances`, {
         method: 'POST',
@@ -171,23 +190,6 @@
         statusEl.className = 'status error';
         show(statusEl, true);
         connectingInstanceName = null;
-        return;
-      }
-      if (connectingMode === 'pairing') {
-        const pairing = await requestPairingCode(name);
-        if (!pairing.ok) {
-          statusEl.textContent = pairing.error || 'Erro ao gerar pairing code';
-          statusEl.className = 'status error';
-          show(statusEl, true);
-          return;
-        }
-        pairingCodeValueEl.textContent = pairing.pairingCode;
-        show(pairingContainerEl, true);
-        show(qrContainer, false);
-        statusEl.textContent = `Pairing code gerado para ${pairing.phoneNumber || 'o número informado'}.`;
-        statusEl.className = 'status success';
-        show(statusEl, true);
-        refreshInstanceList();
         return;
       }
       if (data.qr) {

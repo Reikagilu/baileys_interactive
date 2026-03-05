@@ -146,6 +146,18 @@ router.post('/:name/pairing-code', async (req: Request, res: Response) => {
     return res.status(500).json({ ok: false, instance: name, error: 'instance_not_available' });
   }
 
+  if (ctx.status === 'qr') {
+    disconnectInstance(name);
+    const recreated = await createInstance(name, config.authFolder);
+    if (!recreated.ok) {
+      return res.status(500).json({ ok: false, instance: name, error: recreated.error ?? 'instance_recreate_failed' });
+    }
+    ctx = getInstance(name);
+    if (!ctx) {
+      return res.status(500).json({ ok: false, instance: name, error: 'instance_not_available' });
+    }
+  }
+
   const result = await requestInstancePairingCode(name, phoneNumber);
   if (!result.ok) {
     if (result.error === 'instance_already_connected') {
