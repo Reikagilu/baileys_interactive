@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-03-05T00:00:00Z",
+  "last_updated": "2026-03-06T00:00:00Z",
   "libraries": {
     "chatwoot": {
       "files": [
@@ -20,6 +20,24 @@
           "topic": "webhook external events and optional api auth",
           "tech_stack": "n8n",
           "fetched": "2026-03-05T00:00:00Z",
+          "source": "Context7 API"
+        }
+      ]
+    },
+    "docker": {
+      "files": [
+        {
+          "filename": "nodejs-production-dockerfile-compose.md",
+          "topic": "nodejs production dockerfile and docker compose best practices",
+          "tech_stack": "Node.js production (baileys_interactive)",
+          "fetched": "2026-03-06T00:00:00Z",
+          "source": "Context7 API"
+        },
+        {
+          "filename": "git-dependencies-buildkit.md",
+          "topic": "private git dependencies with BuildKit ssh/secrets",
+          "tech_stack": "Node.js production build",
+          "fetched": "2026-03-06T00:00:00Z",
           "source": "Context7 API"
         }
       ]
