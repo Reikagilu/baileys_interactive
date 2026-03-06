@@ -1,0 +1,28 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-03-05T00:00:00Z",
+  "libraries": {
+    "chatwoot": {
+      "files": [
+        {
+          "filename": "outbound-integration-application-api.md",
+          "topic": "outbound integration setup for create/update conversations and messages",
+          "tech_stack": "external system -> Chatwoot Application API",
+          "fetched": "2026-03-05T00:00:00Z",
+          "source": "Context7 API + Official docs"
+        }
+      ]
+    },
+    "n8n": {
+      "files": [
+        {
+          "filename": "webhook-external-events-auth.md",
+          "topic": "webhook external events and optional api auth",
+          "tech_stack": "n8n",
+          "fetched": "2026-03-05T00:00:00Z",
+          "source": "Context7 API"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Painel da Instancia</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#instanceMain">Pular para o conteudo principal</a>
+  <main class="instance-page">
+    <aside class="instance-sidebar">
+      <div>
+        <div class="instance-brand">
+          <span class="instance-brand-dot" aria-hidden="true"></span>
+          <div class="instance-brand-copy">
+            <span class="instance-brand-text">Beyound</span>
+            <span class="instance-brand-sub">Instance Control</span>
+          </div>
+        </div>
+
+        <nav class="instance-nav" role="tablist" aria-label="Navegacao da instancia">
+          <button type="button" id="tab-dashboard" class="instance-nav-btn active" data-section="dashboard" role="tab" aria-selected="true" aria-controls="section-dashboard">
+            <span class="instance-nav-kicker">01</span><span>Dashboard</span>
+          </button>
+          <button type="button" id="tab-chat" class="instance-nav-btn" data-section="chat" role="tab" aria-selected="false" aria-controls="section-chat">
+            <span class="instance-nav-kicker">02</span><span>Chat</span>
+          </button>
+          <button type="button" id="tab-settings" class="instance-nav-btn" data-section="settings" role="tab" aria-selected="false" aria-controls="section-settings">
+            <span class="instance-nav-kicker">03</span><span>Settings</span>
+          </button>
+          <button type="button" id="tab-events" class="instance-nav-btn" data-section="events" role="tab" aria-selected="false" aria-controls="section-events">
+            <span class="instance-nav-kicker">04</span><span>Events</span>
+          </button>
+          <button type="button" id="tab-integrations" class="instance-nav-btn" data-section="integrations" role="tab" aria-selected="false" aria-controls="section-integrations">
+            <span class="instance-nav-kicker">05</span><span>Integrations</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="instance-sidebar-footer">
+        <p id="sidebarInstanceName" class="instance-sidebar-instance">Instancia: -</p>
+        <a href="/" class="instance-link">Voltar ao painel principal</a>
+      </div>
+    </aside>
+
+    <section id="instanceMain" class="instance-main" tabindex="-1">
+      <header class="instance-topbar">
+        <div class="instance-topbar-copy">
+          <p class="eyebrow">Operations</p>
+          <h1 id="instanceTitle" class="instance-title">Instancia</h1>
+          <p id="instanceSubtitle" class="instance-subtitle">Dashboard operacional por conexao</p>
+          <p id="topbarLastSync" class="instance-last-sync">Sem sincronizacao recente</p>
+        </div>
+
+        <div class="instance-topbar-actions">
+          <span id="headerStatusChip" class="instance-pill state-disconnected">disconnected</span>
+          <div class="instance-key-wrap">
+            <label for="apiKey">API Key</label>
+            <input type="password" id="apiKey" placeholder="x-api-key">
+          </div>
+          <button type="button" id="btnForceRefresh" class="btn btn-ghost">Atualizar agora</button>
+        </div>
+      </header>
+
+      <section class="instance-section active" id="section-dashboard" role="tabpanel" aria-labelledby="tab-dashboard">
+        <div class="dashboard-surface">
+          <article class="instance-card hero-card">
+            <div class="hero-info">
+              <div class="hero-meta">
+                <span class="hero-label">Instancia</span>
+                <strong id="dashInstance">-</strong>
+                <span id="dashNumber" class="hero-muted">-</span>
+              </div>
+              <div class="hero-meta">
+                <span class="hero-label">Perfil</span>
+                <strong id="dashProfileName">-</strong>
+              </div>
+              <div class="hero-meta">
+                <span class="hero-label">Status da conexao</span>
+                <strong id="dashConnectionStatus">-</strong>
+              </div>
+
+              <div id="dashboardStatus" class="status hidden" role="status" aria-live="polite"></div>
+
+              <div class="hero-actions">
+                <button type="button" id="btnDashboardConnect" class="btn btn-primary">Conectar</button>
+                <button type="button" id="btnDashboardRestart" class="btn btn-ghost">Restart</button>
+                <button type="button" id="btnDashboardDisconnect" class="btn btn-danger">Disconnect</button>
+              </div>
+
+              <div class="hero-connect-options">
+                <div class="form-row">
+                  <label for="dashboardConnectMode">Modo de conexao</label>
+                  <select id="dashboardConnectMode">
+                    <option value="qr">QR Code</option>
+                    <option value="pairing">Pairing Code</option>
+                  </select>
+                </div>
+                <div class="form-row hidden" id="dashboardPhoneRow">
+                  <label for="dashboardPairingPhone">Numero para Pairing</label>
+                  <input type="text" id="dashboardPairingPhone" inputmode="numeric" autocomplete="tel" placeholder="5511912345678">
+                </div>
+              </div>
+            </div>
+
+            <div class="hero-side">
+              <img id="dashProfilePicture" class="profile-picture hidden" alt="Foto da conta">
+              <div id="dashboardPairingBox" class="instance-box hidden">
+                <p>Pairing code</p>
+                <strong id="dashboardPairingCode" class="mono-text">-</strong>
+              </div>
+              <div id="dashboardQrBox" class="instance-box hidden">
+                <p>QR Code</p>
+                <img id="dashboardQrImage" class="qr-image" alt="QR Code">
+              </div>
+            </div>
+          </article>
+
+          <article class="instance-card note-card">
+            <h3>Runbook rapido</h3>
+            <p><strong>Conectar</strong> inicia QR/pairing. <strong>Restart</strong> reconecta mantendo sessao. <strong>Disconnect</strong> encerra o socket atual.</p>
+            <p class="hero-muted">Para novo QR sem credenciais antigas, use logout pela tela principal.</p>
+          </article>
+        </div>
+
+        <div class="stats-grid">
+          <article class="instance-card stat-card">
+            <h3>Chats</h3>
+            <strong id="dashChatsCount">0</strong>
+          </article>
+          <article class="instance-card stat-card">
+            <h3>Mensagens em cache</h3>
+            <strong id="dashMessagesCount">0</strong>
+          </article>
+          <article class="instance-card stat-card">
+            <h3>Nao lidas</h3>
+            <strong id="dashUnreadCount">0</strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="instance-section" id="section-chat" role="tabpanel" aria-labelledby="tab-chat">
+        <div class="instance-card chat-card">
+          <div class="chat-toolbar">
+            <h2>Conversas</h2>
+            <div class="chat-toolbar-actions">
+              <button type="button" id="btnRefreshChats" class="btn btn-ghost">Atualizar</button>
+              <button type="button" id="btnSyncChatHistory" class="btn btn-ghost">Buscar historico</button>
+            </div>
+          </div>
+          <p class="chat-hint">Busca, filtros e envio direto por conversa.</p>
+
+          <div class="chat-layout">
+            <aside class="chat-sidebar">
+              <div class="chat-search-wrap">
+                <input type="search" id="chatSearchInput" placeholder="Buscar por nome, numero ou JID">
+                <div class="chat-filter-row" role="tablist" aria-label="Filtros de conversa">
+                  <button type="button" class="chat-filter-btn active" data-chat-filter="all">Todas</button>
+                  <button type="button" class="chat-filter-btn" data-chat-filter="unread">Nao lidas</button>
+                  <button type="button" class="chat-filter-btn" data-chat-filter="groups">Grupos</button>
+                </div>
+              </div>
+              <div class="chat-list" id="chatList" aria-live="polite"></div>
+            </aside>
+
+            <div class="chat-thread">
+              <header id="chatHeader" class="chat-thread-header">
+                <div class="chat-thread-title-wrap">
+                  <strong id="chatHeaderTitle">Selecione um chat</strong>
+                  <span id="chatHeaderMeta" class="subtitle">Nenhuma conversa ativa.</span>
+                </div>
+              </header>
+
+              <div class="chat-messages" id="chatMessages" role="log" aria-live="polite" aria-relevant="additions text">
+                <p class="subtitle">Nenhuma conversa selecionada.</p>
+              </div>
+
+              <div class="chat-composer" id="chatComposer">
+                <textarea id="chatComposerInput" rows="1" placeholder="Digite uma mensagem..." maxlength="4000"></textarea>
+                <button type="button" id="btnSendChatMessage" class="btn btn-primary">Enviar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="instance-section" id="section-settings" role="tabpanel" aria-labelledby="tab-settings">
+        <div class="instance-card">
+          <h2>Configuracoes gerais</h2>
+          <p class="card-hint">Opcoes aplicadas por instancia.</p>
+          <div id="generalToggles" class="switch-list">
+            <label class="switch-row"><span>Rejeitar chamadas</span><input type="checkbox" id="settingRejectCalls"></label>
+            <label class="switch-row"><span>Ignorar grupos</span><input type="checkbox" id="settingIgnoreGroups"></label>
+            <label class="switch-row"><span>Sempre online</span><input type="checkbox" id="settingAlwaysOnline"></label>
+            <label class="switch-row"><span>Ler mensagens automaticamente</span><input type="checkbox" id="settingAutoReadMessages"></label>
+            <label class="switch-row"><span>Sincronizar historico completo ao conectar</span><input type="checkbox" id="settingSyncFullHistory"></label>
+            <label class="switch-row"><span>Ler status automaticamente</span><input type="checkbox" id="settingReadStatus"></label>
+          </div>
+          <button type="button" id="btnSaveGeneral" class="btn btn-primary">Salvar gerais</button>
+        </div>
+
+        <div class="instance-card">
+          <h2>Proxy</h2>
+          <p class="card-hint">Proxy e syncFullHistory podem exigir restart para efeito completo.</p>
+          <label class="switch-row"><span>Habilitar proxy</span><input type="checkbox" id="proxyEnabled"></label>
+          <div class="form-inline three">
+            <div class="form-row"><label for="proxyProtocol">Protocolo</label><input type="text" id="proxyProtocol" placeholder="http"></div>
+            <div class="form-row"><label for="proxyHost">Host</label><input type="text" id="proxyHost" placeholder="127.0.0.1"></div>
+            <div class="form-row"><label for="proxyPort">Porta</label><input type="text" id="proxyPort" placeholder="8080"></div>
+          </div>
+          <div class="form-inline">
+            <div class="form-row"><label for="proxyUsername">Usuario</label><input type="text" id="proxyUsername"></div>
+            <div class="form-row"><label for="proxyPassword">Senha</label><input type="password" id="proxyPassword"></div>
+          </div>
+          <button type="button" id="btnSaveProxy" class="btn btn-primary">Salvar proxy</button>
+        </div>
+
+        <div id="settingsResult" class="result hidden" role="status" aria-live="polite"></div>
+      </section>
+
+      <section class="instance-section" id="section-events" role="tabpanel" aria-labelledby="tab-events">
+        <div class="instance-card">
+          <h2>Webhook de eventos</h2>
+          <p class="card-hint">Selecione os eventos desta instancia e salve para o endpoint informado.</p>
+          <div class="form-row">
+            <label for="eventsWebhookUrl">URL do webhook</label>
+            <input type="text" id="eventsWebhookUrl" placeholder="https://seu-webhook">
+          </div>
+          <div class="event-actions">
+            <button type="button" id="btnMarkAllEvents" class="btn btn-ghost">Marcar tudo</button>
+            <button type="button" id="btnUnmarkAllEvents" class="btn btn-ghost">Desmarcar tudo</button>
+          </div>
+          <div id="eventsToggles" class="switch-list event-list"></div>
+          <div class="event-actions">
+            <button type="button" id="btnSaveEvents" class="btn btn-primary">Salvar eventos</button>
+            <button type="button" id="btnTestEvent" class="btn btn-ghost">Testar evento</button>
+          </div>
+          <div id="eventsResult" class="result hidden" role="status" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section class="instance-section" id="section-integrations" role="tabpanel" aria-labelledby="tab-integrations">
+        <div class="instance-card">
+          <h2>Integracao Chatwoot</h2>
+          <p class="card-hint">Configuracao por instancia para atendimento.</p>
+          <label class="switch-row"><span>Habilitar Chatwoot</span><input type="checkbox" id="intChatwootEnabled"></label>
+          <div class="form-inline three">
+            <div class="form-row"><label for="intChatwootBaseUrl">Base URL</label><input type="text" id="intChatwootBaseUrl" placeholder="https://chatwoot.dominio"></div>
+            <div class="form-row"><label for="intChatwootAccountId">Account ID</label><input type="text" id="intChatwootAccountId"></div>
+            <div class="form-row"><label for="intChatwootInboxId">Inbox ID</label><input type="text" id="intChatwootInboxId"></div>
+          </div>
+          <div class="form-row"><label for="intChatwootToken">Token</label><input type="password" id="intChatwootToken"></div>
+          <div class="event-actions">
+            <button type="button" id="btnSaveIntChatwoot" class="btn btn-primary">Salvar Chatwoot</button>
+            <button type="button" id="btnTestIntChatwoot" class="btn btn-ghost">Testar Chatwoot</button>
+          </div>
+        </div>
+
+        <div class="instance-card">
+          <h2>Integracao n8n</h2>
+          <p class="card-hint">Webhook para automacoes com header opcional.</p>
+          <label class="switch-row"><span>Habilitar n8n</span><input type="checkbox" id="intN8nEnabled"></label>
+          <div class="form-row"><label for="intN8nWebhookUrl">Webhook URL</label><input type="text" id="intN8nWebhookUrl"></div>
+          <div class="form-inline">
+            <div class="form-row"><label for="intN8nHeaderName">Header</label><input type="text" id="intN8nHeaderName" placeholder="x-api-key"></div>
+            <div class="form-row"><label for="intN8nHeaderValue">Valor</label><input type="password" id="intN8nHeaderValue"></div>
+          </div>
+          <div class="event-actions">
+            <button type="button" id="btnSaveIntN8n" class="btn btn-primary">Salvar n8n</button>
+            <button type="button" id="btnTestIntN8n" class="btn btn-ghost">Testar n8n</button>
+          </div>
+        </div>
+
+        <div id="integrationsResult" class="result hidden" role="status" aria-live="polite"></div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/instance.js"></script>
+</body>
+</html>

@@ -1,291 +1,597 @@
 import { Router, type Request, type Response } from 'express';
-import { getInstance } from '../services/whatsapp.js';
-import { toJid, isConnected } from '../utils/helpers.js';
 import { config } from '../config.js';
+import { getInstance } from '../services/whatsapp.js';
+import { emitWebhookEvent } from '../services/webhooks.js';
+import { getIdempotentResult, storeIdempotentResult } from '../services/idempotency.js';
+import { emitInstanceEvent } from '../services/instance-config.js';
+import { toJid, isUrl, normalizeInstanceName } from '../utils/helpers.js';
+import type { MessageContent } from '../types/whatsapp.js';
+import { sendError, sendOk } from '../utils/api-response.js';
 
 const router = Router();
 
-function validateInstance(instanceName: string, res: Response): ReturnType<typeof getInstance> {
+type InteractiveCta =
+  | { type: 'url'; text: string; url: string }
+  | { type: 'copy'; text: string; copy_code: string }
+  | { type: 'call'; text: string; phone_number: string }
+  | { type: 'reply'; text: string; id: string };
+
+function validateInstance(instanceName: string, res: Response) {
   const ctx = getInstance(instanceName);
   if (!ctx) {
-    res.status(404).json({ ok: false, error: 'instance_not_found' });
-    return undefined;
+    sendError(res, 404, 'instance_not_found');
+    return null;
   }
-  if (!isConnected(ctx)) {
-    res.status(400).json({ ok: false, error: 'instance_not_connected', status: ctx.status });
-    return undefined;
+  if (ctx.status !== 'connected') {
+    sendError(res, 409, 'instance_not_connected', 'Instance must be connected.', { status: ctx.status });
+    return null;
   }
   return ctx;
 }
 
-// --- 1. MENU TEXTO (opções numeradas) ---
+function resolveInstanceName(rawInstance: unknown, res: Response): string | null {
+  const instance = normalizeInstanceName(rawInstance, 'main');
+  if (!instance) {
+    sendError(res, 400, 'invalid_instance_name');
+    return null;
+  }
+  return instance;
+}
+
+function parseMenuOptions(rawOptions: unknown): Array<{ id: string; text: string; description?: string }> {
+  if (!Array.isArray(rawOptions)) return [];
+
+  const options: Array<{ id: string; text: string; description?: string }> = [];
+  rawOptions.forEach((option, index) => {
+    if (typeof option === 'string') {
+      const text = option.trim();
+      if (!text) return;
+      options.push({ id: String(index + 1), text });
+      return;
+    }
+
+    if (!option || typeof option !== 'object') return;
+    const entry = option as Record<string, unknown>;
+    const text = String(entry.text ?? entry.title ?? '').trim();
+    if (!text) return;
+
+    const id = String(entry.id ?? index + 1).trim() || String(index + 1);
+    const description = String(entry.description ?? '').trim();
+    options.push({ id, text, ...(description ? { description } : {}) });
+  });
+
+  return options;
+}
+
+function parseInteractiveCtas(rawCtas: unknown): InteractiveCta[] {
+  if (!Array.isArray(rawCtas)) return [];
+
+  const ctas: InteractiveCta[] = [];
+  rawCtas.forEach((cta, index) => {
+    if (!cta || typeof cta !== 'object') return;
+    const entry = cta as Record<string, unknown>;
+    const text = String(entry.text ?? entry.label ?? '').trim();
+    if (!text) return;
+
+    const type = String(entry.type ?? 'reply').trim().toLowerCase();
+    if (type === 'url') {
+      const url = String(entry.url ?? '').trim();
+      if (!isUrl(url)) return;
+      ctas.push({ type: 'url', text, url });
+      return;
+    }
+
+    if (type === 'copy') {
+      const copyCode = String(entry.copy_code ?? entry.copyCode ?? '').trim();
+      if (!copyCode) return;
+      ctas.push({ type: 'copy', text, copy_code: copyCode });
+      return;
+    }
+
+    if (type === 'call') {
+      const phoneNumber = String(entry.phone_number ?? entry.phoneNumber ?? '').trim();
+      if (!phoneNumber) return;
+      ctas.push({ type: 'call', text, phone_number: phoneNumber });
+      return;
+    }
+
+    const id = String(entry.id ?? `reply_${index + 1}`).trim() || `reply_${index + 1}`;
+    ctas.push({ type: 'reply', text, id });
+  });
+
+  return ctas;
+}
+
+async function sendBasicMessage(
+  req: Request,
+  res: Response,
+  contentFactory: (body: Record<string, unknown>) => MessageContent | null,
+  validationError: string
+): Promise<Response | void> {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const to = String(body.to ?? '').trim();
+
+  const jid = toJid(to);
+  if (!jid) {
+    return sendError(res, 400, 'invalid_phone');
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const idempotencyKey = String(req.header('idempotency-key') ?? req.header('x-idempotency-key') ?? '').trim();
+  if (idempotencyKey) {
+    const cached = getIdempotentResult(idempotencyKey, `${req.path}|${instance}|${jid}`);
+    if (cached) {
+      return sendOk(res, {
+        ...(cached.result ?? {}),
+        idempotency: {
+          key: idempotencyKey,
+          replayed: true,
+        },
+      });
+    }
+  }
+
+  const content = contentFactory(body);
+  if (!content) {
+    return sendError(res, 400, validationError);
+  }
+
+  const sent = await ctx.sock.sendMessage(jid, content);
+  const resultPayload = {
+    instance,
+    to: jid,
+    messageId: sent?.key?.id,
+    idempotency: {
+      key: idempotencyKey || null,
+      replayed: false,
+    },
+  };
+
+  if (idempotencyKey) {
+    storeIdempotentResult(idempotencyKey, `${req.path}|${instance}|${jid}`, resultPayload);
+  }
+
+  emitWebhookEvent(
+    'messages.upsert',
+    {
+      source: 'api',
+      direction: 'outbound',
+      instance,
+      to: jid,
+      messageId: sent?.key?.id,
+      content,
+    },
+    instance
+  );
+  void emitInstanceEvent(instance, 'SEND_MESSAGE', {
+    to: jid,
+    messageId: sent?.key?.id,
+    content,
+  });
+
+  return sendOk(res, resultPayload);
+}
+
+router.post('/text', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const text = String(body.text ?? '').trim();
+      if (!text) return null;
+      return { text };
+    },
+    'missing_text'
+  )
+);
+
+router.post('/location', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const latitude = Number(body.latitude);
+      const longitude = Number(body.longitude);
+      const name = String(body.name ?? '').trim();
+      const address = String(body.address ?? '').trim();
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+      const location: Record<string, unknown> = { degreesLatitude: latitude, degreesLongitude: longitude };
+      if (name) location.name = name;
+      if (address) location.address = address;
+      const payload: MessageContent = { location };
+      return payload;
+    },
+    'invalid_location_payload'
+  )
+);
+
+router.post('/contact', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const displayName = String(body.displayName ?? body.name ?? '').trim();
+      const contactNumber = String(body.phoneNumber ?? body.number ?? '').trim();
+      const normalized = contactNumber.replace(/\D/g, '');
+      if (!displayName || normalized.length < 10) return null;
+      return {
+        contacts: {
+          displayName,
+          contacts: [
+            {
+              displayName,
+              vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${displayName}\nTEL;type=CELL;type=VOICE;waid=${normalized}:${normalized}\nEND:VCARD`,
+            },
+          ],
+        },
+      };
+    },
+    'invalid_contact_payload'
+  )
+);
+
+router.post('/reaction', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const messageId = String(body.messageId ?? '').trim();
+      const reaction = String(body.reaction ?? body.text ?? '').trim();
+      if (!messageId) return null;
+      const to = String(body.to ?? '').trim();
+      const remoteJid = toJid(to);
+      if (!remoteJid) return null;
+      return {
+        react: {
+          text: reaction,
+          key: {
+            id: messageId,
+            remoteJid,
+            fromMe: Boolean(body.fromMe),
+          },
+        },
+      };
+    },
+    'invalid_reaction_payload'
+  )
+);
+
+router.post('/media', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const mediaType = String(body.mediaType ?? '').trim();
+      const mediaUrl = String(body.mediaUrl ?? '').trim();
+      const caption = String(body.caption ?? '').trim();
+      const fileName = String(body.fileName ?? '').trim();
+      const mimetype = String(body.mimetype ?? '').trim();
+      if (!mediaType || !mediaUrl || !isUrl(mediaUrl)) return null;
+
+      const urlPayload = { url: mediaUrl };
+      if (mediaType === 'image') return { image: urlPayload, ...(caption ? { caption } : {}) };
+      if (mediaType === 'video') return { video: urlPayload, ...(caption ? { caption } : {}) };
+      if (mediaType === 'audio') return { audio: urlPayload, ptt: Boolean(body.ptt) };
+      if (mediaType === 'document') {
+        const payload: MessageContent = { document: urlPayload };
+        if (caption) payload.caption = caption;
+        if (fileName) payload.fileName = fileName;
+        if (mimetype) payload.mimetype = mimetype;
+        return payload;
+      }
+      if (mediaType === 'sticker') return { sticker: urlPayload };
+      return null;
+    },
+    'invalid_media_payload'
+  )
+);
+
+router.post('/forward', (req: Request, res: Response) =>
+  sendBasicMessage(
+    req,
+    res,
+    (body) => {
+      const text = String(body.text ?? '').trim();
+      const forwardedContent = body.message;
+      if (forwardedContent && typeof forwardedContent === 'object') {
+        return forwardedContent as MessageContent;
+      }
+      if (text) {
+        return { text };
+      }
+      return null;
+    },
+    'missing_message_or_text'
+  )
+);
+
+/**
+ * POST /v1/messages/send_menu
+ */
 router.post('/send_menu', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, title, text, options, footer } = req.body as {
-      instance?: string;
-      to: string;
-      title?: string;
-      text?: string;
-      options: string[];
-      footer?: string;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    title?: string;
+    text?: string;
+    options?: Array<{ id: string; text: string; description?: string }>;
+    footer?: string;
+  };
 
-    if (!to || !Array.isArray(options) || options.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing to/options' });
-    }
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    let menuText = '';
-    if (title) menuText += `*${title}*\n\n`;
-    if (text) menuText += `${text}\n\n`;
-    options.forEach((opt, idx) => {
-      const label = typeof opt === 'string' ? opt : (opt as { text?: string }).text ?? `Opção ${idx + 1}`;
-      menuText += `*${idx + 1}.* ${label}\n`;
-    });
-    if (footer) menuText += `\n_${footer}_`;
-
-    await ctx.sock.sendMessage(jid, { text: menuText.trim() });
-    return res.json({ ok: true, hint: 'User should reply with the option number (1, 2, 3...)' });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const options = parseMenuOptions(body.options);
+  if (!body.text || options.length === 0) {
+    return sendError(res, 400, 'missing_text_or_options');
   }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const lines = options.map((opt, idx) => `${idx + 1}. ${opt.text}${opt.description ? ` — ${opt.description}` : ''}`);
+  const menuText = [body.title ? `*${body.title}*` : null, body.text, '', ...lines, body.footer ? `\n_${body.footer}_` : null]
+    .filter(Boolean)
+    .join('\n');
+
+  const sent = await ctx.sock.sendMessage(jid, { text: menuText });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'plain_menu' });
 });
 
-// --- 2. BOTÕES QUICK REPLY (nativeButtons) ---
+/**
+ * POST /v1/messages/send_buttons_helpers
+ */
 router.post('/send_buttons_helpers', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, text, buttons, footer } = req.body as {
-      instance?: string;
-      to: string;
-      text: string;
-      buttons: Array<{ id: string; text: string }>;
-      footer?: string;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    text?: string;
+    footer?: string;
+    buttons?: Array<{ id: string; text: string }>;
+  };
 
-    if (!to || !text || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing to/text/buttons' });
-    }
-    const limited = buttons.slice(0, config.limits.maxButtons);
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    const nativeButtons = limited.map((btn, idx) => ({
-      type: 'reply' as const,
-      id: btn.id ?? `btn_${idx}`,
-      text: btn.text ?? `Botão ${idx + 1}`,
-    }));
-
-    const result = await ctx.sock.sendMessage(jid, {
-      nativeButtons,
-      text: String(text),
-      footer: footer ? String(footer) : undefined,
-    });
-
-    return res.json({ ok: true, format: 'nativeButtons', messageId: result?.key?.id });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const buttons = Array.isArray(body.buttons) ? body.buttons : [];
+  if (!body.text || buttons.length === 0) {
+    return sendError(res, 400, 'missing_text_or_buttons');
   }
+  if (buttons.length > config.limits.maxButtons) {
+    return sendError(res, 400, 'too_many_buttons', undefined, { max: config.limits.maxButtons });
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const nativeButtons = buttons.map((b) => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.text, id: b.id }) }));
+
+  const sent = await ctx.sock.sendMessage(jid, {
+    text: body.text,
+    footer: body.footer,
+    interactiveButtons: {
+      type: 'reply',
+      buttons: nativeButtons,
+    },
+  } as MessageContent);
+
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_reply' });
 });
 
-// --- 3. BOTÕES CTA (URL, COPY, CALL) ---
+/**
+ * POST /v1/messages/send_interactive_helpers
+ */
 router.post('/send_interactive_helpers', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, text, buttons, footer } = req.body as {
-      instance?: string;
-      to: string;
-      text: string;
-      buttons: Array<{
-        type: 'url' | 'copy' | 'call';
-        text: string;
-        url?: string;
-        copyCode?: string;
-        copyText?: string;
-        phoneNumber?: string;
-      }>;
-      footer?: string;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    text?: string;
+    footer?: string;
+    ctas?: unknown[];
+    buttons?: unknown[];
+  };
 
-    if (!to || !text || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing to/text/buttons' });
-    }
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    const nativeButtons = buttons.slice(0, config.limits.maxButtons).map((btn, idx) => {
-      const type = (btn.type ?? 'reply').toLowerCase();
-      if (type === 'url' || btn.url) {
-        return { type: 'url' as const, text: btn.text ?? 'Abrir', url: btn.url! };
-      }
-      if (type === 'copy' || btn.copyCode || btn.copyText) {
-        return { type: 'copy' as const, text: btn.text ?? 'Copiar', copyText: btn.copyCode ?? btn.copyText ?? '' };
-      }
-      if (type === 'call' || btn.phoneNumber) {
-        return { type: 'call' as const, text: btn.text ?? 'Ligar', phoneNumber: btn.phoneNumber! };
-      }
-      return { type: 'reply' as const, id: `btn_${idx}`, text: btn.text ?? 'Botão' };
-    });
-
-    const result = await ctx.sock.sendMessage(jid, {
-      nativeButtons,
-      text: String(text),
-      footer: footer ? String(footer) : undefined,
-    });
-
-    return res.json({ ok: true, format: 'nativeButtons', messageId: result?.key?.id });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const ctas = parseInteractiveCtas(body.ctas ?? body.buttons);
+  if (!body.text || ctas.length === 0) {
+    return sendError(res, 400, 'missing_text_or_ctas');
   }
+  if (ctas.length > config.limits.maxButtons) {
+    return sendError(res, 400, 'too_many_ctas', undefined, { max: config.limits.maxButtons });
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const buttons = ctas.map((cta) => {
+    if (cta.type === 'url') return { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: cta.text, url: cta.url }) };
+    if (cta.type === 'copy') return { name: 'cta_copy', buttonParamsJson: JSON.stringify({ display_text: cta.text, copy_code: cta.copy_code }) };
+    if (cta.type === 'call') return { name: 'cta_call', buttonParamsJson: JSON.stringify({ display_text: cta.text, phone_number: cta.phone_number }) };
+    return { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: cta.text, id: cta.id }) };
+  });
+
+  const sent = await ctx.sock.sendMessage(jid, {
+    text: body.text,
+    footer: body.footer,
+    interactiveButtons: {
+      type: 'cta',
+      buttons,
+    },
+  } as MessageContent);
+
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_cta' });
 });
 
-// --- 4. LISTA DROPDOWN (nativeList) ---
+/**
+ * POST /v1/messages/send_list_helpers
+ */
 router.post('/send_list_helpers', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, text, footer, buttonText, sections } = req.body as {
-      instance?: string;
-      to: string;
-      text: string;
-      footer?: string;
-      buttonText: string;
-      sections: Array<{ title: string; rows: Array<{ id: string; title: string; description?: string }> }>;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    text?: string;
+    footer?: string;
+    buttonText?: string;
+    sections?: Array<{
+      title: string;
+      rows: Array<{ id: string; title: string; description?: string }>;
+    }>;
+  };
 
-    if (!to || !text || !buttonText || !Array.isArray(sections) || sections.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing to/text/buttonText/sections' });
-    }
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    const result = await ctx.sock.sendMessage(jid, {
-      nativeList: {
-        buttonText: String(buttonText),
-        sections: sections.map((s) => ({
-          title: s.title ?? 'Opções',
-          rows: (s.rows ?? []).map((row, idx) => ({
-            id: row.id ?? `row_${idx}`,
-            title: row.title ?? 'Item',
-            description: row.description ?? '',
-          })),
-        })),
-      },
-      text: String(text),
-      footer: footer ? String(footer) : undefined,
-    });
-
-    return res.json({ ok: true, format: 'nativeList', messageId: result?.key?.id });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const sections = Array.isArray(body.sections) ? body.sections : [];
+  if (!body.text || !body.buttonText || sections.length === 0) {
+    return sendError(res, 400, 'missing_text_or_sections');
   }
+  if (sections.length > config.limits.maxListSections) {
+    return sendError(res, 400, 'too_many_sections', undefined, { max: config.limits.maxListSections });
+  }
+  for (const section of sections) {
+    if (!Array.isArray(section.rows) || section.rows.length === 0) {
+      return sendError(res, 400, 'empty_section_rows');
+    }
+    if (section.rows.length > config.limits.maxListRowsPerSection) {
+      return sendError(res, 400, 'too_many_rows_per_section', undefined, { max: config.limits.maxListRowsPerSection });
+    }
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const sent = await ctx.sock.sendMessage(jid, {
+    text: body.text,
+    footer: body.footer,
+    interactiveList: {
+      type: 'nativeList',
+      buttonText: body.buttonText,
+      sections,
+    },
+  } as MessageContent);
+
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_list' });
 });
 
-// --- 5. ENQUETE / POLL ---
+/**
+ * POST /v1/messages/send_poll
+ */
 router.post('/send_poll', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, name, options, selectableCount } = req.body as {
-      instance?: string;
-      to: string;
-      name: string;
-      options: string[];
-      selectableCount?: number;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    name?: string;
+    options?: string[];
+    selectableCount?: number;
+  };
 
-    if (!to || !name || !Array.isArray(options) || options.length < 2) {
-      return res.status(400).json({ ok: false, error: 'missing to/name/options (min 2)' });
-    }
-    const opts = options.slice(0, config.limits.maxPollOptions).map((o) => (typeof o === 'string' ? o : String(o)));
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    // Formato que funciona no InfiniteAPI/Baileys: poll com name, values e selectableCount
-    const result = await ctx.sock.sendMessage(jid, {
-      poll: {
-        name: String(name),
-        values: opts,
-        selectableCount: Math.min(Math.max(1, selectableCount ?? 1), opts.length),
-      },
-    });
-    return res.json({ ok: true, messageId: result?.key?.id });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const options = Array.isArray(body.options) ? body.options.filter((s) => typeof s === 'string' && s.trim()) : [];
+  if (!body.name || options.length < 2) {
+    return sendError(res, 400, 'missing_name_or_options');
   }
+  if (options.length > config.limits.maxPollOptions) {
+    return sendError(res, 400, 'too_many_poll_options', undefined, { max: config.limits.maxPollOptions });
+  }
+
+  const selectableCount = Number.isInteger(body.selectableCount) ? Number(body.selectableCount) : 1;
+  if (selectableCount < 1 || selectableCount > options.length) {
+    return sendError(res, 400, 'invalid_selectable_count');
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const sent = await ctx.sock.sendMessage(jid, {
+    poll: {
+      name: body.name,
+      values: options,
+      selectableCount,
+    },
+  } as MessageContent);
+
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'poll' });
 });
 
-// --- 6. CARROSSEL (nativeCarousel) ---
+/**
+ * POST /v1/messages/send_carousel_helpers
+ */
 router.post('/send_carousel_helpers', async (req: Request, res: Response) => {
-  try {
-    const { instance = 'main', to, text, footer, cards } = req.body as {
-      instance?: string;
-      to: string;
-      text?: string;
-      footer?: string;
-      cards: Array<{
-        title?: string;
-        body?: string;
-        footer?: string;
-        imageUrl?: string;
-        buttons?: Array<{ id: string; text: string }>;
-      }>;
-    };
+  const body = (req.body ?? {}) as {
+    instance?: string;
+    to?: string;
+    text?: string;
+    footer?: string;
+    cards?: Array<{
+      title: string;
+      description?: string;
+      body?: string;
+      imageUrl?: string;
+      buttons?: Array<{ id: string; text: string }>;
+    }>;
+  };
 
-    if (!to || !Array.isArray(cards) || cards.length === 0) {
-      return res.status(400).json({ ok: false, error: 'missing to/cards' });
-    }
-    const limited = cards.slice(0, config.limits.maxCarouselCards);
+  const instance = resolveInstanceName(body.instance, res);
+  if (!instance) return;
+  const jid = toJid(body.to ?? '');
+  if (!jid) return sendError(res, 400, 'invalid_phone');
 
-    const ctx = validateInstance(instance, res);
-    if (!ctx) return;
-
-    const jid = toJid(to);
-    if (!jid) return res.status(400).json({ ok: false, error: 'invalid_phone' });
-
-    const formattedCards = limited.map((card, idx) => ({
-      title: card.title ?? `Card ${idx + 1}`,
-      body: card.body ?? '',
-      footer: card.footer,
-      image: card.imageUrl ? { url: card.imageUrl } : undefined,
-      buttons: (card.buttons ?? []).map((btn, bIdx) => ({
-        type: 'reply' as const,
-        id: btn.id ?? `card${idx}_btn${bIdx}`,
-        text: btn.text ?? 'Botão',
-      })),
-    }));
-
-    const result = await ctx.sock.sendMessage(jid, {
-      nativeCarousel: { cards: formattedCards },
-      text: text ? String(text) : undefined,
-      footer: footer ? String(footer) : undefined,
-    });
-
-    return res.json({ ok: true, format: 'nativeCarousel', messageId: result?.key?.id });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ ok: false, error: message });
+  const cards = Array.isArray(body.cards) ? body.cards : [];
+  if (!body.text || cards.length === 0) {
+    return sendError(res, 400, 'missing_text_or_cards');
   }
+  if (cards.length > config.limits.maxCarouselCards) {
+    return sendError(res, 400, 'too_many_cards', undefined, { max: config.limits.maxCarouselCards });
+  }
+
+  for (const card of cards) {
+    const buttons = Array.isArray(card.buttons) ? card.buttons : [];
+    if (buttons.length > config.limits.maxButtons) {
+      return sendError(res, 400, 'too_many_card_buttons', undefined, { max: config.limits.maxButtons });
+    }
+  }
+
+  const ctx = validateInstance(instance, res);
+  if (!ctx) return;
+
+  const carouselCards = cards.map((card) => ({
+    title: card.title,
+    description: card.description ?? card.body,
+    image: card.imageUrl ? { url: card.imageUrl } : undefined,
+    buttons: (card.buttons ?? []).map((button) => ({
+      name: 'quick_reply',
+      buttonParamsJson: JSON.stringify({ display_text: button.text, id: button.id }),
+    })),
+  }));
+
+  const sent = await ctx.sock.sendMessage(jid, {
+    text: body.text,
+    footer: body.footer,
+    interactiveCarousel: {
+      type: 'nativeCarousel',
+      cards: carouselCards,
+    },
+  } as MessageContent);
+
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_carousel' });
 });
 
 export default router;

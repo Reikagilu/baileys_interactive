@@ -4,3 +4,6 @@ auth/
 .env
 *.log
 .DS_Store
+data/
+*.sqlite
+.runtime/
