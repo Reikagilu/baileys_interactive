@@ -1,17 +1,64 @@
 (function () {
   const API = '';
+  const apiKeyInput = document.getElementById('apiKey');
+  const API_KEY_STORAGE_KEY = 'rscara_api_key';
+
+  function getStoredApiKey() {
+    const sessionKey = sessionStorage.getItem(API_KEY_STORAGE_KEY);
+    if (sessionKey) return sessionKey;
+    const legacyKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (legacyKey) {
+      sessionStorage.setItem(API_KEY_STORAGE_KEY, legacyKey);
+      localStorage.removeItem(API_KEY_STORAGE_KEY);
+      return legacyKey;
+    }
+    return '';
+  }
+
+  function storeApiKey(key) {
+    if (key) {
+      sessionStorage.setItem(API_KEY_STORAGE_KEY, key);
+      return;
+    }
+    sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+  }
+
+  const cachedApiKey = getStoredApiKey();
+  if (cachedApiKey && !apiKeyInput.value) {
+    apiKeyInput.value = cachedApiKey;
+  }
+
+  apiKeyInput.addEventListener('input', () => {
+    storeApiKey(apiKeyInput.value.trim());
+  });
+
   function headers() {
     const h = { 'Content-Type': 'application/json' };
-    const key = document.getElementById('apiKey').value.trim() || localStorage.getItem('rscara_api_key');
+    const key = apiKeyInput.value.trim() || getStoredApiKey();
     if (key) {
       h['x-api-key'] = key;
-      localStorage.setItem('rscara_api_key', key);
+      storeApiKey(key);
     }
     return h;
   }
 
   function show(el, visible) {
     el.classList.toggle('hidden', !visible);
+  }
+
+  function escapeHtml(value) {
+    return String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function setListState(listEl, message, tone) {
+    if (!listEl) return;
+    const toneClass = tone ? ` ${tone}` : '';
+    listEl.innerHTML = `<li class="list-state${toneClass}">${escapeHtml(message)}</li>`;
   }
 
   // Tabs
@@ -45,17 +92,38 @@
   // Instância que estamos conectando (para atualizar QR e status em tempo real)
   let connectingInstanceName = null;
   let connectingMode = 'qr';
+  const lastModeByInstance = new Map();
 
   const connectModeEl = document.getElementById('connectMode');
   const connectPhoneRowEl = document.getElementById('connectPhoneRow');
   const pairingContainerEl = document.getElementById('pairingContainer');
   const pairingCodeValueEl = document.getElementById('pairingCodeValue');
 
+  const integrationInstanceEl = document.getElementById('integrationInstance');
+  const integrationStatusEl = document.getElementById('integrationStatus');
+  const chatwootResultEl = document.getElementById('chatwootResult');
+  const n8nResultEl = document.getElementById('n8nResult');
+
+  function setResult(el, message, tone) {
+    if (!el) return;
+    el.textContent = message;
+    el.className = tone ? `result ${tone}` : 'result';
+    show(el, true);
+  }
+
+  function setIntegrationStatus(message, tone) {
+    if (!integrationStatusEl) return;
+    integrationStatusEl.textContent = message;
+    integrationStatusEl.className = tone ? `status ${tone}` : 'status';
+    show(integrationStatusEl, true);
+  }
+
   connectModeEl.addEventListener('change', () => {
     const isPairing = connectModeEl.value === 'pairing';
     show(connectPhoneRowEl, isPairing);
     if (!isPairing) {
       show(pairingContainerEl, false);
+      pairingCodeValueEl.textContent = '';
     }
   });
 
@@ -63,15 +131,16 @@
   function renderSavedList(saved) {
     const ul = document.getElementById('savedList');
     if (!saved || saved.length === 0) {
-      ul.innerHTML = '<li class="text-muted">Nenhuma conexão salva. Conecte uma vez por nome e ela aparecerá aqui.</li>';
+      setListState(ul, 'Nenhuma conexao salva. Conecte por nome e ela aparecera aqui.');
       return;
     }
     ul.innerHTML = saved
       .map(
         (name) =>
           `<li class="saved-item-row">
-            <span class="instance-name">${name}</span>
+            <span class="instance-name">${escapeHtml(name)}</span>
             <div class="saved-item-actions">
+              <a class="btn btn-small btn-ghost" href="/instance.html?instance=${encodeURIComponent(name)}">Painel</a>
               <button type="button" class="btn btn-primary btn-connect-saved" data-connect-name="${name}">Conectar</button>
               <button type="button" class="btn btn-small btn-danger" data-delete-saved-name="${name}" title="Excluir sessão salva (será necessário novo QR para conectar)">Deletar</button>
             </div>
@@ -130,6 +199,7 @@
             pairing_channel_not_ready: 'Canal do WhatsApp ainda iniciando. Tente novamente em alguns segundos.',
             empty_pairing_code: 'O WhatsApp não retornou código de pareamento. Tente novamente.',
             pairing_code_unavailable: 'Não foi possível gerar o pairing code agora. Tente novamente em alguns segundos.',
+            pairing_code_unstable: 'O código ficou inválido durante a inicialização. Gere um novo código e tente imediatamente.',
             pairing_code_disabled: 'Pairing code está desabilitado no servidor.',
           };
           return { ok: false, error: msgByCode[data.error] || data.error || 'Erro ao gerar pairing code.' };
@@ -150,15 +220,35 @@
     return { ok: false, error: 'Não foi possível gerar pairing code.' };
   }
 
+  async function resetInstanceOnModeSwitch(name, nextMode) {
+    const previousMode = lastModeByInstance.get(name);
+    if (!previousMode || previousMode === nextMode) return;
+
+    try {
+      await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/disconnect`, {
+        method: 'POST',
+        headers: headers(),
+      });
+    } catch (_) {}
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
   async function doConnect(name) {
-    connectingInstanceName = name;
-    connectingMode = connectModeEl.value === 'pairing' ? 'pairing' : 'qr';
+    const nextMode = connectModeEl.value === 'pairing' ? 'pairing' : 'qr';
     const statusEl = document.getElementById('connectStatus');
     const qrContainer = document.getElementById('qrContainer');
     const qrImage = document.getElementById('qrImage');
+
+    await resetInstanceOnModeSwitch(name, nextMode);
+
+    connectingInstanceName = name;
+    connectingMode = nextMode;
+    lastModeByInstance.set(name, connectingMode);
     show(statusEl, false);
     show(qrContainer, false);
     show(pairingContainerEl, false);
+    pairingCodeValueEl.textContent = '';
 
     if (connectingMode === 'pairing') {
       const pairing = await requestPairingCode(name);
@@ -166,6 +256,7 @@
         statusEl.textContent = pairing.error || 'Erro ao gerar pairing code';
         statusEl.className = 'status error';
         show(statusEl, true);
+        connectingInstanceName = null;
         return;
       }
       pairingCodeValueEl.textContent = pairing.pairingCode;
@@ -247,16 +338,17 @@
   function renderInstanceList(list) {
     const ul = document.getElementById('instanceList');
     if (!list.length) {
-      ul.innerHTML = '<li>Nenhuma instância ativa.</li>';
+      setListState(ul, 'Nenhuma instancia ativa no momento.');
       return;
     }
     ul.innerHTML = list
       .map(
         (i) =>
           `<li class="instance-row">
-            <span class="instance-name">${i.instance}</span>
-            <span class="badge ${i.status}">${i.status}</span>
+            <span class="instance-name">${escapeHtml(i.instance)}</span>
+            <span class="badge ${escapeHtml(i.status)}">${escapeHtml(i.status)}</span>
             <div class="instance-actions">
+              <a class="btn btn-small btn-primary" href="/instance.html?instance=${encodeURIComponent(i.instance)}">Painel</a>
               ${i.status === 'qr' ? `<button type="button" class="btn btn-small btn-ghost" data-action="qr" data-name="${i.instance}">Ver QR</button>` : ''}
               ${i.status === 'connected' ? `<button type="button" class="btn btn-small btn-ghost" data-action="disconnect" data-name="${i.instance}">Desconectar</button>` : ''}
               <button type="button" class="btn btn-small btn-ghost" data-action="logout" data-name="${i.instance}" title="Novo QR na próxima conexão">Novo QR</button>
@@ -301,10 +393,162 @@
   function updateConnectSelect(saved) {
     const sel = document.getElementById('connectInstanceSelect');
     const current = sel.value;
-    const options = ['— Nova conexão —', ...(saved || [])];
     sel.innerHTML = '<option value="">— Nova conexão —</option>' +
-      (saved || []).map((n) => `<option value="${n}" ${n === current ? 'selected' : ''}>${n}</option>`).join('');
+      (saved || []).map((n) => `<option value="${escapeHtml(n)}" ${n === current ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
     connectNewNameRow.style.display = sel.value === '' ? '' : 'none';
+  }
+
+  function updateIntegrationSelect(names) {
+    if (!integrationInstanceEl) return;
+    const current = integrationInstanceEl.value;
+    const list = Array.isArray(names) ? names : [];
+    if (!list.length) {
+      integrationInstanceEl.innerHTML = '<option value="main">main</option>';
+      return;
+    }
+    integrationInstanceEl.innerHTML = list
+      .map((name) => `<option value="${escapeHtml(name)}" ${name === current ? 'selected' : ''}>${escapeHtml(name)}</option>`)
+      .join('');
+    if (!list.includes(current)) integrationInstanceEl.selectedIndex = 0;
+  }
+
+  function updateOverviewStats(saved, instances) {
+    const safeSaved = Array.isArray(saved) ? saved : [];
+    const safeInstances = Array.isArray(instances) ? instances : [];
+    const connectedCount = safeInstances.filter((entry) => String(entry.status || '') === 'connected').length;
+    const statSaved = document.getElementById('statSavedCount');
+    const statActive = document.getElementById('statActiveCount');
+    const statConnected = document.getElementById('statConnectedCount');
+    if (statSaved) statSaved.textContent = String(safeSaved.length);
+    if (statActive) statActive.textContent = String(safeInstances.length);
+    if (statConnected) statConnected.textContent = String(connectedCount);
+  }
+
+  function fillIntegrationsForm(integration) {
+    const chatwoot = integration?.chatwoot || {};
+    document.getElementById('chatwootEnabled').checked = Boolean(chatwoot.enabled);
+    document.getElementById('chatwootBaseUrl').value = chatwoot.baseUrl || '';
+    document.getElementById('chatwootAccountId').value = chatwoot.accountId || '';
+    document.getElementById('chatwootInboxId').value = chatwoot.inboxId || '';
+    document.getElementById('chatwootToken').value = chatwoot.apiAccessToken || '';
+
+    const n8n = integration?.n8n || {};
+    document.getElementById('n8nEnabled').checked = Boolean(n8n.enabled);
+    document.getElementById('n8nWebhookUrl').value = n8n.webhookUrl || '';
+    document.getElementById('n8nAuthHeaderName').value = n8n.authHeaderName || 'x-api-key';
+    document.getElementById('n8nAuthHeaderValue').value = n8n.authHeaderValue || '';
+  }
+
+  async function loadIntegrationsForSelected() {
+    if (!integrationInstanceEl) return;
+    const instance = (integrationInstanceEl.value || '').trim();
+    if (!instance) return;
+
+    try {
+      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}`, { headers: headers() });
+      const data = await res.json();
+      if (!res.ok || !data.integration) {
+        setIntegrationStatus(data.error || 'Erro ao carregar integrações.', 'error');
+        return;
+      }
+      fillIntegrationsForm(data.integration);
+      setIntegrationStatus(`Integrações carregadas para ${instance}.`, 'success');
+    } catch (error) {
+      setIntegrationStatus(error.message || 'Erro de rede ao carregar integrações.', 'error');
+    }
+  }
+
+  async function saveChatwootConfig() {
+    const instance = (integrationInstanceEl?.value || '').trim();
+    if (!instance) return;
+    const body = {
+      enabled: document.getElementById('chatwootEnabled').checked,
+      baseUrl: document.getElementById('chatwootBaseUrl').value.trim(),
+      accountId: document.getElementById('chatwootAccountId').value.trim(),
+      inboxId: document.getElementById('chatwootInboxId').value.trim(),
+      apiAccessToken: document.getElementById('chatwootToken').value.trim(),
+    };
+    try {
+      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot`, {
+        method: 'PATCH',
+        headers: headers(),
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResult(chatwootResultEl, data.error || 'Erro ao salvar Chatwoot.', 'error');
+        return;
+      }
+      fillIntegrationsForm(data.integration);
+      setResult(chatwootResultEl, 'Configuração Chatwoot salva.', 'success');
+    } catch (error) {
+      setResult(chatwootResultEl, error.message || 'Erro de rede ao salvar Chatwoot.', 'error');
+    }
+  }
+
+  async function testChatwootConfig() {
+    const instance = (integrationInstanceEl?.value || '').trim();
+    if (!instance) return;
+    try {
+      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/test`, {
+        method: 'POST',
+        headers: headers(),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResult(chatwootResultEl, data.error || 'Teste Chatwoot falhou.', 'error');
+        return;
+      }
+      setResult(chatwootResultEl, `Chatwoot OK (status ${data.status || 200}).`, 'success');
+    } catch (error) {
+      setResult(chatwootResultEl, error.message || 'Erro de rede no teste Chatwoot.', 'error');
+    }
+  }
+
+  async function saveN8nConfig() {
+    const instance = (integrationInstanceEl?.value || '').trim();
+    if (!instance) return;
+    const body = {
+      enabled: document.getElementById('n8nEnabled').checked,
+      webhookUrl: document.getElementById('n8nWebhookUrl').value.trim(),
+      authHeaderName: document.getElementById('n8nAuthHeaderName').value.trim(),
+      authHeaderValue: document.getElementById('n8nAuthHeaderValue').value.trim(),
+    };
+    try {
+      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
+        method: 'PATCH',
+        headers: headers(),
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResult(n8nResultEl, data.error || 'Erro ao salvar n8n.', 'error');
+        return;
+      }
+      fillIntegrationsForm(data.integration);
+      setResult(n8nResultEl, 'Configuração n8n salva.', 'success');
+    } catch (error) {
+      setResult(n8nResultEl, error.message || 'Erro de rede ao salvar n8n.', 'error');
+    }
+  }
+
+  async function testN8nConfig() {
+    const instance = (integrationInstanceEl?.value || '').trim();
+    if (!instance) return;
+    try {
+      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n/test`, {
+        method: 'POST',
+        headers: headers(),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResult(n8nResultEl, data.error || 'Teste n8n falhou.', 'error');
+        return;
+      }
+      setResult(n8nResultEl, `n8n OK (status ${data.status || 200}).`, 'success');
+    } catch (error) {
+      setResult(n8nResultEl, error.message || 'Erro de rede no teste n8n.', 'error');
+    }
   }
 
   async function refreshInstanceList() {
@@ -326,8 +570,9 @@
         const sel = document.getElementById('dispatchInstance');
         const current = sel.value;
         const names = [...new Set([...data.instances.map((i) => i.instance), ...(data.saved || [])])];
-        sel.innerHTML = names.map((n) => `<option value="${n}" ${n === current ? 'selected' : ''}>${n}</option>`).join('');
+        sel.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}" ${n === current ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
         if (!names.includes(current)) sel.selectedIndex = 0;
+        updateIntegrationSelect(names);
 
         // Atualização ativa: se estamos conectando uma instância, atualizar QR e status
         if (connectingInstanceName) {
@@ -347,10 +592,17 @@
                 }
               } catch (_) {}
             } else if (inst.status !== 'connected' && connectingMode === 'pairing') {
+              const currentPairingCode = String(pairingCodeValueEl.textContent || '').trim();
               show(qrContainer, false);
-              show(pairingContainerEl, true);
-              statusEl.textContent = 'Digite o pairing code no WhatsApp para concluir a conexão.';
-              statusEl.className = 'status success';
+              if (currentPairingCode) {
+                show(pairingContainerEl, true);
+                statusEl.textContent = 'Digite o pairing code no WhatsApp para concluir a conexão.';
+                statusEl.className = 'status success';
+              } else {
+                show(pairingContainerEl, false);
+                statusEl.textContent = 'Aguardando geração do pairing code...';
+                statusEl.className = 'status';
+              }
               show(statusEl, true);
             } else if (inst.status === 'connected') {
               show(qrContainer, false);
@@ -364,20 +616,52 @@
               statusEl.textContent = 'Desconectado. Clique em Conectar novamente.';
               statusEl.className = 'status error';
               show(statusEl, true);
+              connectingInstanceName = null;
             }
+          } else {
+            connectingInstanceName = null;
           }
         }
       }
+      updateOverviewStats(data.saved || [], data.instances || []);
     } catch (_) {
       renderSavedList([]);
       renderInstanceList([]);
       updateConnectSelect([]);
+      updateOverviewStats([], []);
     }
   }
 
   document.getElementById('btnRefreshList').addEventListener('click', refreshInstanceList);
+  if (integrationInstanceEl) {
+    document.getElementById('btnIntegrationReload').addEventListener('click', loadIntegrationsForSelected);
+    integrationInstanceEl.addEventListener('change', loadIntegrationsForSelected);
+    document.getElementById('btnSaveChatwoot').addEventListener('click', saveChatwootConfig);
+    document.getElementById('btnTestChatwoot').addEventListener('click', testChatwootConfig);
+    document.getElementById('btnSaveN8n').addEventListener('click', saveN8nConfig);
+    document.getElementById('btnTestN8n').addEventListener('click', testN8nConfig);
+    const btnOpenIntegrationPanel = document.getElementById('btnOpenIntegrationPanel');
+    if (btnOpenIntegrationPanel) {
+      btnOpenIntegrationPanel.addEventListener('click', () => {
+        const name = (integrationInstanceEl.value || '').trim();
+        if (!name) return;
+        window.location.href = `/instance.html?instance=${encodeURIComponent(name)}#integrations`;
+      });
+    }
+  }
+
+  const integrationsTab = document.querySelector('[data-tab="integracoes"]');
+  if (integrationsTab) {
+    integrationsTab.addEventListener('click', () => {
+      loadIntegrationsForSelected();
+    });
+  }
+
   show(connectPhoneRowEl, false);
   refreshInstanceList();
+  if (integrationInstanceEl) {
+    loadIntegrationsForSelected();
+  }
 
   // Polling ativo: atualizar lista, QR e status a cada 2s quando a aba Conexões estiver visível
   setInterval(() => {
@@ -399,7 +683,7 @@
   }
 
   function addMenuOption() {
-    addRow('menuOptionsList', '<input type="text" placeholder="Texto da opção" data-field="opt">');
+    addRow('menuOptionsList', '<input type="text" placeholder="ID (opcional)" data-field="id"><input type="text" placeholder="Texto da opcao" data-field="text"><input type="text" placeholder="Descricao (opcional)" data-field="description">');
   }
   function addButtonRow() {
     addRow('buttonsList', '<input type="text" placeholder="ID do botão" data-field="id"><input type="text" placeholder="Texto do botão" data-field="text">');
@@ -450,7 +734,7 @@
     block.innerHTML = `
       <div class="block-title">Card</div>
       <div class="form-row"><input type="text" placeholder="Título" data-field="title"></div>
-      <div class="form-row"><input type="text" placeholder="Corpo/descrição" data-field="body"></div>
+      <div class="form-row"><input type="text" placeholder="Descricao" data-field="description"></div>
       <div class="form-row"><input type="text" placeholder="Rodapé" data-field="footer"></div>
       <div class="form-row"><input type="text" placeholder="URL da imagem" data-field="imageUrl"></div>
       <div class="sub-list card-buttons"></div>
@@ -493,9 +777,16 @@
   // Coletar dados dos formulários e montar payload
   function getMenuPayload() {
     const options = [];
-    document.querySelectorAll('#menuOptionsList .item-row input[data-field="opt"]').forEach((inp) => {
-      const v = inp.value.trim();
-      if (v) options.push(v);
+    document.querySelectorAll('#menuOptionsList .item-row').forEach((row, idx) => {
+      const id = row.querySelector('[data-field="id"]')?.value?.trim();
+      const text = row.querySelector('[data-field="text"]')?.value?.trim();
+      const description = row.querySelector('[data-field="description"]')?.value?.trim();
+      if (!text) return;
+      options.push({
+        id: id || String(idx + 1),
+        text,
+        ...(description ? { description } : {}),
+      });
     });
     return {
       url: '/v1/messages/send_menu',
@@ -504,7 +795,7 @@
         to: document.getElementById('dispatchTo').value.trim(),
         title: document.getElementById('menuTitle').value.trim() || 'Menu',
         text: document.getElementById('menuText').value.trim() || 'Escolha uma opção:',
-        options: options.length ? options : ['Opção 1'],
+        options: options.length ? options : [{ id: '1', text: 'Opcao 1' }],
         footer: document.getElementById('menuFooter').value.trim() || undefined,
       },
     };
@@ -528,17 +819,17 @@
     };
   }
   function getInteractivePayload() {
-    const buttons = [];
+    const ctas = [];
     document.querySelectorAll('#interactiveList .item-row').forEach((row) => {
       const type = row.querySelector('[data-field="type"]')?.value || 'url';
       const text = row.querySelector('[data-field="text"]')?.value?.trim();
       const extra = row.querySelector('[data-field="extra"]')?.value?.trim();
       if (!text || !extra) return;
-      const btn = { type, text };
-      if (type === 'url') btn.url = extra;
-      else if (type === 'copy') btn.copyCode = extra;
-      else if (type === 'call') btn.phoneNumber = extra;
-      buttons.push(btn);
+      const cta = { type, text };
+      if (type === 'url') cta.url = extra;
+      else if (type === 'copy') cta.copy_code = extra;
+      else if (type === 'call') cta.phone_number = extra;
+      ctas.push(cta);
     });
     return {
       url: '/v1/messages/send_interactive_helpers',
@@ -547,7 +838,7 @@
         to: document.getElementById('dispatchTo').value.trim(),
         text: document.getElementById('interactiveText').value.trim() || 'Confira:',
         footer: document.getElementById('interactiveFooter').value.trim() || undefined,
-        buttons,
+        ctas,
       },
     };
   }
@@ -597,7 +888,7 @@
     const cards = [];
     document.querySelectorAll('#carouselCardsList .block-section').forEach((block) => {
       const title = block.querySelector('[data-field="title"]')?.value?.trim();
-      const body = block.querySelector('[data-field="body"]')?.value?.trim();
+      const description = block.querySelector('[data-field="description"]')?.value?.trim();
       const footer = block.querySelector('[data-field="footer"]')?.value?.trim();
       const imageUrl = block.querySelector('[data-field="imageUrl"]')?.value?.trim();
       const buttons = [];
@@ -608,7 +899,7 @@
       });
       cards.push({
         title: title || '',
-        body: body || '',
+        description: description || '',
         footer: footer || undefined,
         imageUrl: imageUrl || undefined,
         buttons: buttons.length ? buttons : [{ id: 'btn1', text: 'Ver' }],
@@ -621,7 +912,7 @@
         to: document.getElementById('dispatchTo').value.trim(),
         text: document.getElementById('carouselText').value.trim() || undefined,
         footer: document.getElementById('carouselFooter').value.trim() || undefined,
-        cards: cards.length ? cards : [{ title: 'Card', body: '', buttons: [{ id: 'b1', text: 'Botão' }] }],
+        cards: cards.length ? cards : [{ title: 'Card', description: '', buttons: [{ id: 'b1', text: 'Botao' }] }],
       },
     };
   }
@@ -671,7 +962,7 @@
         show(resultEl, true);
         return;
     }
-    if (type === 'interactive' && (!payload.body.buttons || payload.body.buttons.length === 0)) {
+    if (type === 'interactive' && (!payload.body.ctas || payload.body.ctas.length === 0)) {
       resultEl.textContent = 'Adicione ao menos um botão CTA.';
       resultEl.className = 'result error';
       show(resultEl, true);
@@ -716,7 +1007,4 @@
     resultEl.className = failed === 0 ? 'result success' : failed === recipients.length ? 'result error' : 'result';
     btnSend.disabled = false;
   });
-
-  const savedKey = localStorage.getItem('rscara_api_key');
-  if (savedKey) document.getElementById('apiKey').placeholder = '••••••••';
 })();

@@ -1,28 +1,32 @@
 {
-  "name": "rsalcara",
+  "name": "Beyound",
   "version": "1.0.0",
   "description": "API Node.js para múltiplas contas WhatsApp com InfiniteAPI (Baileys) e disparo de componentes especiais",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/tests/**/*.test.js",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "worker:webhooks": "node dist/workers/webhook-delivery-worker.js",
+    "start:stack": "node dist/index.js & node dist/workers/webhook-delivery-worker.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "express": "^4.21.0",
-    "qrcode": "^1.5.4",
+    "baileys": "github:Beyound/InfiniteAPI",
     "dotenv": "^16.4.5",
-    "baileys": "github:rsalcara/InfiniteAPI"
+    "express": "^4.21.0",
+    "https-proxy-agent": "^7.0.6",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "tsx": "^4.19.0",
-    "@types/node": "^22.0.0",
     "@types/express": "^4.17.21",
-    "@types/qrcode": "^1.5.5"
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
   }
 }

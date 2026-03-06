@@ -3,10 +3,24 @@
  */
 export function toJid(phone: string | null | undefined): string | null {
   if (!phone || typeof phone !== 'string') return null;
+  if (phone.includes('@')) return phone;
   const cleaned = phone.replace(/\D/g, '');
   if (cleaned.length < 10) return null;
-  if (phone.includes('@')) return phone;
   return `${cleaned}@s.whatsapp.net`;
+}
+
+export const INSTANCE_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function isValidInstanceName(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  return INSTANCE_NAME_PATTERN.test(value.trim());
+}
+
+export function normalizeInstanceName(value: unknown, fallback?: string): string | null {
+  const raw = value == null || String(value).trim() === '' ? fallback ?? '' : String(value);
+  const name = raw.trim();
+  if (!name) return null;
+  return isValidInstanceName(name) ? name : null;
 }
 
 /**
