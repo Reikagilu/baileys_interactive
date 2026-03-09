@@ -22,6 +22,34 @@ const errorResponse = {
   },
 };
 
+function okResponseWithExample(example: Record<string, unknown>) {
+  return {
+    description: 'Successful response',
+    content: {
+      'application/json': {
+        schema: {
+          $ref: '#/components/schemas/SuccessEnvelope',
+        },
+        example,
+      },
+    },
+  };
+}
+
+function errorResponseWithExample(example: Record<string, unknown>) {
+  return {
+    description: 'Error response',
+    content: {
+      'application/json': {
+        schema: {
+          $ref: '#/components/schemas/ErrorResponse',
+        },
+        example,
+      },
+    },
+  };
+}
+
 export const openApiSpec = {
   openapi: '3.0.3',
   info: {
@@ -102,10 +130,28 @@ export const openApiSpec = {
                 type: 'object',
                 properties: { instance: { type: 'string', example: 'main' } },
               },
+              example: {
+                instance: 'loja_sp',
+              },
             },
           },
         },
-        responses: { 200: okResponse, 400: errorResponse, 401: errorResponse, 403: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'e79f21ad-f03e-4d71-ad5e-1f2f7d9f84e8',
+            instance: 'loja_sp',
+            status: 'qr',
+            qr: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...',
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'invalid_instance_name',
+            requestId: 'e79f21ad-f03e-4d71-ad5e-1f2f7d9f84e8',
+          }),
+          401: errorResponse,
+          403: errorResponse,
+        },
       },
     },
     '/v1/instances/saved': {
@@ -176,7 +222,38 @@ export const openApiSpec = {
         operationId: 'getInstanceDetails',
         security: secure,
         parameters: [{ $ref: '#/components/parameters/InstanceName' }],
-        responses: { 200: okResponse, 404: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: '47d1b62d-a8e8-4b79-84b9-0fbeb16ca24f',
+            instance: 'main',
+            status: 'connected',
+            hasQr: false,
+            createdAt: '2026-03-09T12:30:41.123Z',
+            linkedNumber: '5511999998888',
+            profileName: 'Atendimento Loja',
+            profilePictureUrl: 'https://pps.whatsapp.net/v/t61.24694-24/...',
+            settings: {
+              instance: 'main',
+              proxy: { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' },
+              general: {
+                rejectCalls: false,
+                ignoreGroups: false,
+                alwaysOnline: false,
+                autoReadMessages: false,
+                syncFullHistory: false,
+                readStatus: false,
+              },
+              events: {
+                webhookUrl: '',
+                toggles: { APPLICATION_STARTUP: false, SEND_MESSAGE: true },
+              },
+              createdAt: 1762790000000,
+              updatedAt: 1762790000000,
+            },
+          }),
+          404: errorResponse,
+        },
       },
     },
     '/v1/instances/{name}/restart': {
@@ -245,10 +322,35 @@ export const openApiSpec = {
                   text: { type: 'string', example: 'Ola! Tudo bem?' },
                 },
               },
+              example: {
+                text: 'Bom dia! Em que posso ajudar?',
+              },
             },
           },
         },
-        responses: { 200: okResponse, 400: errorResponse, 404: errorResponse, 409: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'a9ad42de-a52f-4aaf-95bd-b9cde2e44376',
+            instance: 'main',
+            jid: '5511999998888@s.whatsapp.net',
+            messageId: '3EB0AA11BB22CC33DD44',
+            timestamp: 1773059804,
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'text_required',
+            requestId: 'a9ad42de-a52f-4aaf-95bd-b9cde2e44376',
+          }),
+          404: errorResponse,
+          409: errorResponseWithExample({
+            ok: false,
+            error: 'instance_not_connected',
+            requestId: 'a9ad42de-a52f-4aaf-95bd-b9cde2e44376',
+            message: 'Instance must be connected.',
+            details: { status: 'qr' },
+          }),
+        },
       },
     },
     '/v1/instances/{name}/chats/{jid}/sync-history': {
@@ -413,10 +515,37 @@ export const openApiSpec = {
               schema: {
                 $ref: '#/components/schemas/BaseSendMessagePayload',
               },
+              example: {
+                instance: 'main',
+                to: '5511999998888',
+                text: 'Oi! Pedido confirmado.',
+              },
             },
           },
         },
-        responses: { 200: okResponse, 400: errorResponse, 404: errorResponse, 409: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'b6f2f3e0-8f78-4fc5-b8f9-faf7b8f79df3',
+            instance: 'main',
+            to: '5511999998888@s.whatsapp.net',
+            messageId: '3EB0123456789ABCDEF0',
+            idempotency: { key: null, replayed: false },
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'missing_text',
+            requestId: 'b6f2f3e0-8f78-4fc5-b8f9-faf7b8f79df3',
+          }),
+          404: errorResponse,
+          409: errorResponseWithExample({
+            ok: false,
+            error: 'instance_not_connected',
+            requestId: 'b6f2f3e0-8f78-4fc5-b8f9-faf7b8f79df3',
+            message: 'Instance must be connected.',
+            details: { status: 'qr' },
+          }),
+        },
       },
     },
     '/v1/messages/media': {
@@ -449,10 +578,35 @@ export const openApiSpec = {
                   },
                 ],
               },
+              example: {
+                instance: 'main',
+                to: '5511999998888',
+                mediaType: 'document',
+                mediaUrl: 'https://example.com/nota-fiscal.pdf',
+                caption: 'Segue NF',
+                fileName: 'nf-123.pdf',
+                mimetype: 'application/pdf',
+              },
             },
           },
         },
-        responses: { 200: okResponse, 400: errorResponse, 404: errorResponse, 409: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'f9cb0c6b-cff0-4dfb-ae6b-df4235d198f7',
+            instance: 'main',
+            to: '5511999998888@s.whatsapp.net',
+            messageId: '3EB0ABCDEF1234567890',
+            idempotency: { key: null, replayed: false },
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'invalid_media_payload',
+            requestId: 'f9cb0c6b-cff0-4dfb-ae6b-df4235d198f7',
+          }),
+          404: errorResponse,
+          409: errorResponse,
+        },
       },
     },
     '/v1/messages/location': {
@@ -541,10 +695,33 @@ export const openApiSpec = {
                   },
                 ],
               },
+              example: {
+                instance: 'main',
+                to: '5511999998888',
+                messageId: '3EB0ABCDEF1234567890',
+                reaction: '👍',
+                fromMe: false,
+              },
             },
           },
         },
-        responses: { 200: okResponse, 400: errorResponse, 404: errorResponse, 409: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'dc6f02f3-c652-4a3e-b9f9-5a1496f6e273',
+            instance: 'main',
+            to: '5511999998888@s.whatsapp.net',
+            messageId: '3EB0F00DBABE12345678',
+            idempotency: { key: null, replayed: false },
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'invalid_reaction_payload',
+            requestId: 'dc6f02f3-c652-4a3e-b9f9-5a1496f6e273',
+          }),
+          404: errorResponse,
+          409: errorResponse,
+        },
       },
     },
     '/v1/messages/forward': {
@@ -893,7 +1070,25 @@ export const openApiSpec = {
         summary: 'List registered webhooks',
         operationId: 'listWebhooks',
         security: secure,
-        responses: { 200: okResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: '8f6c9583-9903-4458-b90e-67bdb5d3f5eb',
+            webhooks: [
+              {
+                id: 'f2f2d8b4-b8d7-47d1-9a39-4f7616f8c593',
+                name: 'n8n-prod',
+                url: 'https://n8n.example.com/webhook/whatsapp',
+                events: ['messages.upsert', 'connection.update'],
+                instance: 'main',
+                enabled: true,
+                secret: 'whsec_***',
+                createdAt: 1773059200123,
+                updatedAt: 1773059200123,
+              },
+            ],
+          }),
+        },
       },
       post: {
         tags: ['Webhooks'],
@@ -916,10 +1111,44 @@ export const openApiSpec = {
                   secret: { type: 'string' },
                 },
               },
+              example: {
+                name: 'webhook-principal',
+                url: 'https://hooks.example.com/wa',
+                events: ['messages.upsert', 'connection.update'],
+                instance: 'main',
+                enabled: true,
+                secret: 'whsec_live_123',
+              },
             },
           },
         },
-        responses: { 201: okResponse, 400: errorResponse },
+        responses: {
+          201: okResponseWithExample({
+            ok: true,
+            requestId: 'ee9ca5fe-8b39-4b95-b34b-67f3d267a82f',
+            webhook: {
+              id: '2aef47a0-8ea6-4f89-a9c4-13c9761c6b0f',
+              name: 'webhook-principal',
+              url: 'https://hooks.example.com/wa',
+              events: ['messages.upsert', 'connection.update'],
+              instance: 'main',
+              enabled: true,
+              secret: 'whsec_live_123',
+              createdAt: 1773059905123,
+              updatedAt: 1773059905123,
+            },
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'invalid_url',
+            requestId: 'ee9ca5fe-8b39-4b95-b34b-67f3d267a82f',
+            message: 'Webhook URL blocked by security policy.',
+            details: {
+              reason: 'private_network_url_not_allowed',
+              details: 'blocked_host=localhost',
+            },
+          }),
+        },
       },
     },
     '/v1/webhooks/deliveries': {
@@ -1063,7 +1292,38 @@ export const openApiSpec = {
         summary: 'Get operational alerts and recommendations',
         operationId: 'getOpsAlerts',
         security: secure,
-        responses: { 200: okResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: 'afdb6d92-4f99-41f9-8159-f1f0f38f15da',
+            status: 'degraded',
+            alerts: [
+              {
+                id: 'webhook.pending.high',
+                severity: 'high',
+                metric: 'webhook.deliveriesPending',
+                value: 150,
+                threshold: 100,
+                message: 'Pending webhook deliveries exceed threshold.',
+                recommendation: 'Scale workers and verify target endpoints latency.',
+              },
+            ],
+            snapshot: {
+              connectedInstances: 1,
+              totalInstances: 3,
+              webhook: {
+                webhooksTotal: 4,
+                webhooksEnabled: 3,
+                deliveriesPending: 150,
+                deliveriesProcessing: 5,
+                deliveriesDelivered: 1000,
+                deliveriesFailed: 20,
+                deliveriesTotal: 1175,
+                oldestPendingAgeSeconds: 420,
+              },
+            },
+          }),
+        },
       },
     },
     '/v1/ops/audit': {
@@ -1166,7 +1426,26 @@ export const openApiSpec = {
         operationId: 'testN8nIntegration',
         security: secure,
         parameters: [{ name: 'instance', in: 'path', required: true, schema: { type: 'string' } }],
-        responses: { 200: okResponse, 400: errorResponse, 502: errorResponse },
+        responses: {
+          200: okResponseWithExample({
+            ok: true,
+            requestId: '7b1b245d-ae8e-4d49-9f75-838f9fb7f15d',
+            tested: true,
+            status: 200,
+          }),
+          400: errorResponseWithExample({
+            ok: false,
+            error: 'n8n_not_configured',
+            requestId: '7b1b245d-ae8e-4d49-9f75-838f9fb7f15d',
+          }),
+          502: errorResponseWithExample({
+            ok: false,
+            error: 'n8n_test_failed',
+            requestId: '7b1b245d-ae8e-4d49-9f75-838f9fb7f15d',
+            message: 'n8n_http_404',
+            details: { status: 404 },
+          }),
+        },
       },
     },
   },
@@ -1176,6 +1455,7 @@ export const openApiSpec = {
         type: 'apiKey',
         in: 'header',
         name: 'x-api-key',
+        description: 'Use a chave da API no header x-api-key para acessar rotas /v1/*.',
       },
     },
     parameters: {
@@ -1234,7 +1514,7 @@ export const openApiSpec = {
       },
       TargetMessagePayload: {
         type: 'object',
-        required: ['instance', 'to'],
+        required: ['to'],
         properties: {
           instance: { type: 'string', example: 'main' },
           to: { type: 'string', example: '5511999999999' },
