@@ -1,6 +1,6 @@
 # rscara
 
-API em **TypeScript** para múltiplas contas WhatsApp usando [InfiniteAPI](https://github.com/Beyound/InfiniteAPI) (fork do Baileys), com geração de QR code, gerenciamento de conexões e disparo de componentes especiais (botões, listas, carrossel, enquete). Inclui interface web para conectar números e enviar mensagens.
+API em **TypeScript** para múltiplas contas WhatsApp usando [InfiniteAPI](https://github.com/rsalcara/InfiniteAPI) (fork do Baileys), com geração de QR code, gerenciamento de conexões e disparo de componentes especiais (botões, listas, carrossel, enquete). Inclui interface web para conectar números e enviar mensagens.
 
 ## Requisitos
 
