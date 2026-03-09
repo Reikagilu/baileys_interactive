@@ -120,6 +120,11 @@ Com o servidor rodando, acesse **http://localhost:8787**. A página inicial e os
 
 ## Endpoints
 
+Documentacao OpenAPI/Swagger:
+
+- `GET /openapi.json` (spec OpenAPI 3.0)
+- `GET /docs` (Swagger UI)
+
 O header **`x-api-key`** é obrigatório apenas nas rotas `/v1/*` quando `API_KEY` está definida. As rotas `/health`, `/ready` e a interface em `/` não exigem key.
 
 Escopos de autorização suportados por rota:

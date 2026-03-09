@@ -2,12 +2,15 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
+import swaggerUiDist from 'swagger-ui-dist';
 import instancesRouter from './routes/instances.js';
 import messagesRouter from './routes/messages.js';
 import webhooksRouter from './routes/webhooks.js';
 import chatsRouter from './routes/chats.js';
 import opsRouter from './routes/ops.js';
 import integrationsRouter from './routes/integrations.js';
+import { openApiSpec } from './docs/openapi.js';
+import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
 import { requestContext } from './middleware/request-context.js';
 import { sendError } from './utils/api-response.js';
 import { getAllInstances, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
@@ -15,6 +18,7 @@ import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const swaggerAssetsDir = swaggerUiDist.getAbsoluteFSPath();
 const hasConfiguredApiKeys = Boolean(config.apiKey.trim() || config.apiKeysJson.trim());
 
 if (process.env.NODE_ENV === 'production' && !hasConfiguredApiKeys) {
@@ -70,6 +74,17 @@ app.get('/metrics', (_req, res) => {
 
   res.setHeader('content-type', 'text/plain; version=0.0.4; charset=utf-8');
   res.send(`${lines.join('\n')}\n`);
+});
+
+app.get('/openapi.json', (_req, res) => {
+  res.json(openApiSpec);
+});
+
+app.use('/docs-assets', express.static(swaggerAssetsDir));
+
+app.get('/docs', (_req, res) => {
+  res.setHeader('content-type', 'text/html; charset=utf-8');
+  res.send(renderSwaggerUiHtml('/openapi.json'));
 });
 
 // API key só nas rotas /v1 (a interface em / carrega sem key)
