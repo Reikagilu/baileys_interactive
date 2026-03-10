@@ -13,9 +13,11 @@ import { openApiSpec } from './docs/openapi.js';
 import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
 import { requestContext } from './middleware/request-context.js';
 import { sendError } from './utils/api-response.js';
-import { getAllInstances, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
+import { getAllInstances, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
 import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
+import { normalizeInstanceName } from './utils/helpers.js';
+import { verifyMediaUrlToken } from './utils/media-signature.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const swaggerAssetsDir = swaggerUiDist.getAbsoluteFSPath();
@@ -85,6 +87,34 @@ app.use('/docs-assets', express.static(swaggerAssetsDir));
 app.get('/docs', (_req, res) => {
   res.setHeader('content-type', 'text/html; charset=utf-8');
   res.send(renderSwaggerUiHtml('/openapi.json'));
+});
+
+app.get('/v1/media/:instance/:mediaId', (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  const mediaId = String(req.params.mediaId ?? '').trim();
+  if (!instance || !mediaId) {
+    return sendError(res, 400, 'invalid_media_request');
+  }
+
+  const verification = verifyMediaUrlToken(
+    config.media.signedUrlSecret,
+    instance,
+    mediaId,
+    req.query.exp,
+    req.query.sig
+  );
+  if (!verification.ok) {
+    return sendError(res, verification.error === 'expired_token' ? 410 : 401, verification.error);
+  }
+
+  const media = getInstanceChatMediaBinary(instance, mediaId);
+  if (!media.ok || !media.bytes || !media.mimeType) {
+    return sendError(res, 404, 'media_not_found');
+  }
+
+  res.setHeader('Cache-Control', 'private, max-age=60');
+  res.setHeader('Content-Type', media.mimeType);
+  return res.status(200).send(media.bytes);
 });
 
 // API key só nas rotas /v1 (a interface em / carrega sem key)

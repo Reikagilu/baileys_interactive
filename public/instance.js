@@ -70,6 +70,8 @@
     availableEvents: [],
     hideTimers: new Map(),
     autoSyncedChats: new Set(),
+    mediaObjectUrls: new Set(),
+    mediaBlobCache: new Map(),
   };
 
   const el = {
@@ -197,6 +199,73 @@
       data = { ok: false, error: 'invalid_json_response' };
     }
     return { response, data };
+  }
+
+  async function apiBinary(path) {
+    const response = await fetch(`${API}${path}`, {
+      cache: 'no-store',
+      headers: {
+        ...headers(),
+        'cache-control': 'no-cache',
+        pragma: 'no-cache',
+      },
+    });
+    return response;
+  }
+
+  function revokeMediaObjectUrls() {
+    state.mediaObjectUrls.forEach((value) => {
+      try {
+        URL.revokeObjectURL(value);
+      } catch (_) {}
+    });
+    state.mediaObjectUrls.clear();
+    state.mediaBlobCache.clear();
+  }
+
+  function normalizeMediaPath(url) {
+    if (typeof url !== 'string' || !url.trim()) return '';
+    if (/^https?:\/\//i.test(url)) {
+      try {
+        const parsed = new URL(url);
+        return `${parsed.pathname}${parsed.search}`;
+      } catch {
+        return '';
+      }
+    }
+    return url;
+  }
+
+  async function resolveMediaSource(media) {
+    if (!media || typeof media !== 'object') return null;
+
+    const mediaPath = normalizeMediaPath(media.url);
+    if (mediaPath) {
+      const cached = state.mediaBlobCache.get(mediaPath);
+      if (cached) return cached;
+      try {
+        const response = await apiBinary(mediaPath);
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        state.mediaObjectUrls.add(objectUrl);
+        state.mediaBlobCache.set(mediaPath, objectUrl);
+        return objectUrl;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return buildMediaDataUrl(media);
+  }
+
+  async function attachMediaSource(element, media) {
+    if (!element || !media) return;
+    try {
+      const source = await resolveMediaSource(media);
+      if (!source) return;
+      element.src = source;
+    } catch (_) {}
   }
 
   function beginLoad(key) {
@@ -399,6 +468,96 @@
     });
   }
 
+  function inferMimeType(media) {
+    if (!media || typeof media !== 'object') return 'application/octet-stream';
+    if (typeof media.mimeType === 'string' && /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(media.mimeType)) {
+      return media.mimeType;
+    }
+    switch (media.kind) {
+      case 'audio':
+        return 'audio/ogg';
+      case 'image':
+        return 'image/jpeg';
+      case 'sticker':
+        return 'image/webp';
+      case 'video':
+        return 'video/mp4';
+      case 'document':
+        return 'application/octet-stream';
+      default:
+        return 'application/octet-stream';
+    }
+  }
+
+  function buildMediaDataUrl(media) {
+    if (!media || typeof media !== 'object') return null;
+    if (typeof media.base64 !== 'string' || media.base64.length === 0) return null;
+    const mimeType = inferMimeType(media);
+    return `data:${mimeType};base64,${media.base64}`;
+  }
+
+  function renderMessageMedia(media) {
+    if (!media || typeof media !== 'object') return null;
+
+    if (media.kind === 'audio') {
+      const audio = document.createElement('audio');
+      audio.className = 'chat-media-audio';
+      audio.controls = true;
+      audio.preload = 'none';
+      void attachMediaSource(audio, media);
+      return audio;
+    }
+
+    if (media.kind === 'video') {
+      const video = document.createElement('video');
+      video.className = 'chat-media-video';
+      video.controls = true;
+      video.preload = 'metadata';
+      void attachMediaSource(video, media);
+      return video;
+    }
+
+    if (media.kind === 'image' || media.kind === 'sticker') {
+      const image = document.createElement('img');
+      image.className = media.kind === 'sticker' ? 'chat-media-sticker' : 'chat-media-image';
+      image.loading = 'lazy';
+      image.alt = media.kind === 'sticker' ? 'Figurinha recebida' : 'Imagem recebida';
+      void attachMediaSource(image, media);
+      return image;
+    }
+
+    if (media.kind === 'document') {
+      const link = document.createElement('a');
+      link.className = 'chat-media-document';
+      link.href = '#';
+      link.download = String(media.fileName || 'arquivo');
+      link.textContent = `Baixar ${String(media.fileName || 'documento')}`;
+      link.addEventListener('click', async (event) => {
+        event.preventDefault();
+        const source = await resolveMediaSource(media);
+        if (!source) return;
+        const tmp = document.createElement('a');
+        tmp.href = source;
+        tmp.download = String(media.fileName || 'arquivo');
+        tmp.rel = 'noopener noreferrer';
+        tmp.click();
+      });
+      return link;
+    }
+
+    return null;
+  }
+
+  function formatSenderLabel(message) {
+    if (message.fromMe) return 'Você';
+    const name = String(message.senderName || '').trim();
+    const number = String(message.senderNumber || '').trim();
+    if (name && number) return `${name} (${number})`;
+    if (name) return name;
+    if (number) return number;
+    return 'Contato';
+  }
+
   function getSelectedChat() {
     return state.chatItems.find((chat) => chat.jid === state.selectedChatJid) || null;
   }
@@ -561,6 +720,7 @@
         renderChatListPlaceholder(msg);
         state.selectedChatJid = '';
         setChatHeaderDefaults();
+        revokeMediaObjectUrls();
         clearNode(el.chatMessages);
         const p = document.createElement('p');
         p.className = 'subtitle';
@@ -579,6 +739,7 @@
         state.selectedChatJid = '';
         renderChatListPlaceholder('Sem conversas em cache. Envie/receba mensagens para popular.');
         setChatHeaderDefaults();
+        revokeMediaObjectUrls();
         clearNode(el.chatMessages);
         const p = document.createElement('p');
         p.className = 'subtitle';
@@ -605,6 +766,7 @@
       renderChatListPlaceholder(error.message || 'Erro de rede no chat.');
       state.selectedChatJid = '';
       setChatHeaderDefaults();
+      revokeMediaObjectUrls();
       clearNode(el.chatMessages);
       const p = document.createElement('p');
       p.className = 'subtitle';
@@ -622,6 +784,7 @@
   async function loadChatMessages() {
     if (!state.selectedChatJid) {
       setChatHeaderDefaults();
+      revokeMediaObjectUrls();
       clearNode(el.chatMessages);
       const p = document.createElement('p');
       p.className = 'subtitle';
@@ -634,6 +797,7 @@
 
     if (!beginLoad('chat-messages')) return;
     try {
+      revokeMediaObjectUrls();
       clearNode(el.chatMessages);
       const loading = document.createElement('p');
       loading.className = 'subtitle';
@@ -669,6 +833,7 @@
 
       const distanceFromBottom = el.chatMessages.scrollHeight - el.chatMessages.scrollTop - el.chatMessages.clientHeight;
       const keepPinnedBottom = distanceFromBottom < 70;
+      revokeMediaObjectUrls();
       clearNode(el.chatMessages);
 
       const messages = Array.isArray(data.messages) ? data.messages : [];
@@ -705,16 +870,37 @@
 
         const label = document.createElement('strong');
         label.className = 'chat-bubble-author';
-        label.textContent = message.fromMe ? 'Você' : 'Contato';
+        label.textContent = formatSenderLabel(message);
+        bubble.appendChild(label);
 
-        const text = document.createElement('p');
-        text.textContent = message.text || '';
+        const mediaNode = renderMessageMedia(message.media);
+        if (mediaNode) {
+          bubble.appendChild(mediaNode);
+        }
+
+        const messageText = String(message.text || '').trim();
+        const isMediaPlaceholder = /^\[[a-z]+\]$/i.test(messageText);
+        const captionText = typeof message.media?.caption === 'string' ? message.media.caption.trim() : '';
+        const textToRender = captionText || (!isMediaPlaceholder ? messageText : '');
+
+        if (textToRender) {
+          const text = document.createElement('p');
+          text.textContent = textToRender;
+          bubble.appendChild(text);
+        }
+
+        if (message.media && !message.media.base64 && message.media.omittedReason) {
+          const notice = document.createElement('p');
+          notice.className = 'chat-media-warning';
+          notice.textContent = message.media.omittedReason === 'too_large'
+            ? 'Mídia não carregada: arquivo acima do limite configurado.'
+            : 'Mídia não carregada: falha no download.';
+          bubble.appendChild(notice);
+        }
 
         const footer = document.createElement('small');
         footer.textContent = formatMessageTimestamp(message.timestamp);
 
-        bubble.appendChild(label);
-        bubble.appendChild(text);
         bubble.appendChild(footer);
         el.chatMessages.appendChild(bubble);
       });
@@ -733,6 +919,7 @@
         void syncSelectedChatHistory();
       }
     } catch (error) {
+      revokeMediaObjectUrls();
       clearNode(el.chatMessages);
       const p = document.createElement('p');
       p.className = 'subtitle';
