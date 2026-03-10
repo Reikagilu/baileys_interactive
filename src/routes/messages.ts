@@ -90,24 +90,33 @@ async function sendMessageWithTyping(
   typingMs: number | null
 ) {
   if (ctx && typingMs && typeof ctx.sock.sendPresenceUpdate === 'function') {
+    const HEARTBEAT_MS = 8000;
     try {
       await ctx.sock.presenceSubscribe?.(jid);
     } catch {
       // ignore subscribe failures
     }
-    try {
-      await ctx.sock.sendPresenceUpdate('composing', jid);
-    } catch {
-      // ignore presence failures
+    let remaining = typingMs;
+    while (remaining > 0) {
+      try {
+        await ctx.sock.sendPresenceUpdate('composing', jid);
+      } catch {
+        // ignore presence failures
+      }
+      const chunk = Math.min(remaining, HEARTBEAT_MS);
+      await sleep(chunk);
+      remaining -= chunk;
     }
-    await sleep(typingMs);
+  }
+  const sent = await ctx?.sock.sendMessage(jid, content);
+  if (ctx && typingMs && typeof ctx.sock.sendPresenceUpdate === 'function') {
     try {
       await ctx.sock.sendPresenceUpdate('paused', jid);
     } catch {
       // ignore presence failures
     }
   }
-  return ctx?.sock.sendMessage(jid, content);
+  return sent;
 }
 
 type InteractiveCta =
