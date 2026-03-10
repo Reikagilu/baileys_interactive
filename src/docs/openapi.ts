@@ -1532,6 +1532,75 @@ export const openApiSpec = {
           },
         ],
       },
+      WebhookMessageCrypto: {
+        type: 'object',
+        description: 'Contexto criptografico compacto opcional da mensagem.',
+        properties: {
+          senderKeyHash: { type: 'string' },
+          recipientKeyHash: { type: 'string' },
+          messageSecret: { type: 'string' },
+        },
+      },
+      WebhookMessageMedia: {
+        type: 'object',
+        description: 'Representacao de midia no payload de webhook/evento de instancia.',
+        properties: {
+          kind: { type: 'string', enum: ['audio', 'image', 'video', 'sticker', 'document'] },
+          mimeType: { type: 'string' },
+          fileName: { type: 'string' },
+          caption: { type: 'string' },
+          mediaId: { type: 'string' },
+          url: { type: 'string', format: 'uri' },
+          base64: { type: 'string', description: 'Opcional; recomendado manter desabilitado em producao.' },
+          bytes: { type: 'integer', minimum: 0 },
+          omittedReason: { type: 'string', enum: ['too_large', 'download_failed'] },
+        },
+      },
+      WebhookMessageUpsertItem: {
+        type: 'object',
+        properties: {
+          key: {
+            type: 'object',
+            properties: {
+              remoteJid: { type: 'string' },
+              fromMe: { type: 'boolean' },
+              id: { type: 'string' },
+              participant: { type: 'string' },
+            },
+            additionalProperties: true,
+          },
+          messageTimestamp: { type: 'integer' },
+          pushName: { type: 'string' },
+          text: { type: 'string' },
+          message_type: { type: 'string', example: 'audio' },
+          messageType: { type: 'string', example: 'audio' },
+          sender: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              number: { type: 'string' },
+            },
+          },
+          media: { $ref: '#/components/schemas/WebhookMessageMedia' },
+          crypto: { $ref: '#/components/schemas/WebhookMessageCrypto' },
+          message: {
+            type: 'object',
+            description: 'Mensagem raw sanitizada (sem waveform e hashes binarios).',
+            additionalProperties: true,
+          },
+        },
+      },
+      WebhookMessagesUpsertPayload: {
+        type: 'object',
+        description: 'Payload padrao emitido em MESSAGES_UPSERT / messages.upsert.',
+        properties: {
+          type: { type: 'string', example: 'notify' },
+          messages: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/WebhookMessageUpsertItem' },
+          },
+        },
+      },
     },
   },
 } as const;

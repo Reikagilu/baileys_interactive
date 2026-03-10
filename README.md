@@ -259,6 +259,55 @@ Assinatura HMAC:
 - Payload assinado: `${x-webhook-timestamp}.${rawBodyJson}`
 - Valor: hex em `x-webhook-signature`
 
+Payload padrao (`MESSAGES_UPSERT` / `messages.upsert`):
+
+- Envelope sem duplicacao (`payload.messages[]`, nao `payload.payload.messages[]`).
+- Cada item pode incluir:
+  - `message_type` e `messageType` (compatibilidade)
+  - `sender` (`name`, `number`)
+  - `media` (`kind`, `url`, `mediaId`, `mimeType`, etc.)
+  - `crypto` compacto opcional (`senderKeyHash`, `recipientKeyHash`, `messageSecret`)
+- Campos ruidosos removidos do `message` raw: `waveform`, `fileSha256`, `fileEncSha256`.
+
+Exemplo resumido:
+
+```json
+{
+  "event": "MESSAGES_UPSERT",
+  "instance": "main",
+  "payload": {
+    "type": "notify",
+    "messages": [
+      {
+        "key": {
+          "remoteJid": "5511999999999@s.whatsapp.net",
+          "fromMe": false,
+          "id": "3EB0ABC123"
+        },
+        "message_type": "audio",
+        "messageType": "audio",
+        "text": "[audio]",
+        "sender": {
+          "name": "Fulano",
+          "number": "5511999999999"
+        },
+        "media": {
+          "kind": "audio",
+          "mediaId": "9c6f4f8c-...",
+          "url": "https://seu-host/v1/media/main/9c6f4f8c-...?exp=...&sig=...",
+          "mimeType": "audio/ogg; codecs=opus"
+        },
+        "crypto": {
+          "senderKeyHash": "...",
+          "recipientKeyHash": "...",
+          "messageSecret": "..."
+        }
+      }
+    ]
+  }
+}
+```
+
 Processamento de fila:
 
 - Entregas são persistidas em SQLite (`WEBHOOK_DB_PATH`).
