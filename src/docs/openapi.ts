@@ -530,6 +530,7 @@ export const openApiSpec = {
             instance: 'main',
             to: '5511999998888@s.whatsapp.net',
             messageId: '3EB0123456789ABCDEF0',
+            typingMs: 1800,
             idempotency: { key: null, replayed: false },
           }),
           400: errorResponseWithExample({
@@ -597,6 +598,7 @@ export const openApiSpec = {
             instance: 'main',
             to: '5511999998888@s.whatsapp.net',
             messageId: '3EB0ABCDEF1234567890',
+            typingMs: 1800,
             idempotency: { key: null, replayed: false },
           }),
           400: errorResponseWithExample({
@@ -712,6 +714,7 @@ export const openApiSpec = {
             instance: 'main',
             to: '5511999998888@s.whatsapp.net',
             messageId: '3EB0F00DBABE12345678',
+            typingMs: 1200,
             idempotency: { key: null, replayed: false },
           }),
           400: errorResponseWithExample({
