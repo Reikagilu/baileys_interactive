@@ -35,10 +35,9 @@
         <nav class="tabs" aria-label="Abas da pagina principal">
           <button type="button" class="tab active" data-tab="conexoes" aria-label="Abrir aba Instancias">Instancias</button>
           <button type="button" class="tab" data-tab="disparos" aria-label="Abrir aba Disparos">Disparos</button>
-          <button type="button" class="tab" data-tab="integracoes" aria-label="Abrir aba Integracoes">Integracoes</button>
         </nav>
         <div class="sidebar-hint">
-          <p>Integre por instancia no painel dedicado para evitar configuracoes duplicadas.</p>
+          <p>Gerencie instancias e disparos nesta tela principal.</p>
         </div>
       </aside>
 
@@ -46,7 +45,7 @@
         <section id="conexoes" class="panel active">
           <div class="overview-grid">
             <article class="card stat-tile">
-              <p>Conexoes salvas</p>
+              <p>Sessoes autenticadas</p>
               <strong id="statSavedCount">0</strong>
             </article>
             <article class="card stat-tile">
@@ -61,7 +60,7 @@
 
           <div class="connections-grid">
             <section class="card">
-              <h2>Conexoes salvas</h2>
+              <h2>Sessoes autenticadas</h2>
               <p class="card-hint">Abra o painel, conecte por QR/pairing ou exclua a sessao para novo QR.</p>
               <ul id="savedList" class="saved-list"></ul>
             </section>
@@ -81,7 +80,7 @@
                 <span class="field-hint">Formato: DDI + DDD + numero.</span>
               </div>
               <div class="form-row">
-                <label for="connectInstanceSelect">Conexao existente</label>
+                <label for="connectInstanceSelect">Sessao existente</label>
                 <select id="connectInstanceSelect">
                   <option value="">- Nova conexao -</option>
                 </select>
@@ -213,51 +212,6 @@
           </div>
         </section>
 
-        <section id="integracoes" class="panel">
-          <div class="integrations-grid integrations-grid-compact">
-            <section class="card">
-              <h2>Integracoes por instancia</h2>
-              <p class="card-hint">Use o painel da instancia para fluxo completo de integracoes junto com settings e eventos.</p>
-              <div class="form-row">
-                <label for="integrationInstance">Instancia</label>
-                <select id="integrationInstance"><option value="main">main</option></select>
-              </div>
-              <div class="instance-actions">
-                <button type="button" id="btnOpenIntegrationPanel" class="btn btn-primary">Abrir painel da instancia</button>
-                <button type="button" id="btnIntegrationReload" class="btn btn-ghost">Recarregar config</button>
-              </div>
-              <div id="integrationStatus" class="status hidden" role="status" aria-live="polite"></div>
-            </section>
-
-            <section class="card">
-              <h2>Edicao rapida (global)</h2>
-              <p class="card-hint">Edite rapidamente sem sair da tela principal quando necessario.</p>
-
-              <h3 class="card-subtitle">Chatwoot</h3>
-              <div class="form-row"><label><input type="checkbox" id="chatwootEnabled"> Habilitar Chatwoot nesta instancia</label></div>
-              <div class="form-row"><label for="chatwootBaseUrl">Base URL</label><input type="text" id="chatwootBaseUrl" placeholder="https://chatwoot.seudominio.com"></div>
-              <div class="form-row"><label for="chatwootAccountId">Account ID</label><input type="text" id="chatwootAccountId"></div>
-              <div class="form-row"><label for="chatwootInboxId">Inbox ID</label><input type="text" id="chatwootInboxId"></div>
-              <div class="form-row"><label for="chatwootToken">API Access Token</label><input type="password" id="chatwootToken"></div>
-              <div class="instance-actions">
-                <button type="button" id="btnSaveChatwoot" class="btn btn-primary">Salvar Chatwoot</button>
-                <button type="button" id="btnTestChatwoot" class="btn btn-ghost">Testar conexao</button>
-              </div>
-              <div id="chatwootResult" class="result hidden"></div>
-
-              <h3 class="card-subtitle">n8n</h3>
-              <div class="form-row"><label><input type="checkbox" id="n8nEnabled"> Habilitar n8n nesta instancia</label></div>
-              <div class="form-row"><label for="n8nWebhookUrl">Webhook URL</label><input type="text" id="n8nWebhookUrl" placeholder="https://n8n.seudominio.com/webhook/..." ></div>
-              <div class="form-row"><label for="n8nAuthHeaderName">Header de autenticacao</label><input type="text" id="n8nAuthHeaderName" placeholder="x-api-key"></div>
-              <div class="form-row"><label for="n8nAuthHeaderValue">Valor do header</label><input type="password" id="n8nAuthHeaderValue"></div>
-              <div class="instance-actions">
-                <button type="button" id="btnSaveN8n" class="btn btn-primary">Salvar n8n</button>
-                <button type="button" id="btnTestN8n" class="btn btn-ghost">Testar webhook</button>
-              </div>
-              <div id="n8nResult" class="result hidden"></div>
-            </section>
-          </div>
-        </section>
       </main>
     </div>
   </div>

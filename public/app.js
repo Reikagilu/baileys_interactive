@@ -131,7 +131,7 @@
   function renderSavedList(saved) {
     const ul = document.getElementById('savedList');
     if (!saved || saved.length === 0) {
-      setListState(ul, 'Nenhuma conexao salva. Conecte por nome e ela aparecera aqui.');
+      setListState(ul, 'Nenhuma sessao autenticada. Conecte por nome e ela aparecera aqui.');
       return;
     }
     ul.innerHTML = saved
@@ -140,9 +140,8 @@
           `<li class="saved-item-row">
             <span class="instance-name">${escapeHtml(name)}</span>
             <div class="saved-item-actions">
-              <a class="btn btn-small btn-ghost" href="/instance.html?instance=${encodeURIComponent(name)}">Painel</a>
               <button type="button" class="btn btn-primary btn-connect-saved" data-connect-name="${name}">Conectar</button>
-              <button type="button" class="btn btn-small btn-danger" data-delete-saved-name="${name}" title="Excluir sessão salva (será necessário novo QR para conectar)">Deletar</button>
+              <button type="button" class="btn btn-small btn-danger" data-delete-saved-name="${name}" title="Excluir sessão autenticada (será necessário novo QR para conectar)">Deletar</button>
             </div>
           </li>`
       )
@@ -159,7 +158,7 @@
     ul.querySelectorAll('[data-delete-saved-name]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const name = btn.getAttribute('data-delete-saved-name');
-        if (!name || !confirm(`Excluir a conexão salva "${name}"? Será necessário escanear o QR de novo para conectar.`)) return;
+        if (!name || !confirm(`Excluir a sessão autenticada "${name}"? Será necessário escanear o QR de novo para conectar.`)) return;
         try {
           const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/logout`, {
             method: 'POST',

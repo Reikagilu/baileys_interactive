@@ -42,6 +42,7 @@ const EXTERNAL_MESSAGE_STRIP_KEYS = new Set([
   'fileEncSha256',
   'fileSha256',
   'waveform',
+  'messageContextInfo',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -520,6 +521,30 @@ function extractMessageText(message: unknown): string {
   return '[message]';
 }
 
+function detectRawMessageType(message: unknown, depth = 0): string {
+  if (!isRecord(message) || depth > 6) return 'unknown';
+
+  if (isRecord(message.conversation) || typeof message.conversation === 'string') return 'text';
+  if (isRecord(message.extendedTextMessage)) return 'text';
+  if (isRecord(message.audioMessage)) return 'audio';
+  if (isRecord(message.imageMessage)) return 'image';
+  if (isRecord(message.videoMessage)) return 'video';
+  if (isRecord(message.stickerMessage)) return 'sticker';
+  if (isRecord(message.documentMessage)) return 'document';
+  if (isRecord(message.locationMessage)) return 'location';
+  if (isRecord(message.contactMessage) || isRecord(message.contactsArrayMessage)) return 'contact';
+  if (isRecord(message.reactionMessage)) return 'reaction';
+
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    const nested = detectRawMessageType(wrapper.message, depth + 1);
+    if (nested !== 'unknown') return nested;
+  }
+
+  return 'unknown';
+}
+
 function shouldIncludeMediaBase64(kind: MediaKind): boolean {
   if (!config.webhooks.includeIncomingMediaBase64) return false;
   if (kind === 'video') return config.webhooks.includeIncomingVideoBase64;
@@ -806,6 +831,40 @@ function stripMessageNoise(value: unknown, depth = 0): unknown {
   return output;
 }
 
+function findMessageContextInfoNode(message: unknown, depth = 0): Record<string, unknown> | null {
+  if (!isRecord(message) || depth > 6) return null;
+  if (isRecord(message.messageContextInfo)) return message.messageContextInfo;
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    const nested = findMessageContextInfoNode(wrapper.message, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function extractCompactCryptoContext(rawMessage: Record<string, unknown>):
+  | { senderKeyHash?: string; recipientKeyHash?: string; messageSecret?: string }
+  | null {
+  const message = isRecord(rawMessage.message) ? rawMessage.message : null;
+  if (!message) return null;
+
+  const ctx = findMessageContextInfoNode(message);
+  if (!ctx) return null;
+
+  const metadata = isRecord(ctx.deviceListMetadata) ? ctx.deviceListMetadata : null;
+  const senderKeyHash = metadata && typeof metadata.senderKeyHash === 'string' ? metadata.senderKeyHash : undefined;
+  const recipientKeyHash = metadata && typeof metadata.recipientKeyHash === 'string' ? metadata.recipientKeyHash : undefined;
+  const messageSecret = typeof ctx.messageSecret === 'string' ? ctx.messageSecret : undefined;
+
+  if (!senderKeyHash && !recipientKeyHash && !messageSecret) return null;
+  return {
+    senderKeyHash,
+    recipientKeyHash,
+    messageSecret,
+  };
+}
+
 function getCachedMessageForRaw(instance: string, rawMessage: Record<string, unknown>): CachedMessageInternal | null {
   const key = isRecord(rawMessage.key) ? rawMessage.key : null;
   const jid = key && typeof key.remoteJid === 'string' ? key.remoteJid.trim() : '';
@@ -824,10 +883,25 @@ async function normalizeUpsertMessagesForExternal(
   const normalized: Array<Record<string, unknown>> = [];
   for (const raw of messages) {
     const cleaned = stripMessageNoise(raw) as Record<string, unknown>;
+    const inferredType = detectRawMessageType(raw.message);
+    cleaned.message_type = inferredType;
+    cleaned.messageType = inferredType;
+    const cryptoContext = extractCompactCryptoContext(raw);
+    if (cryptoContext) {
+      cleaned.crypto = cryptoContext;
+    }
+    const senderFallback = extractSender(raw);
+    cleaned.sender = {
+      name: senderFallback.senderName,
+      number: senderFallback.senderNumber,
+    };
     const cached = getCachedMessageForRaw(instance, raw);
     if (cached) {
       await ensureCachedMessageMedia(instance, cached);
       cleaned.text = cached.text;
+      const resolvedType = cached.media?.kind ?? inferredType;
+      cleaned.message_type = resolvedType;
+      cleaned.messageType = resolvedType;
       cleaned.sender = {
         name: cached.senderName,
         number: cached.senderNumber,
@@ -1353,7 +1427,7 @@ export async function createInstance(
             type: typeof payloadObject.type === 'string' ? payloadObject.type : 'notify',
             messages: outboundMessages,
           };
-          emitWebhookEvent('messages.upsert', { instance: name, payload: payloadForEvents }, name);
+          emitWebhookEvent('messages.upsert', payloadForEvents, name);
           await emitInstanceEvent(name, 'MESSAGES_UPSERT', payloadForEvents);
         })();
       }
