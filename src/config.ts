@@ -63,9 +63,9 @@ export const config = {
     purgeIntervalMs: parseNumber(process.env.WEBHOOK_PURGE_INTERVAL_MS, 60000, 1000),
     includeIncomingMediaBase64: parseBoolean(
       process.env.WEBHOOK_INCLUDE_INCOMING_MEDIA_BASE64 ?? process.env.WEBHOOK_INCLUDE_INCOMING_AUDIO_BASE64,
-      true
+      false
     ),
-    includeIncomingVideoBase64: parseBoolean(process.env.WEBHOOK_INCLUDE_INCOMING_VIDEO_BASE64, true),
+    includeIncomingVideoBase64: parseBoolean(process.env.WEBHOOK_INCLUDE_INCOMING_VIDEO_BASE64, false),
     incomingMediaBase64MaxBytes: parseNumber(
       process.env.WEBHOOK_INCOMING_MEDIA_BASE64_MAX_BYTES ?? process.env.WEBHOOK_INCOMING_AUDIO_BASE64_MAX_BYTES,
       2 * 1024 * 1024,

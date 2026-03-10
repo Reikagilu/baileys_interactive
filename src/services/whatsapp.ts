@@ -38,6 +38,11 @@ const MEDIA_NODE_BY_KIND = {
   sticker: { field: 'stickerMessage', downloadType: 'sticker' },
   document: { field: 'documentMessage', downloadType: 'document' },
 } as const;
+const EXTERNAL_MESSAGE_STRIP_KEYS = new Set([
+  'fileEncSha256',
+  'fileSha256',
+  'waveform',
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -791,6 +796,61 @@ async function enrichIncomingMediaBase64(messages: Array<Record<string, unknown>
   return enriched;
 }
 
+function stripMessageNoise(value: unknown, depth = 0): unknown {
+  if (!isRecord(value) || depth > 8) return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (EXTERNAL_MESSAGE_STRIP_KEYS.has(key)) continue;
+    output[key] = stripMessageNoise(entry, depth + 1);
+  }
+  return output;
+}
+
+function getCachedMessageForRaw(instance: string, rawMessage: Record<string, unknown>): CachedMessageInternal | null {
+  const key = isRecord(rawMessage.key) ? rawMessage.key : null;
+  const jid = key && typeof key.remoteJid === 'string' ? key.remoteJid.trim() : '';
+  const id = key && typeof key.id === 'string' ? key.id.trim() : '';
+  if (!jid || !id) return null;
+  const chats = chatCache.get(instance);
+  const chat = chats?.get(jid);
+  if (!chat) return null;
+  return chat.messages.find((item) => item.id === id) ?? null;
+}
+
+async function normalizeUpsertMessagesForExternal(
+  instance: string,
+  messages: Array<Record<string, unknown>>
+): Promise<Array<Record<string, unknown>>> {
+  const normalized: Array<Record<string, unknown>> = [];
+  for (const raw of messages) {
+    const cleaned = stripMessageNoise(raw) as Record<string, unknown>;
+    const cached = getCachedMessageForRaw(instance, raw);
+    if (cached) {
+      await ensureCachedMessageMedia(instance, cached);
+      cleaned.text = cached.text;
+      cleaned.sender = {
+        name: cached.senderName,
+        number: cached.senderNumber,
+      };
+      if (cached.media) {
+        cleaned.media = {
+          kind: cached.media.kind,
+          mimeType: cached.media.mimeType,
+          fileName: cached.media.fileName,
+          caption: cached.media.caption,
+          mediaId: cached.media.mediaId,
+          url: cached.media.mediaId ? buildMediaUrl(instance, cached.media.mediaId) : undefined,
+          base64: config.webhooks.includeIncomingMediaBase64 ? cached.media.base64 : undefined,
+          bytes: cached.media.bytes,
+          omittedReason: cached.media.omittedReason,
+        };
+      }
+    }
+    normalized.push(cleaned);
+  }
+  return normalized;
+}
+
 function ensureInstanceChatMap(instance: string): Map<string, CachedChat> {
   let map = chatCache.get(instance);
   if (!map) {
@@ -1007,13 +1067,16 @@ export async function reconnectPreviouslyActiveInstances(authFolder: string): Pr
       .map((entry) => entry.name.trim())
   );
 
-  const queueFromState = [...savedSessions].filter((name) => {
+  const queue = [...savedSessions].filter((name) => {
+    if (!isValidInstanceName(name)) return false;
     const state = lastInstanceState.get(name);
-    if (!state) return false;
-    return state.wasConnected && !state.stoppedByUser;
+    if (state?.stoppedByUser) return false;
+    if (state?.wasConnected) return true;
+    if (autostartInstances.has(name)) return true;
+    // Backward compatibility: sessions salvas antigas (sem estado persistido)
+    // devem tentar restaurar no startup, exceto quando foram explicitamente paradas.
+    return !state;
   });
-  const queue = (queueFromState.length > 0 ? queueFromState : [...autostartInstances])
-    .filter((name) => isValidInstanceName(name) && savedSessions.has(name));
   let started = 0;
 
   for (const name of queue) {
@@ -1232,7 +1295,7 @@ export async function createInstance(
             stoppedByUser: true,
           });
           chatCache.delete(name);
-          clearInstanceMediaBinaries(name);
+          clearInstanceMediaBinaries(name, true);
           stopAlwaysOnline(name);
           stopContinuousHistorySync(name);
           return;
@@ -1284,12 +1347,14 @@ export async function createInstance(
       if (list.length > 0) {
         void (async () => {
           const enrichedList = await enrichIncomingMediaBase64(list);
+          const outboundMessages = await normalizeUpsertMessagesForExternal(name, enrichedList);
+          const payloadObject = (typeof payload === 'object' && payload !== null ? payload : {}) as Record<string, unknown>;
           const payloadForEvents = {
-            ...(typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {}),
-            messages: enrichedList,
+            type: typeof payloadObject.type === 'string' ? payloadObject.type : 'notify',
+            messages: outboundMessages,
           };
           emitWebhookEvent('messages.upsert', { instance: name, payload: payloadForEvents }, name);
-          await emitInstanceEvent(name, 'MESSAGES_UPSERT', { payload: payloadForEvents });
+          await emitInstanceEvent(name, 'MESSAGES_UPSERT', payloadForEvents);
         })();
       }
 
@@ -1599,7 +1664,7 @@ export function disconnectInstance(name: string, options?: { keepAutostart?: boo
   }
   pairingIssuedAt.delete(name);
   chatCache.delete(name);
-  clearInstanceMediaBinaries(name);
+  clearInstanceMediaBinaries(name, true);
   stopAlwaysOnline(name);
   stopContinuousHistorySync(name);
   return true;
