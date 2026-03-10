@@ -209,6 +209,8 @@ Quando `API_KEYS_JSON` é informado, cada chave pode ter escopos diferentes. A `
 | POST   | `/v1/messages/send_poll` | Enquete |
 | POST   | `/v1/messages/send_carousel_helpers` | Carrossel com cards (imagem + botões) |
 
+Nota: todas as rotas de envio aceitam `typingMs` opcional (300-10000 ms) para simular status "digitando" antes do envio. Tambem aceitam `typingMode: "auto"` para calcular delay automaticamente com base no tamanho do texto quando `typingMs` nao for enviado.
+
 Em todos os endpoints de mensagens o body deve incluir **`instance`** (nome da instância) e **`to`** (número no formato `5511999999999`).
 
 Quando `idempotency-key` é enviado, respostas repetidas para a mesma rota/instância/destinatário retornam o mesmo resultado com `idempotency.replayed = true`.

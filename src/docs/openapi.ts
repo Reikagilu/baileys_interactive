@@ -1518,6 +1518,19 @@ export const openApiSpec = {
         properties: {
           instance: { type: 'string', example: 'main' },
           to: { type: 'string', example: '5511999999999' },
+          typingMs: {
+            type: 'integer',
+            minimum: 300,
+            maximum: 10000,
+            description: 'Delay opcional de digitacao antes do envio da mensagem.',
+            example: 1800,
+          },
+          typingMode: {
+            type: 'string',
+            enum: ['auto', 'manual'],
+            description: 'Modo de digitacao. `auto` calcula delay por tamanho do texto quando typingMs nao for informado.',
+            example: 'auto',
+          },
         },
       },
       BaseSendMessagePayload: {

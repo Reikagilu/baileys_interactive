@@ -16,6 +16,7 @@ export interface InstanceContext {
 
 export interface WASocketLike {
   sendMessage: (jid: string, content: MessageContent) => Promise<{ key?: { id?: string }; messageTimestamp?: number }>;
+  presenceSubscribe?: (jid: string) => Promise<unknown>;
   relayMessage?: (jid: string, content: unknown, opts?: unknown) => Promise<unknown>;
   requestPairingCode?: (phoneNumber: string) => Promise<string>;
   readMessages?: (keys: Array<{ remoteJid: string; id: string; participant?: string; fromMe?: boolean }>) => Promise<void>;
