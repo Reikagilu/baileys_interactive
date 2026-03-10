@@ -246,6 +246,7 @@ async function sendBasicMessage(
     instance,
     to: jid,
     messageId: sent?.key?.id,
+    typingMs: typingMs ?? 0,
     idempotency: {
       key: idempotencyKey || null,
       replayed: false,
@@ -444,8 +445,9 @@ router.post('/send_menu', async (req: Request, res: Response) => {
     .join('\n');
 
   const menuContent = { text: menuText } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, menuContent, resolveTypingMs(body as unknown as Record<string, unknown>, menuContent, parseTypingMs(body.typingMs)));
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'plain_menu' });
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, menuContent, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, menuContent, typingMs);
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'plain_menu', typingMs: typingMs ?? 0 });
 });
 
 /**
@@ -488,9 +490,10 @@ router.post('/send_buttons_helpers', async (req: Request, res: Response) => {
       buttons: nativeButtons,
     },
   } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
 
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_reply' });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_reply', typingMs: typingMs ?? 0 });
 });
 
 /**
@@ -539,9 +542,10 @@ router.post('/send_interactive_helpers', async (req: Request, res: Response) => 
       buttons,
     },
   } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
 
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_cta' });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_cta', typingMs: typingMs ?? 0 });
 });
 
 /**
@@ -595,9 +599,10 @@ router.post('/send_list_helpers', async (req: Request, res: Response) => {
       sections,
     },
   } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
 
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_list' });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_list', typingMs: typingMs ?? 0 });
 });
 
 /**
@@ -642,9 +647,10 @@ router.post('/send_poll', async (req: Request, res: Response) => {
       selectableCount,
     },
   } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
 
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'poll' });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'poll', typingMs: typingMs ?? 0 });
 });
 
 /**
@@ -708,9 +714,10 @@ router.post('/send_carousel_helpers', async (req: Request, res: Response) => {
       cards: carouselCards,
     },
   } as MessageContent;
-  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
+  const typingMs = resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs));
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
 
-  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_carousel' });
+  return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_carousel', typingMs: typingMs ?? 0 });
 });
 
 export default router;
