@@ -9,6 +9,106 @@ import type { MessageContent } from '../types/whatsapp.js';
 import { sendError, sendOk } from '../utils/api-response.js';
 
 const router = Router();
+const MIN_TYPING_MS = 300;
+const MAX_TYPING_MS = 10000;
+const AUTO_TYPING_BASE_MS = 700;
+const AUTO_TYPING_PER_CHAR_MS = 45;
+const AUTO_TYPING_JITTER_MIN_MS = -250;
+const AUTO_TYPING_JITTER_MAX_MS = 350;
+
+function parseTypingMs(raw: unknown): number | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  const rounded = Math.round(value);
+  if (rounded <= 0) return null;
+  return Math.max(MIN_TYPING_MS, Math.min(MAX_TYPING_MS, rounded));
+}
+
+function parseTypingMode(raw: unknown): 'auto' | 'manual' | null {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const normalized = String(raw).trim().toLowerCase();
+  if (normalized === 'auto') return 'auto';
+  if (normalized === 'manual') return 'manual';
+  return null;
+}
+
+function randomIntBetween(min: number, max: number): number {
+  const floorMin = Math.ceil(min);
+  const floorMax = Math.floor(max);
+  return Math.floor(Math.random() * (floorMax - floorMin + 1)) + floorMin;
+}
+
+function computeAutoTypingMs(seedText: string): number {
+  const jitter = randomIntBetween(AUTO_TYPING_JITTER_MIN_MS, AUTO_TYPING_JITTER_MAX_MS);
+  const raw = AUTO_TYPING_BASE_MS + seedText.length * AUTO_TYPING_PER_CHAR_MS + jitter;
+  return Math.max(MIN_TYPING_MS, Math.min(MAX_TYPING_MS, raw));
+}
+
+function extractTypingSeed(body: Record<string, unknown>, content: MessageContent | null): string {
+  const bodyText = String(body.text ?? body.caption ?? body.name ?? '').trim();
+  if (bodyText) return bodyText;
+
+  if (content && typeof content === 'object') {
+    const candidate = content as Record<string, unknown>;
+    const text = String(candidate.text ?? candidate.caption ?? '').trim();
+    if (text) return text;
+
+    const poll = candidate.poll;
+    if (poll && typeof poll === 'object') {
+      const pollName = String((poll as Record<string, unknown>).name ?? '').trim();
+      if (pollName) return pollName;
+    }
+  }
+
+  return '';
+}
+
+function resolveTypingMs(
+  body: Record<string, unknown>,
+  content: MessageContent | null,
+  explicitTypingMs?: number | null
+): number | null {
+  const manualTyping = explicitTypingMs ?? parseTypingMs(body.typingMs);
+  if (manualTyping) return manualTyping;
+
+  const mode = parseTypingMode(body.typingMode);
+  if (mode !== 'auto') return null;
+
+  const seedText = extractTypingSeed(body, content);
+  return computeAutoTypingMs(seedText);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendMessageWithTyping(
+  ctx: ReturnType<typeof validateInstance>,
+  jid: string,
+  content: MessageContent,
+  typingMs: number | null
+) {
+  if (ctx && typingMs && typeof ctx.sock.sendPresenceUpdate === 'function') {
+    try {
+      await ctx.sock.presenceSubscribe?.(jid);
+    } catch {
+      // ignore subscribe failures
+    }
+    try {
+      await ctx.sock.sendPresenceUpdate('composing', jid);
+    } catch {
+      // ignore presence failures
+    }
+    await sleep(typingMs);
+    try {
+      await ctx.sock.sendPresenceUpdate('paused', jid);
+    } catch {
+      // ignore presence failures
+    }
+  }
+  return ctx?.sock.sendMessage(jid, content);
+}
 
 type InteractiveCta =
   | { type: 'url'; text: string; url: string }
@@ -140,7 +240,8 @@ async function sendBasicMessage(
     return sendError(res, 400, validationError);
   }
 
-  const sent = await ctx.sock.sendMessage(jid, content);
+  const typingMs = resolveTypingMs(body, content);
+  const sent = await sendMessageWithTyping(ctx, jid, content, typingMs);
   const resultPayload = {
     instance,
     to: jid,
@@ -320,6 +421,8 @@ router.post('/send_menu', async (req: Request, res: Response) => {
     text?: string;
     options?: Array<{ id: string; text: string; description?: string }>;
     footer?: string;
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -340,7 +443,8 @@ router.post('/send_menu', async (req: Request, res: Response) => {
     .filter(Boolean)
     .join('\n');
 
-  const sent = await ctx.sock.sendMessage(jid, { text: menuText });
+  const menuContent = { text: menuText } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, menuContent, resolveTypingMs(body as unknown as Record<string, unknown>, menuContent, parseTypingMs(body.typingMs)));
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'plain_menu' });
 });
 
@@ -354,6 +458,8 @@ router.post('/send_buttons_helpers', async (req: Request, res: Response) => {
     text?: string;
     footer?: string;
     buttons?: Array<{ id: string; text: string }>;
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -374,14 +480,15 @@ router.post('/send_buttons_helpers', async (req: Request, res: Response) => {
 
   const nativeButtons = buttons.map((b) => ({ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: b.text, id: b.id }) }));
 
-  const sent = await ctx.sock.sendMessage(jid, {
+  const content = {
     text: body.text,
     footer: body.footer,
     interactiveButtons: {
       type: 'reply',
       buttons: nativeButtons,
     },
-  } as MessageContent);
+  } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
 
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_reply' });
 });
@@ -397,6 +504,8 @@ router.post('/send_interactive_helpers', async (req: Request, res: Response) => 
     footer?: string;
     ctas?: unknown[];
     buttons?: unknown[];
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -422,14 +531,15 @@ router.post('/send_interactive_helpers', async (req: Request, res: Response) => 
     return { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: cta.text, id: cta.id }) };
   });
 
-  const sent = await ctx.sock.sendMessage(jid, {
+  const content = {
     text: body.text,
     footer: body.footer,
     interactiveButtons: {
       type: 'cta',
       buttons,
     },
-  } as MessageContent);
+  } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
 
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_buttons_cta' });
 });
@@ -448,6 +558,8 @@ router.post('/send_list_helpers', async (req: Request, res: Response) => {
       title: string;
       rows: Array<{ id: string; title: string; description?: string }>;
     }>;
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -474,7 +586,7 @@ router.post('/send_list_helpers', async (req: Request, res: Response) => {
   const ctx = validateInstance(instance, res);
   if (!ctx) return;
 
-  const sent = await ctx.sock.sendMessage(jid, {
+  const content = {
     text: body.text,
     footer: body.footer,
     interactiveList: {
@@ -482,7 +594,8 @@ router.post('/send_list_helpers', async (req: Request, res: Response) => {
       buttonText: body.buttonText,
       sections,
     },
-  } as MessageContent);
+  } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
 
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_list' });
 });
@@ -497,6 +610,8 @@ router.post('/send_poll', async (req: Request, res: Response) => {
     name?: string;
     options?: string[];
     selectableCount?: number;
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -520,13 +635,14 @@ router.post('/send_poll', async (req: Request, res: Response) => {
   const ctx = validateInstance(instance, res);
   if (!ctx) return;
 
-  const sent = await ctx.sock.sendMessage(jid, {
+  const content = {
     poll: {
       name: body.name,
       values: options,
       selectableCount,
     },
-  } as MessageContent);
+  } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
 
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'poll' });
 });
@@ -547,6 +663,8 @@ router.post('/send_carousel_helpers', async (req: Request, res: Response) => {
       imageUrl?: string;
       buttons?: Array<{ id: string; text: string }>;
     }>;
+    typingMs?: number;
+    typingMode?: 'auto' | 'manual';
   };
 
   const instance = resolveInstanceName(body.instance, res);
@@ -582,14 +700,15 @@ router.post('/send_carousel_helpers', async (req: Request, res: Response) => {
     })),
   }));
 
-  const sent = await ctx.sock.sendMessage(jid, {
+  const content = {
     text: body.text,
     footer: body.footer,
     interactiveCarousel: {
       type: 'nativeCarousel',
       cards: carouselCards,
     },
-  } as MessageContent);
+  } as MessageContent;
+  const sent = await sendMessageWithTyping(ctx, jid, content, resolveTypingMs(body as unknown as Record<string, unknown>, content, parseTypingMs(body.typingMs)));
 
   return sendOk(res, { instance, to: jid, messageId: sent?.key?.id, style: 'native_carousel' });
 });
