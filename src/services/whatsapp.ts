@@ -1,7 +1,10 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import type { InstanceContext } from '../types/whatsapp.js';
+import { config } from '../config.js';
 import { isValidInstanceName } from '../utils/helpers.js';
+import { signMediaUrlToken } from '../utils/media-signature.js';
 import { emitWebhookEvent } from './webhooks.js';
 import { emitInstanceEvent, getInstanceGeneral, getInstancePanelConfig } from './instance-config.js';
 
@@ -14,15 +17,69 @@ const syncHistoryCursor = new Map<string, number>();
 const runtimePath = path.resolve(process.cwd(), '.runtime');
 const startupStatePath = path.join(runtimePath, 'autostart-instances.json');
 const autostartInstances = new Set<string>();
+const lastStatePath = path.join(runtimePath, 'instance-last-state.json');
+const lastInstanceState = new Map<string, { status: string; wasConnected: boolean; stoppedByUser: boolean; updatedAt: string }>();
+const mediaStoragePath = path.resolve(process.cwd(), 'data', 'chat-media');
+const mediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
 const CONTINUOUS_HISTORY_SYNC_MS = 7000;
 const CONTINUOUS_HISTORY_BATCH_CHATS = 6;
 const CONTINUOUS_HISTORY_FETCH_COUNT = 120;
+const MESSAGE_WRAPPER_KEYS = [
+  'ephemeralMessage',
+  'viewOnceMessage',
+  'viewOnceMessageV2',
+  'viewOnceMessageV2Extension',
+  'documentWithCaptionMessage',
+] as const;
+const MEDIA_NODE_BY_KIND = {
+  audio: { field: 'audioMessage', downloadType: 'audio' },
+  image: { field: 'imageMessage', downloadType: 'image' },
+  video: { field: 'videoMessage', downloadType: 'video' },
+  sticker: { field: 'stickerMessage', downloadType: 'sticker' },
+  document: { field: 'documentMessage', downloadType: 'document' },
+} as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+type MediaKind = keyof typeof MEDIA_NODE_BY_KIND;
+
+interface CachedMedia {
+  kind: MediaKind;
+  mimeType?: string;
+  fileName?: string;
+  caption?: string;
+  base64?: string;
+  url?: string;
+  bytes?: number;
+  mediaId?: string;
+  omittedReason?: 'too_large' | 'download_failed';
+}
+
+interface CachedMediaBinary {
+  instance: string;
+  mediaId: string;
+  kind: MediaKind;
+  mimeType: string;
+  relativePath: string;
+  sizeBytes: number;
+  createdAt: number;
+  expiresAt: number;
+}
 
 interface CachedMessage {
   id: string;
   fromMe: boolean;
   text: string;
   timestamp: number;
+  senderName?: string;
+  senderNumber?: string;
+  media?: CachedMedia;
+}
+
+interface CachedMessageInternal extends CachedMessage {
+  mediaSource?: { kind: MediaKind; node: Record<string, unknown> };
 }
 
 interface CachedChat {
@@ -31,10 +88,77 @@ interface CachedChat {
   unreadCount: number;
   lastMessage: string;
   lastTimestamp: number;
-  messages: CachedMessage[];
+  messages: CachedMessageInternal[];
 }
 
 const chatCache = new Map<string, Map<string, CachedChat>>();
+const chatMediaBinaryStore = new Map<string, CachedMediaBinary>();
+
+function buildMediaUrl(instance: string, mediaId: string): string {
+  const exp = Math.floor(Date.now() / 1000) + config.media.signedUrlTtlSeconds;
+  const sig = signMediaUrlToken(config.media.signedUrlSecret, instance, mediaId, exp);
+  return `/v1/media/${encodeURIComponent(instance)}/${encodeURIComponent(mediaId)}?exp=${exp}&sig=${encodeURIComponent(sig)}`;
+}
+
+function mediaFileExtension(kind: MediaKind, mimeType?: string): string {
+  const value = String(mimeType ?? '').trim().toLowerCase();
+  if (value === 'image/jpeg') return 'jpg';
+  if (value === 'image/png') return 'png';
+  if (value === 'image/webp') return 'webp';
+  if (value === 'image/gif') return 'gif';
+  if (value === 'video/mp4') return 'mp4';
+  if (value === 'video/webm') return 'webm';
+  if (value === 'audio/ogg') return 'ogg';
+  if (value === 'audio/mpeg') return 'mp3';
+  if (value === 'audio/mp4') return 'm4a';
+  if (value === 'application/pdf') return 'pdf';
+  if (kind === 'video') return 'mp4';
+  if (kind === 'audio') return 'ogg';
+  if (kind === 'sticker') return 'webp';
+  if (kind === 'image') return 'jpg';
+  return 'bin';
+}
+
+function loadMediaIndex(): void {
+  chatMediaBinaryStore.clear();
+  try {
+    if (!fs.existsSync(mediaIndexPath)) return;
+    const raw = fs.readFileSync(mediaIndexPath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const [mediaId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object') continue;
+      const entry = value as Partial<CachedMediaBinary>;
+      if (!entry.instance || !entry.relativePath || !entry.mimeType || !entry.kind) continue;
+      const normalized: CachedMediaBinary = {
+        mediaId,
+        instance: String(entry.instance),
+        kind: entry.kind as MediaKind,
+        mimeType: String(entry.mimeType),
+        relativePath: String(entry.relativePath),
+        sizeBytes: Number(entry.sizeBytes ?? 0),
+        createdAt: Number(entry.createdAt ?? Date.now()),
+        expiresAt: Number(entry.expiresAt ?? Date.now()),
+      };
+      const absolutePath = path.join(mediaStoragePath, normalized.relativePath);
+      if (fs.existsSync(absolutePath)) {
+        chatMediaBinaryStore.set(mediaId, normalized);
+      }
+    }
+  } catch {
+    // ignore malformed index
+  }
+}
+
+function persistMediaIndex(): void {
+  try {
+    fs.mkdirSync(runtimePath, { recursive: true });
+    const payload = Object.fromEntries([...chatMediaBinaryStore.entries()].sort(([a], [b]) => a.localeCompare(b)));
+    fs.writeFileSync(mediaIndexPath, JSON.stringify(payload, null, 2), 'utf8');
+  } catch {
+    // ignore persistence failures
+  }
+}
 
 function normalizeTimestamp(raw: unknown): number {
   const toMs = (value: number): number => {
@@ -101,6 +225,36 @@ function loadAutostartState(): void {
   }
 }
 
+function loadLastInstanceState(): void {
+  lastInstanceState.clear();
+  try {
+    if (!fs.existsSync(lastStatePath)) return;
+    const raw = fs.readFileSync(lastStatePath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return;
+
+    for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
+      const normalizedName = String(name ?? '').trim();
+      if (!isValidInstanceName(normalizedName)) continue;
+      if (!value || typeof value !== 'object') continue;
+      const record = value as {
+        status?: unknown;
+        wasConnected?: unknown;
+        stoppedByUser?: unknown;
+        updatedAt?: unknown;
+      };
+      lastInstanceState.set(normalizedName, {
+        status: String(record.status ?? 'unknown'),
+        wasConnected: Boolean(record.wasConnected),
+        stoppedByUser: Boolean(record.stoppedByUser),
+        updatedAt: String(record.updatedAt ?? new Date().toISOString()),
+      });
+    }
+  } catch {
+    // ignore malformed file
+  }
+}
+
 function persistAutostartState(): void {
   try {
     fs.mkdirSync(runtimePath, { recursive: true });
@@ -109,6 +263,39 @@ function persistAutostartState(): void {
   } catch {
     // ignore persistence failures
   }
+}
+
+function persistLastInstanceState(): void {
+  try {
+    fs.mkdirSync(runtimePath, { recursive: true });
+    const payload = Object.fromEntries(
+      [...lastInstanceState.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+    );
+    fs.writeFileSync(lastStatePath, JSON.stringify(payload, null, 2), 'utf8');
+  } catch {
+    // ignore persistence failures
+  }
+}
+
+function trackLastInstanceState(
+  name: string,
+  patch: Partial<{ status: string; wasConnected: boolean; stoppedByUser: boolean }>
+): void {
+  const current = lastInstanceState.get(name) ?? {
+    status: 'unknown',
+    wasConnected: false,
+    stoppedByUser: false,
+    updatedAt: new Date().toISOString(),
+  };
+  const next = {
+    status: patch.status ?? current.status,
+    wasConnected: patch.wasConnected ?? current.wasConnected,
+    stoppedByUser: patch.stoppedByUser ?? current.stoppedByUser,
+    updatedAt: new Date().toISOString(),
+  };
+  lastInstanceState.set(name, next);
+  persistLastInstanceState();
 }
 
 function markAutostart(name: string, enabled: boolean): void {
@@ -121,6 +308,9 @@ function markAutostart(name: string, enabled: boolean): void {
 }
 
 loadAutostartState();
+loadLastInstanceState();
+loadMediaIndex();
+purgeExpiredMediaBinaries();
 
 function stopAlwaysOnline(name: string): void {
   const timer = alwaysOnlineIntervals.get(name);
@@ -325,6 +515,282 @@ function extractMessageText(message: unknown): string {
   return '[message]';
 }
 
+function shouldIncludeMediaBase64(kind: MediaKind): boolean {
+  if (!config.webhooks.includeIncomingMediaBase64) return false;
+  if (kind === 'video') return config.webhooks.includeIncomingVideoBase64;
+  return true;
+}
+
+function maxMediaBytes(kind: MediaKind, scope: 'chat' | 'webhook'): number {
+  if (scope === 'webhook') {
+    if (kind === 'video') return config.webhooks.incomingVideoBase64MaxBytes;
+    return config.webhooks.incomingMediaBase64MaxBytes;
+  }
+  if (kind === 'video') return config.limits.chatVideoMaxBytes;
+  return config.limits.chatInlineMediaMaxBytes;
+}
+
+function purgeExpiredMediaBinaries(now = Date.now()): void {
+  const ttl = config.limits.chatMediaRetentionMs;
+  let changed = false;
+  for (const [mediaId, item] of chatMediaBinaryStore.entries()) {
+    if (item.expiresAt <= now || now - item.createdAt > ttl) {
+      const absolutePath = path.join(mediaStoragePath, item.relativePath);
+      try {
+        if (fs.existsSync(absolutePath)) fs.rmSync(absolutePath, { force: true });
+      } catch {
+        // ignore deletion failures
+      }
+      chatMediaBinaryStore.delete(mediaId);
+      changed = true;
+    }
+  }
+  if (changed) persistMediaIndex();
+}
+
+function clearInstanceMediaBinaries(instance: string, force = false): void {
+  if (!force) return;
+  let changed = false;
+  for (const [mediaId, item] of chatMediaBinaryStore.entries()) {
+    if (item.instance === instance) {
+      const absolutePath = path.join(mediaStoragePath, item.relativePath);
+      try {
+        if (fs.existsSync(absolutePath)) fs.rmSync(absolutePath, { force: true });
+      } catch {
+        // ignore deletion failures
+      }
+      chatMediaBinaryStore.delete(mediaId);
+      changed = true;
+    }
+  }
+  if (changed) persistMediaIndex();
+}
+
+function isSafeInlineMime(kind: MediaKind, mimeType?: string): boolean {
+  const value = String(mimeType ?? '').trim().toLowerCase();
+  if (!value) return kind !== 'video';
+  if (kind === 'image') return value.startsWith('image/') && value !== 'image/svg+xml';
+  if (kind === 'audio') return value.startsWith('audio/');
+  if (kind === 'sticker') return value === 'image/webp' || value === 'image/png';
+  if (kind === 'video') return value.startsWith('video/');
+  return false;
+}
+
+function storeMediaBinary(instance: string, media: CachedMedia): CachedMedia {
+  if (!media.base64) return media;
+  const mimeType = media.mimeType || (media.kind === 'video' ? 'video/mp4' : 'application/octet-stream');
+  if (!isSafeInlineMime(media.kind, mimeType) && media.kind !== 'document') {
+    return {
+      ...media,
+      base64: undefined,
+      omittedReason: 'download_failed',
+    };
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(media.base64, 'base64');
+  } catch {
+    return {
+      ...media,
+      base64: undefined,
+      omittedReason: 'download_failed',
+    };
+  }
+
+  if (!bytes.length || bytes.length > maxMediaBytes(media.kind, 'chat')) {
+    return {
+      ...media,
+      base64: undefined,
+      omittedReason: 'too_large',
+    };
+  }
+
+  const createdAt = Date.now();
+  const expiresAt = createdAt + config.limits.chatMediaRetentionMs;
+  const mediaId = randomUUID();
+  const ext = mediaFileExtension(media.kind, mimeType);
+  const year = new Date(createdAt).getUTCFullYear();
+  const month = String(new Date(createdAt).getUTCMonth() + 1).padStart(2, '0');
+  const day = String(new Date(createdAt).getUTCDate()).padStart(2, '0');
+  const relativePath = path.join(instance, String(year), month, day, `${mediaId}.${ext}`);
+  const absolutePath = path.join(mediaStoragePath, relativePath);
+  try {
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, bytes);
+  } catch {
+    return {
+      ...media,
+      base64: undefined,
+      omittedReason: 'download_failed',
+    };
+  }
+
+  chatMediaBinaryStore.set(mediaId, {
+    instance,
+    mediaId,
+    kind: media.kind,
+    mimeType,
+    relativePath,
+    sizeBytes: bytes.length,
+    createdAt,
+    expiresAt,
+  });
+  persistMediaIndex();
+
+  return {
+    ...media,
+    mediaId,
+    base64: undefined,
+    bytes: bytes.length,
+  };
+}
+
+function findMediaNode(message: unknown, depth = 0): { kind: MediaKind; node: Record<string, unknown> } | null {
+  if (!isRecord(message) || depth > 6) return null;
+
+  for (const [kind, configByKind] of Object.entries(MEDIA_NODE_BY_KIND) as Array<
+    [MediaKind, { field: string; downloadType: string }]
+  >) {
+    const candidate = message[configByKind.field];
+    if (isRecord(candidate)) {
+      return { kind, node: candidate };
+    }
+  }
+
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    const nested = findMediaNode(wrapper.message, depth + 1);
+    if (nested) return nested;
+  }
+
+  return null;
+}
+
+function injectMediaBase64(message: unknown, kind: MediaKind, base64: string, depth = 0): unknown {
+  if (!isRecord(message) || depth > 6) return message;
+
+  const mediaField = MEDIA_NODE_BY_KIND[kind].field;
+  if (isRecord(message[mediaField])) {
+    return {
+      ...message,
+      [mediaField]: {
+        ...(message[mediaField] as Record<string, unknown>),
+        base64,
+      },
+    };
+  }
+
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    return {
+      ...message,
+      [wrapperKey]: {
+        ...wrapper,
+        message: injectMediaBase64(wrapper.message, kind, base64, depth + 1),
+      },
+    };
+  }
+
+  return message;
+}
+
+async function downloadMediaBase64(
+  node: Record<string, unknown>,
+  kind: MediaKind,
+  scope: 'chat' | 'webhook' = 'webhook'
+): Promise<{ base64?: string; bytes?: number; omittedReason?: 'too_large' | 'download_failed' } | null> {
+  if (scope === 'webhook' && !shouldIncludeMediaBase64(kind)) return null;
+
+  try {
+    const module = (await import('baileys')) as {
+      downloadContentFromMessage?: (
+        message: Record<string, unknown>,
+        type: string
+      ) => Promise<AsyncIterable<Uint8Array | Buffer>>;
+    };
+
+    if (typeof module.downloadContentFromMessage !== 'function') return { omittedReason: 'download_failed' };
+
+    const stream = await module.downloadContentFromMessage(node, MEDIA_NODE_BY_KIND[kind].downloadType);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const limit = maxMediaBytes(kind, scope);
+
+    for await (const chunk of stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > limit) {
+        return { omittedReason: 'too_large' };
+      }
+      chunks.push(buffer);
+    }
+
+    if (!chunks.length) return { omittedReason: 'download_failed' };
+    return {
+      base64: Buffer.concat(chunks).toString('base64'),
+      bytes: total,
+    };
+  } catch {
+    return { omittedReason: 'download_failed' };
+  }
+}
+
+function extractMediaMeta(message: unknown): { kind: MediaKind; mimeType?: string; caption?: string; fileName?: string; base64?: string } | null {
+  const found = findMediaNode(message);
+  if (!found) return null;
+
+  const mimeType = typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined;
+  const caption = typeof found.node.caption === 'string' ? found.node.caption : undefined;
+  const fileName = typeof found.node.fileName === 'string' ? found.node.fileName : undefined;
+  const base64 = typeof found.node.base64 === 'string' ? found.node.base64 : undefined;
+  return {
+    kind: found.kind,
+    mimeType,
+    caption,
+    fileName,
+    base64,
+  };
+}
+
+function extractSender(rawMessage: Record<string, unknown>): { senderName?: string; senderNumber?: string } {
+  const key = isRecord(rawMessage.key) ? rawMessage.key : {};
+  const participant = typeof key.participant === 'string' ? key.participant : '';
+  const remoteJid = typeof key.remoteJid === 'string' ? key.remoteJid : '';
+  const senderJid = participant || remoteJid;
+  const senderNumber = senderJid ? senderJid.split('@')[0] : undefined;
+  const senderName = typeof rawMessage.pushName === 'string' ? rawMessage.pushName.trim() : undefined;
+  return {
+    senderName: senderName || undefined,
+    senderNumber,
+  };
+}
+
+async function enrichIncomingMediaBase64(messages: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+  if (!config.webhooks.includeIncomingMediaBase64 || messages.length === 0) return messages;
+
+  const enriched = [...messages];
+  for (let i = 0; i < messages.length; i += 1) {
+    const current = messages[i];
+    const message = isRecord(current.message) ? current.message : null;
+    if (!message) continue;
+
+    const found = findMediaNode(message);
+    if (!found) continue;
+    const mediaData = await downloadMediaBase64(found.node, found.kind, 'webhook');
+    if (!mediaData?.base64) continue;
+
+    enriched[i] = {
+      ...current,
+      message: injectMediaBase64(message, found.kind, mediaData.base64),
+    };
+  }
+
+  return enriched;
+}
+
 function ensureInstanceChatMap(instance: string): Map<string, CachedChat> {
   let map = chatCache.get(instance);
   if (!map) {
@@ -336,7 +802,18 @@ function ensureInstanceChatMap(instance: string): Map<string, CachedChat> {
 
 function updateCachedMessage(
   instance: string,
-  payload: { jid: string; id: string; fromMe: boolean; text: string; timestamp: number; incrementUnread?: boolean }
+  payload: {
+    jid: string;
+    id: string;
+    fromMe: boolean;
+    text: string;
+    timestamp: number;
+    incrementUnread?: boolean;
+    senderName?: string;
+    senderNumber?: string;
+    media?: CachedMedia;
+    mediaSource?: { kind: MediaKind; node: Record<string, unknown> };
+  }
 ): boolean {
   const chats = ensureInstanceChatMap(instance);
   const existing = chats.get(payload.jid);
@@ -351,7 +828,20 @@ function updateCachedMessage(
       messages: [],
   };
 
-  if (chat.messages.some((message) => message.id === payload.id)) {
+  const existingMessage = chat.messages.find((message) => message.id === payload.id);
+  if (existingMessage) {
+    if (payload.senderName) existingMessage.senderName = payload.senderName;
+    if (payload.senderNumber) existingMessage.senderNumber = payload.senderNumber;
+    if (payload.media) {
+      existingMessage.media = {
+        ...(existingMessage.media ?? {}),
+        ...payload.media,
+      } as CachedMedia;
+    }
+    if (payload.mediaSource) {
+      existingMessage.mediaSource = payload.mediaSource;
+    }
+    chats.set(payload.jid, chat);
     return false;
   }
 
@@ -367,6 +857,10 @@ function updateCachedMessage(
     fromMe: payload.fromMe,
     text: payload.text,
     timestamp: payload.timestamp,
+    senderName: payload.senderName,
+    senderNumber: payload.senderNumber,
+    media: payload.media,
+    mediaSource: payload.mediaSource,
   });
 
   chats.set(payload.jid, chat);
@@ -442,6 +936,9 @@ function ingestMessagesToCache(
     const message = msg.message;
     const timestamp = normalizeTimestamp((msg as { messageTimestamp?: unknown }).messageTimestamp);
     const text = extractMessageText(message);
+    const sender = extractSender(msg);
+    const mediaMeta = extractMediaMeta(message);
+    const mediaFound = findMediaNode(message);
 
     const wasInserted = updateCachedMessage(instance, {
       jid: remoteJid,
@@ -450,6 +947,18 @@ function ingestMessagesToCache(
       text,
       timestamp,
       incrementUnread: fromHistory ? false : !Boolean(key.fromMe),
+      senderName: sender.senderName,
+      senderNumber: sender.senderNumber,
+      media: mediaMeta
+        ? {
+            kind: mediaMeta.kind,
+            mimeType: mediaMeta.mimeType,
+            fileName: mediaMeta.fileName,
+            caption: mediaMeta.caption,
+            base64: mediaMeta.base64,
+          }
+        : undefined,
+      mediaSource: mediaFound ?? undefined,
     });
     if (wasInserted) inserted += 1;
   }
@@ -498,7 +1007,13 @@ export async function reconnectPreviouslyActiveInstances(authFolder: string): Pr
       .map((entry) => entry.name.trim())
   );
 
-  const queue = [...autostartInstances].filter((name) => isValidInstanceName(name) && savedSessions.has(name));
+  const queueFromState = [...savedSessions].filter((name) => {
+    const state = lastInstanceState.get(name);
+    if (!state) return false;
+    return state.wasConnected && !state.stoppedByUser;
+  });
+  const queue = (queueFromState.length > 0 ? queueFromState : [...autostartInstances])
+    .filter((name) => isValidInstanceName(name) && savedSessions.has(name));
   let started = 0;
 
   for (const name of queue) {
@@ -629,6 +1144,11 @@ export async function createInstance(
         ctx.qr = null;
         reconnectAttempts.set(name, 0);
         markAutostart(name, true);
+        trackLastInstanceState(name, {
+          status: 'connected',
+          wasConnected: true,
+          stoppedByUser: false,
+        });
         const currentUser = (ctx.sock.user as { id?: string; name?: string } | undefined) ?? {};
         const linkedJid = String(currentUser.id ?? '').trim();
         const linkedNumber = linkedJid ? linkedJid.split(':')[0].split('@')[0] : '';
@@ -654,7 +1174,7 @@ export async function createInstance(
         startContinuousHistorySync(name, ctx);
       }
 
-      if (connection === 'close') {
+        if (connection === 'close') {
         // Ignore close events from stale sockets that are no longer current.
         if (instances.get(name) !== ctx) {
           return;
@@ -664,6 +1184,9 @@ export async function createInstance(
         const { code, message } = formatDisconnectInfo(lastDisconnect);
         ctx.status = 'disconnected';
         ctx.qr = null;
+        trackLastInstanceState(name, {
+          status: 'disconnected',
+        });
 
         console.log(
           `[whatsapp][${name}] connection_close code=${String(code ?? 'n/a')} message=${String(message ?? 'n/a')}`
@@ -703,7 +1226,13 @@ export async function createInstance(
           instances.delete(name);
           reconnectAttempts.delete(name);
           markAutostart(name, false);
+          trackLastInstanceState(name, {
+            status: 'disconnected',
+            wasConnected: false,
+            stoppedByUser: true,
+          });
           chatCache.delete(name);
+          clearInstanceMediaBinaries(name);
           stopAlwaysOnline(name);
           stopContinuousHistorySync(name);
           return;
@@ -752,14 +1281,16 @@ export async function createInstance(
       const ingested = ingestMessagesToCache(name, originalList, { fromHistory: false });
       const list = ingested.list;
 
-      const payloadForEvents = {
-        ...(typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {}),
-        messages: list,
-      };
-
       if (list.length > 0) {
-        emitWebhookEvent('messages.upsert', { instance: name, payload: payloadForEvents }, name);
-        void emitInstanceEvent(name, 'MESSAGES_UPSERT', { payload: payloadForEvents });
+        void (async () => {
+          const enrichedList = await enrichIncomingMediaBase64(list);
+          const payloadForEvents = {
+            ...(typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {}),
+            messages: enrichedList,
+          };
+          emitWebhookEvent('messages.upsert', { instance: name, payload: payloadForEvents }, name);
+          await emitInstanceEvent(name, 'MESSAGES_UPSERT', { payload: payloadForEvents });
+        })();
       }
 
       const settings = getInstanceGeneral(name);
@@ -1055,9 +1586,20 @@ export function disconnectInstance(name: string, options?: { keepAutostart?: boo
   reconnectAttempts.delete(name);
   if (!options?.keepAutostart) {
     markAutostart(name, false);
+    trackLastInstanceState(name, {
+      status: 'disconnected',
+      wasConnected: false,
+      stoppedByUser: true,
+    });
+  } else {
+    trackLastInstanceState(name, {
+      status: 'disconnected',
+      stoppedByUser: false,
+    });
   }
   pairingIssuedAt.delete(name);
   chatCache.delete(name);
+  clearInstanceMediaBinaries(name);
   stopAlwaysOnline(name);
   stopContinuousHistorySync(name);
   return true;
@@ -1086,8 +1628,14 @@ export async function logoutInstance(name: string, authFolder: string): Promise<
     instances.delete(name);
     reconnectAttempts.delete(name);
     markAutostart(name, false);
+    trackLastInstanceState(name, {
+      status: 'disconnected',
+      wasConnected: false,
+      stoppedByUser: true,
+    });
     pairingIssuedAt.delete(name);
     chatCache.delete(name);
+    clearInstanceMediaBinaries(name, true);
     stopAlwaysOnline(name);
     stopContinuousHistorySync(name);
   }
@@ -1132,12 +1680,106 @@ export function getInstanceChatList(name: string): Array<{
     .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
 }
 
-export function getInstanceChatMessages(name: string, jid: string): CachedMessage[] {
+function toPublicCachedMessage(instance: string, message: CachedMessageInternal): CachedMessage {
+  const media = message.media
+    ? {
+        ...message.media,
+        url: message.media.mediaId ? buildMediaUrl(instance, message.media.mediaId) : undefined,
+      }
+    : undefined;
+
+  return {
+    id: message.id,
+    fromMe: message.fromMe,
+    text: message.text,
+    timestamp: message.timestamp,
+    senderName: message.senderName,
+    senderNumber: message.senderNumber,
+    media,
+  };
+}
+
+async function ensureCachedMessageMedia(instance: string, message: CachedMessageInternal): Promise<void> {
+  if (!message.media || message.media.base64 || message.media.omittedReason || !message.mediaSource) return;
+
+  const downloaded = await downloadMediaBase64(message.mediaSource.node, message.mediaSource.kind, 'chat');
+  if (downloaded?.base64) {
+    const nextMimeType = message.media.mimeType ?? message.mediaSource.node.mimetype;
+    if (!isSafeInlineMime(message.mediaSource.kind, typeof nextMimeType === 'string' ? nextMimeType : undefined)) {
+      message.media = {
+        ...message.media,
+        omittedReason: 'download_failed',
+      };
+      return;
+    }
+
+    message.media = {
+      ...message.media,
+      base64: downloaded.base64,
+      bytes: downloaded.bytes,
+    };
+
+    message.media = storeMediaBinary(instance, message.media);
+    return;
+  }
+
+  if (downloaded?.omittedReason) {
+    message.media = {
+      ...message.media,
+      omittedReason: downloaded.omittedReason,
+    };
+  }
+}
+
+function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessageInternal[] {
   const chats = chatCache.get(name);
   if (!chats) return [];
   const chat = chats.get(jid);
   if (!chat) return [];
   return [...chat.messages].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+export function getInstanceChatMessages(name: string, jid: string): CachedMessage[] {
+  return getInstanceChatMessagesInternal(name, jid).map((item) => toPublicCachedMessage(name, item));
+}
+
+export async function getInstanceChatMessagesWithMedia(name: string, jid: string): Promise<CachedMessage[]> {
+  purgeExpiredMediaBinaries();
+  const list = getInstanceChatMessagesInternal(name, jid);
+  for (const message of list) {
+    await ensureCachedMessageMedia(name, message);
+  }
+  return list.map((item) => toPublicCachedMessage(name, item));
+}
+
+export function getInstanceChatMediaBinary(
+  name: string,
+  mediaId: string
+): { ok: boolean; mimeType?: string; bytes?: Buffer; error?: 'not_found' } {
+  purgeExpiredMediaBinaries();
+  const item = chatMediaBinaryStore.get(mediaId);
+  if (!item || item.instance !== name) {
+    return { ok: false, error: 'not_found' };
+  }
+
+  const absolutePath = path.join(mediaStoragePath, item.relativePath);
+  let bytes: Buffer;
+  try {
+    if (!fs.existsSync(absolutePath)) {
+      chatMediaBinaryStore.delete(mediaId);
+      persistMediaIndex();
+      return { ok: false, error: 'not_found' };
+    }
+    bytes = fs.readFileSync(absolutePath);
+  } catch {
+    return { ok: false, error: 'not_found' };
+  }
+
+  return {
+    ok: true,
+    mimeType: item.mimeType,
+    bytes,
+  };
 }
 
 export async function syncInstanceChatHistory(

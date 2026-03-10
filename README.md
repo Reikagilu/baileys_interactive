@@ -55,9 +55,16 @@ Variáveis em `.env`:
 | `WEBHOOK_WORKER_LOCK_MS` | Tempo do lease/lock de entrega em processamento | 30000 |
 | `WEBHOOK_DLQ_RETENTION_MS` | Retenção de itens em DLQ antes de purge automático | 604800000 |
 | `WEBHOOK_PURGE_INTERVAL_MS` | Intervalo para purge automático de DLQ no worker | 60000 |
+| `WEBHOOK_INCLUDE_INCOMING_MEDIA_BASE64` | Inclui `base64` em mídia recebida (`audio`, `image`, `sticker`, `document`) no evento `messages.upsert` e no chat | true |
+| `WEBHOOK_INCLUDE_INCOMING_VIDEO_BASE64` | Inclui `base64` em `video` recebido (pode gerar payload grande) | true |
+| `WEBHOOK_INCOMING_MEDIA_BASE64_MAX_BYTES` | Limite de bytes para serializar mídia não-vídeo em `base64` | 2097152 |
+| `WEBHOOK_INCOMING_VIDEO_BASE64_MAX_BYTES` | Limite de bytes para serializar vídeo em `base64` | 5242880 |
 | `IDEMPOTENCY_ENABLED` | Habilita deduplicação por `idempotency-key` | true |
 | `IDEMPOTENCY_TTL_MS` | TTL da resposta idempotente em memória | 600000 |
 | `IDEMPOTENCY_MAX_ENTRIES` | Máximo de chaves idempotentes em memória | 5000 |
+| `MEDIA_SIGNED_URL_SECRET` | Segredo HMAC para assinar URLs públicas de mídia (`/v1/media/...`) | API_KEY |
+| `MEDIA_SIGNED_URL_TTL_SECONDS` | Tempo de expiração da URL assinada de mídia | 3600 |
+| `CHAT_MEDIA_RETENTION_MS` | Retenção de mídia do chat em disco (90 dias) | 7776000000 |
 
 ## Desenvolvimento
 

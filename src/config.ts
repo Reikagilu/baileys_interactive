@@ -61,11 +61,26 @@ export const config = {
     embeddedWorkerEnabled: parseBoolean(process.env.WEBHOOK_EMBEDDED_WORKER_ENABLED, true),
     dlqRetentionMs: parseNumber(process.env.WEBHOOK_DLQ_RETENTION_MS, 7 * 24 * 60 * 60 * 1000, 60 * 1000),
     purgeIntervalMs: parseNumber(process.env.WEBHOOK_PURGE_INTERVAL_MS, 60000, 1000),
+    includeIncomingMediaBase64: parseBoolean(
+      process.env.WEBHOOK_INCLUDE_INCOMING_MEDIA_BASE64 ?? process.env.WEBHOOK_INCLUDE_INCOMING_AUDIO_BASE64,
+      true
+    ),
+    includeIncomingVideoBase64: parseBoolean(process.env.WEBHOOK_INCLUDE_INCOMING_VIDEO_BASE64, true),
+    incomingMediaBase64MaxBytes: parseNumber(
+      process.env.WEBHOOK_INCOMING_MEDIA_BASE64_MAX_BYTES ?? process.env.WEBHOOK_INCOMING_AUDIO_BASE64_MAX_BYTES,
+      2 * 1024 * 1024,
+      1024
+    ),
+    incomingVideoBase64MaxBytes: parseNumber(process.env.WEBHOOK_INCOMING_VIDEO_BASE64_MAX_BYTES, 5 * 1024 * 1024, 1024),
   },
   idempotency: {
     enabled: parseBoolean(process.env.IDEMPOTENCY_ENABLED, true),
     ttlMs: parseNumber(process.env.IDEMPOTENCY_TTL_MS, 10 * 60 * 1000, 1000),
     maxEntries: parseNumber(process.env.IDEMPOTENCY_MAX_ENTRIES, 5000, 100),
+  },
+  media: {
+    signedUrlSecret: process.env.MEDIA_SIGNED_URL_SECRET ?? process.env.API_KEY ?? 'change-me-in-production',
+    signedUrlTtlSeconds: parseNumber(process.env.MEDIA_SIGNED_URL_TTL_SECONDS, 3600, 60),
   },
   limits: {
     maxButtons: 3,
@@ -73,6 +88,13 @@ export const config = {
     maxListSections: 10,
     maxListRowsPerSection: 10,
     maxPollOptions: 12,
+    chatInlineMediaMaxBytes: parseNumber(process.env.CHAT_INLINE_MEDIA_MAX_BYTES, 1536 * 1024, 1024),
+    chatVideoMaxBytes: parseNumber(process.env.CHAT_VIDEO_MAX_BYTES, 8 * 1024 * 1024, 1024),
+    chatMediaRetentionMs: parseNumber(
+      process.env.CHAT_MEDIA_RETENTION_MS ?? process.env.CHAT_MEDIA_TTL_MS,
+      90 * 24 * 60 * 60 * 1000,
+      60 * 1000
+    ),
   },
 } as const;
 

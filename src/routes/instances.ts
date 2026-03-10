@@ -7,7 +7,8 @@ import {
   getInstance,
   getAllInstances,
   getInstanceChatList,
-  getInstanceChatMessages,
+  getInstanceChatMediaBinary,
+  getInstanceChatMessagesWithMedia,
   markInstanceChatAsRead,
   normalizePairingPhoneNumber,
   removeInstance,
@@ -335,14 +336,34 @@ router.get('/:name/chats', (req: Request, res: Response) => {
 /**
  * GET /v1/instances/:name/chats/:jid/messages
  */
-router.get('/:name/chats/:jid/messages', (req: Request, res: Response) => {
+router.get('/:name/chats/:jid/messages', async (req: Request, res: Response) => {
   const { name, jid } = req.params;
   if (!getInstance(name)) {
     return sendError(res, 404, 'instance_not_found');
   }
   const decodedJid = decodeURIComponent(jid);
   markInstanceChatAsRead(name, decodedJid);
-  return sendOk(res, { instance: name, jid: decodedJid, messages: getInstanceChatMessages(name, decodedJid) });
+  const messages = await getInstanceChatMessagesWithMedia(name, decodedJid);
+  return sendOk(res, { instance: name, jid: decodedJid, messages });
+});
+
+/**
+ * GET /v1/instances/:name/media/:mediaId
+ */
+router.get('/:name/media/:mediaId', (req: Request, res: Response) => {
+  const { name, mediaId } = req.params;
+  if (!getInstance(name)) {
+    return sendError(res, 404, 'instance_not_found');
+  }
+
+  const media = getInstanceChatMediaBinary(name, String(mediaId || '').trim());
+  if (!media.ok || !media.bytes || !media.mimeType) {
+    return sendError(res, 404, 'media_not_found');
+  }
+
+  res.setHeader('Cache-Control', 'private, max-age=60');
+  res.setHeader('Content-Type', media.mimeType);
+  return res.status(200).send(media.bytes);
 });
 
 /**
