@@ -63,6 +63,11 @@ interface CachedMedia {
   omittedReason?: 'too_large' | 'download_failed';
 }
 
+interface CachedContact {
+  displayName?: string;
+  number?: string;
+}
+
 interface CachedMediaBinary {
   instance: string;
   mediaId: string;
@@ -82,6 +87,7 @@ interface CachedMessage {
   senderName?: string;
   senderNumber?: string;
   media?: CachedMedia;
+  contact?: CachedContact;
 }
 
 interface CachedMessageInternal extends CachedMessage {
@@ -785,6 +791,53 @@ function extractMediaMeta(message: unknown): { kind: MediaKind; mimeType?: strin
   };
 }
 
+function parsePhoneFromVcard(vcardRaw: string): string | undefined {
+  const match = vcardRaw.match(/TEL[^:]*:([^\r\n]+)/i);
+  if (!match || !match[1]) return undefined;
+  return match[1].replace(/[^0-9+]/g, '').trim() || undefined;
+}
+
+function extractContactMeta(message: unknown): CachedContact | null {
+  if (!isRecord(message)) return null;
+
+  const contact = isRecord(message.contactMessage) ? message.contactMessage : null;
+  if (contact) {
+    const displayName = typeof contact.displayName === 'string' ? contact.displayName.trim() : undefined;
+    const number =
+      typeof contact.number === 'string'
+        ? contact.number.trim()
+        : typeof contact.vcard === 'string'
+          ? parsePhoneFromVcard(contact.vcard)
+          : undefined;
+    if (!displayName && !number) return null;
+    return {
+      displayName: displayName || undefined,
+      number: number || undefined,
+    };
+  }
+
+  const contactsArray = isRecord(message.contactsArrayMessage) ? message.contactsArrayMessage : null;
+  const contactsList = Array.isArray(contactsArray?.contacts) ? contactsArray.contacts : null;
+  if (contactsList && contactsList.length > 0) {
+    const first = isRecord(contactsList[0]) ? contactsList[0] : null;
+    if (!first) return null;
+    const displayName = typeof first.displayName === 'string' ? first.displayName.trim() : undefined;
+    const number =
+      typeof first.number === 'string'
+        ? first.number.trim()
+        : typeof first.vcard === 'string'
+          ? parsePhoneFromVcard(first.vcard)
+          : undefined;
+    if (!displayName && !number) return null;
+    return {
+      displayName: displayName || undefined,
+      number: number || undefined,
+    };
+  }
+
+  return null;
+}
+
 function extractSender(rawMessage: Record<string, unknown>): { senderName?: string; senderNumber?: string } {
   const key = isRecord(rawMessage.key) ? rawMessage.key : {};
   const participant = typeof key.participant === 'string' ? key.participant : '';
@@ -950,18 +1003,25 @@ async function resolveReactionTarget(
   }
 
   await ensureCachedMessageMedia(instance, target);
+  const targetType = target.media?.kind ?? (target.contact ? 'contact' : 'text');
   return {
     id: target.id,
     chatJid,
     participant: ref.targetParticipant,
     emoji: ref.emoji,
     found: true,
-    type: target.media?.kind ?? 'text',
+    type: targetType,
     text: target.text,
     sender: {
       name: target.senderName,
       number: target.senderNumber,
     },
+    contact: target.contact
+      ? {
+          displayName: target.contact.displayName,
+          number: target.contact.number,
+        }
+      : undefined,
     media: target.media
       ? {
           kind: target.media.kind,
@@ -1066,6 +1126,7 @@ function updateCachedMessage(
     senderName?: string;
     senderNumber?: string;
     media?: CachedMedia;
+    contact?: CachedContact;
     mediaSource?: { kind: MediaKind; node: Record<string, unknown> };
   }
 ): boolean {
@@ -1092,6 +1153,12 @@ function updateCachedMessage(
         ...payload.media,
       } as CachedMedia;
     }
+    if (payload.contact) {
+      existingMessage.contact = {
+        ...(existingMessage.contact ?? {}),
+        ...payload.contact,
+      };
+    }
     if (payload.mediaSource) {
       existingMessage.mediaSource = payload.mediaSource;
     }
@@ -1114,6 +1181,7 @@ function updateCachedMessage(
     senderName: payload.senderName,
     senderNumber: payload.senderNumber,
     media: payload.media,
+    contact: payload.contact,
     mediaSource: payload.mediaSource,
   });
 
@@ -1192,6 +1260,7 @@ function ingestMessagesToCache(
     const text = extractMessageText(message);
     const sender = extractSender(msg);
     const mediaMeta = extractMediaMeta(message);
+    const contactMeta = extractContactMeta(message);
     const mediaFound = findMediaNode(message);
 
     const wasInserted = updateCachedMessage(instance, {
@@ -1212,6 +1281,7 @@ function ingestMessagesToCache(
             base64: mediaMeta.base64,
           }
         : undefined,
+      contact: contactMeta ?? undefined,
       mediaSource: mediaFound ?? undefined,
     });
     if (wasInserted) inserted += 1;
@@ -1955,6 +2025,7 @@ function toPublicCachedMessage(instance: string, message: CachedMessageInternal)
     senderName: message.senderName,
     senderNumber: message.senderNumber,
     media,
+    contact: message.contact,
   };
 }
 
