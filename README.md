@@ -1,4 +1,4 @@
-# rscara
+# Beyound
 
 API em TypeScript para multiplas instancias WhatsApp com InfiniteAPI (fork Baileys), com:
 
