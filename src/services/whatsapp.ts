@@ -865,6 +865,117 @@ function extractCompactCryptoContext(rawMessage: Record<string, unknown>):
   };
 }
 
+function findReactionMessageNode(message: unknown, depth = 0): Record<string, unknown> | null {
+  if (!isRecord(message) || depth > 6) return null;
+  if (isRecord(message.reactionMessage)) return message.reactionMessage;
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    const nested = findReactionMessageNode(wrapper.message, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function extractReactionReference(rawMessage: Record<string, unknown>): {
+  emoji?: string;
+  targetMessageId?: string;
+  targetRemoteJid?: string;
+  targetParticipant?: string;
+} | null {
+  const rootMessage = isRecord(rawMessage.message) ? rawMessage.message : null;
+  if (!rootMessage) return null;
+  const reaction = findReactionMessageNode(rootMessage);
+  if (!reaction) return null;
+
+  const reactionKey = isRecord(reaction.key) ? reaction.key : null;
+  const targetMessageId =
+    typeof reactionKey?.id === 'string'
+      ? reactionKey.id.trim()
+      : typeof reaction.stanzaId === 'string'
+        ? reaction.stanzaId.trim()
+        : '';
+  const targetRemoteJid =
+    typeof reactionKey?.remoteJid === 'string'
+      ? reactionKey.remoteJid.trim()
+      : typeof reaction.remoteJid === 'string'
+        ? reaction.remoteJid.trim()
+        : '';
+  const targetParticipant =
+    typeof reactionKey?.participant === 'string'
+      ? reactionKey.participant.trim()
+      : typeof reaction.participant === 'string'
+        ? reaction.participant.trim()
+        : '';
+  const emoji = typeof reaction.text === 'string' ? reaction.text : undefined;
+
+  return {
+    emoji,
+    targetMessageId: targetMessageId || undefined,
+    targetRemoteJid: targetRemoteJid || undefined,
+    targetParticipant: targetParticipant || undefined,
+  };
+}
+
+async function resolveReactionTarget(
+  instance: string,
+  rawMessage: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  const ref = extractReactionReference(rawMessage);
+  if (!ref || !ref.targetMessageId) return null;
+
+  const currentKey = isRecord(rawMessage.key) ? rawMessage.key : null;
+  const fallbackJid = typeof currentKey?.remoteJid === 'string' ? currentKey.remoteJid.trim() : '';
+  const chatJid = ref.targetRemoteJid || fallbackJid;
+  if (!chatJid) {
+    return {
+      id: ref.targetMessageId,
+      emoji: ref.emoji,
+      found: false,
+    };
+  }
+
+  const chats = chatCache.get(instance);
+  const chat = chats?.get(chatJid);
+  const target = chat?.messages.find((item) => item.id === ref.targetMessageId) ?? null;
+
+  if (!target) {
+    return {
+      id: ref.targetMessageId,
+      chatJid,
+      participant: ref.targetParticipant,
+      emoji: ref.emoji,
+      found: false,
+    };
+  }
+
+  await ensureCachedMessageMedia(instance, target);
+  return {
+    id: target.id,
+    chatJid,
+    participant: ref.targetParticipant,
+    emoji: ref.emoji,
+    found: true,
+    type: target.media?.kind ?? 'text',
+    text: target.text,
+    sender: {
+      name: target.senderName,
+      number: target.senderNumber,
+    },
+    media: target.media
+      ? {
+          kind: target.media.kind,
+          mimeType: target.media.mimeType,
+          fileName: target.media.fileName,
+          caption: target.media.caption,
+          mediaId: target.media.mediaId,
+          url: target.media.mediaId ? buildMediaUrl(instance, target.media.mediaId) : undefined,
+          bytes: target.media.bytes,
+        }
+      : undefined,
+  };
+}
+
 function getCachedMessageForRaw(instance: string, rawMessage: Record<string, unknown>): CachedMessageInternal | null {
   const key = isRecord(rawMessage.key) ? rawMessage.key : null;
   const jid = key && typeof key.remoteJid === 'string' ? key.remoteJid.trim() : '';
@@ -920,6 +1031,15 @@ async function normalizeUpsertMessagesForExternal(
         };
       }
     }
+
+    if (cleaned.message_type === 'reaction' || cleaned.messageType === 'reaction') {
+      const reactionTarget = await resolveReactionTarget(instance, raw);
+      if (reactionTarget) {
+        cleaned.reaction_target = reactionTarget;
+        cleaned.reactionTarget = reactionTarget;
+      }
+    }
+
     normalized.push(cleaned);
   }
   return normalized;
