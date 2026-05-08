@@ -1,33 +1,9 @@
 # syntax=docker/dockerfile:1.7
+# Estratégia: copia o dist/ base do contexto, recompila automaticamente os
+# arquivos modificados de src/ durante o build e restaura os módulos reais
+# preservados do dist base. Assim `docker compose build` já sobe com tudo certo.
 
 ARG NODE_VERSION=22
-
-FROM node:${NODE_VERSION}-bookworm-slim AS builder
-
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-ARG REPO_URL
-ARG REPO_REF=main
-
-# garante que REPO_URL foi informado
-RUN test -n "${REPO_URL}"
-
-# clona o projeto no build (ideal para seu servidor)
-RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" /app
-
-# sobrescreve public/ com os arquivos locais customizados (Chatwoot + visual)
-COPY public/ /app/public/
-# sobrescreve src/ modificado (integrations expandido com novos campos Chatwoot)
-COPY src/ /app/src/
-
-RUN npm ci \
-  && npm run build \
-  && npm prune --omit=dev \
-  && npm cache clean --force
 
 FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 
@@ -43,10 +19,17 @@ ENV MESSAGES_DB_PATH=data/messages.sqlite
 RUN mkdir -p /app/auth /app/data \
   && chown node:node /app /app/auth /app/data
 
-COPY --from=builder --chown=node:node /app/package*.json ./
-COPY --from=builder --chown=node:node /app/node_modules ./node_modules
-COPY --from=builder --chown=node:node /app/dist ./dist
-COPY --from=builder --chown=node:node /app/public ./public
+COPY --chown=node:node package*.json ./
+COPY --chown=node:node node_modules ./node_modules
+COPY --chown=node:node dist ./dist
+COPY --chown=node:node public ./public
+COPY --chown=node:node src ./src
+COPY --chown=node:node tsconfig.build.json ./tsconfig.build.json
+COPY --chown=node:node build.sh ./build.sh
+
+RUN bash ./build.sh \
+  && find ./dist -type f \( -name "*.map" -o -name "*.d.ts" \) -delete \
+  && rm -rf ./dist/tests ./dist/dist ./src ./tsconfig.build.json ./build.sh
 
 USER node
 

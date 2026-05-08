@@ -12,6 +12,7 @@ export interface ChatwootConfig {
   apiAccessToken: string;
   // Extended fields
   nameInbox: string;
+  webhookSlug: string;   // slug used in webhook URL: /chatwoot/webhook/:slug
   signMessages: boolean;
   signDelimiter: string;
   organization: string;
@@ -48,6 +49,7 @@ function defaultChatwoot(): ChatwootConfig {
     inboxId: '',
     apiAccessToken: '',
     nameInbox: 'WhatsApp',
+    webhookSlug: '',
     signMessages: false,
     signDelimiter: '\\n',
     organization: '',
@@ -140,6 +142,25 @@ export function getInstanceIntegrations(instance: string): InstanceIntegrations 
   }
 
   return toRow(row);
+}
+
+/**
+ * Find the instance name that has a given webhookSlug configured.
+ * Returns null if not found.
+ */
+export function findInstanceByWebhookSlug(slug: string): string | null {
+  const normalized = String(slug || '').trim().toLowerCase();
+  if (!normalized) return null;
+  const rows = db
+    .prepare('SELECT instance, chatwoot_json FROM integration_configs')
+    .all() as Array<Record<string, unknown>>;
+  for (const row of rows) {
+    const cfg = parseJson<ChatwootConfig>(row.chatwoot_json, defaultChatwoot());
+    if (cfg.webhookSlug && cfg.webhookSlug.trim().toLowerCase() === normalized) {
+      return String(row.instance);
+    }
+  }
+  return null;
 }
 
 export function listIntegrationInstances(): InstanceIntegrations[] {

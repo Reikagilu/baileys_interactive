@@ -25,6 +25,8 @@ services:
       ALLOW_PRIVATE_NETWORK_WEBHOOKS: "true"
       ALLOW_PRIVATE_NETWORK_INTEGRATIONS: "true"
       WEBHOOK_EMBEDDED_WORKER_ENABLED: "true"
+      SERVER_URL: "http://192.168.4.26:8787"
+      BAILEYS_LOG: "false"
 
     volumes:
       - baileys_auth:/app/auth

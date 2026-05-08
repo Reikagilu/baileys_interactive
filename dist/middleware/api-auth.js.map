@@ -1,0 +1,1 @@
+{"version":3,"file":"api-auth.js","sourceRoot":"","sources":["../../src/middleware/api-auth.ts"],"names":[],"mappings":"AAKA,MAAM,UAAU,aAAa,CAAC,cAAyB,IAA0E,OAAO,SAAgB,CAAC,CAAC,CAAC;AAC3J,MAAM,UAAU,eAAe,CAAC,GAAa,IAAyB,OAAO,SAAgB,CAAC,CAAC,CAAC"}

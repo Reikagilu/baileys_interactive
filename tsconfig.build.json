@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "rootDir": "src",
+    "outDir": "dist",
+    "strict": false,
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true,
+    "noEmitOnError": false,
+    "allowJs": false
+  },
+  "include": [
+    "src/index.ts",
+    "src/config.ts",
+    "src/routes/integrations.ts",
+    "src/services/chatwoot-bridge.ts",
+    "src/services/chatwoot-sync-store.ts",
+    "src/services/chatwoot-tracking.ts",
+    "src/services/integrations.ts",
+    "src/services/message-store.ts",
+    "src/services/whatsapp.ts"
+  ]
+}

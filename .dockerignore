@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+auth/
+data/
+dist/dist/
+node_modules/.cache/
+*.log
+tmp/
+.tmp/
+.local/
+tool-output/

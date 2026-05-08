@@ -14,15 +14,18 @@ import {
   resetUnread as msResetUnread,
   listChats as msListChats,
   listMessages as msListMessages,
+  countMessages as msCountMessages,
   clearInstance as msClearInstance,
 } from './message-store.js';
-import { dispatchToChatwoot } from './chatwoot-bridge.js';
+import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
+import { markChatwootOriginated } from './chatwoot-tracking.js';
 
 const instances = new Map<string, InstanceContext>();
 const reconnectAttempts = new Map<string, number>();
 const pairingIssuedAt = new Map<string, number>();
 const alwaysOnlineIntervals = new Map<string, NodeJS.Timeout>();
 const syncHistoryIntervals = new Map<string, NodeJS.Timeout>();
+const syncHistoryInFlight = new Set<string>();
 const syncHistoryCursor = new Map<string, number>();
 const runtimePath = path.resolve(process.cwd(), '.runtime');
 const startupStatePath = path.join(runtimePath, 'autostart-instances.json');
@@ -96,6 +99,7 @@ interface CachedMessage {
   timestamp: number;
   senderName?: string;
   senderNumber?: string;
+  participant?: string;
   media?: CachedMedia;
   contact?: CachedContact;
 }
@@ -375,6 +379,7 @@ function stopContinuousHistorySync(name: string): void {
     syncHistoryIntervals.delete(name);
   }
   syncHistoryCursor.delete(name);
+  syncHistoryInFlight.delete(name);
 }
 
 function extractMessagesFromHistoryResponse(raw: unknown): Array<Record<string, unknown>> {
@@ -401,61 +406,67 @@ function extractMessagesFromHistoryResponse(raw: unknown): Array<Record<string, 
 }
 
 async function runContinuousHistorySync(name: string, ctx: InstanceContext): Promise<void> {
-  const settings = getInstanceGeneral(name);
-  if (!settings.syncFullHistory) return;
+  if (syncHistoryInFlight.has(name)) return;
+  syncHistoryInFlight.add(name);
+  try {
+    const settings = getInstanceGeneral(name);
+    if (!settings.syncFullHistory) return;
 
-  const anySock = ctx.sock as any;
-  const hasFetchHistory = typeof anySock.fetchMessageHistory === 'function';
-  const hasResyncState = typeof anySock.resyncAppState === 'function';
-  if (!hasFetchHistory && !hasResyncState) return;
+    const anySock = ctx.sock as any;
+    const hasFetchHistory = typeof anySock.fetchMessageHistory === 'function';
+    const hasResyncState = typeof anySock.resyncAppState === 'function';
+    if (!hasFetchHistory && !hasResyncState) return;
 
-  const list = getInstanceChatList(name).filter((chat) => !(settings.ignoreGroups && chat.jid.endsWith('@g.us')));
-  if (list.length === 0) {
-    if (hasResyncState) {
-      try {
-        await anySock.resyncAppState(['critical_block', 'regular']);
-      } catch {
-        // best effort
-      }
-    }
-    return;
-  }
-
-  const start = syncHistoryCursor.get(name) ?? 0;
-  const limit = Math.min(CONTINUOUS_HISTORY_BATCH_CHATS, list.length);
-  const selected: Array<(typeof list)[number]> = [];
-  for (let i = 0; i < limit; i++) {
-    const idx = (start + i) % list.length;
-    selected.push(list[idx]);
-  }
-  syncHistoryCursor.set(name, (start + limit) % list.length);
-
-  for (const chat of selected) {
-    if (!hasFetchHistory) break;
-    const existing = getInstanceChatMessages(name, chat.jid);
-    const oldest = existing.length > 0 ? existing[0] : undefined;
-    const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
-    const oldestKey = oldest
-      ? {
-          remoteJid: chat.jid,
-          id: oldest.id,
-          fromMe: oldest.fromMe,
+    const list = getInstanceChatList(name).filter((chat) => !(settings.ignoreGroups && chat.jid.endsWith('@g.us')));
+    if (list.length === 0) {
+      if (hasResyncState) {
+        try {
+          await anySock.resyncAppState(['critical_block', 'regular']);
+        } catch {
+          // best effort
         }
-      : undefined;
-
-    try {
-      const response = await anySock.fetchMessageHistory(
-        CONTINUOUS_HISTORY_FETCH_COUNT,
-        oldestKey,
-        oldestTimestamp
-      );
-      const messages = extractMessagesFromHistoryResponse(response);
-      if (messages.length > 0) {
-        ingestMessagesToCache(name, messages, { fromHistory: true });
       }
-    } catch {
-      // best effort continuous sync
+      return;
     }
+
+    const start = syncHistoryCursor.get(name) ?? 0;
+    const limit = Math.min(CONTINUOUS_HISTORY_BATCH_CHATS, list.length);
+    const selected: Array<(typeof list)[number]> = [];
+    for (let i = 0; i < limit; i++) {
+      const idx = (start + i) % list.length;
+      selected.push(list[idx]);
+    }
+    syncHistoryCursor.set(name, (start + limit) % list.length);
+
+    for (const chat of selected) {
+      if (!hasFetchHistory) break;
+      const existing = getInstanceChatMessages(name, chat.jid);
+      const oldest = existing.length > 0 ? existing[0] : undefined;
+      const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
+      const oldestKey = oldest
+        ? {
+            remoteJid: chat.jid,
+            id: oldest.id,
+            fromMe: oldest.fromMe,
+          }
+        : undefined;
+
+      try {
+        const response = await anySock.fetchMessageHistory(
+          CONTINUOUS_HISTORY_FETCH_COUNT,
+          oldestKey,
+          oldestTimestamp
+        );
+        const messages = extractMessagesFromHistoryResponse(response);
+        if (messages.length > 0) {
+          ingestMessagesToCache(name, messages, { fromHistory: true });
+        }
+      } catch {
+        // best effort continuous sync
+      }
+    }
+  } finally {
+    syncHistoryInFlight.delete(name);
   }
 }
 
@@ -861,6 +872,17 @@ function extractSender(rawMessage: Record<string, unknown>): { senderName?: stri
   };
 }
 
+function isSkippableSystemMessage(message: unknown): boolean {
+  if (!isRecord(message)) return false;
+  if (isRecord(message.protocolMessage) || isRecord(message.senderKeyDistributionMessage)) return true;
+  for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+    const wrapper = message[wrapperKey];
+    if (!isRecord(wrapper) || !isRecord(wrapper.message)) continue;
+    if (isSkippableSystemMessage(wrapper.message)) return true;
+  }
+  return false;
+}
+
 async function enrichIncomingMediaBase64(messages: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
   if (!config.webhooks.includeIncomingMediaBase64 || messages.length === 0) return messages;
 
@@ -1135,6 +1157,7 @@ function updateCachedMessage(
     incrementUnread?: boolean;
     senderName?: string;
     senderNumber?: string;
+    participant?: string;
     media?: CachedMedia;
     contact?: CachedContact;
     mediaSource?: { kind: MediaKind; node: Record<string, unknown> };
@@ -1190,6 +1213,7 @@ function updateCachedMessage(
     timestamp: payload.timestamp,
     senderName: payload.senderName,
     senderNumber: payload.senderNumber,
+    participant: payload.participant,
     media: payload.media,
     contact: payload.contact,
     mediaSource: payload.mediaSource,
@@ -1206,8 +1230,9 @@ function updateCachedMessage(
       timestamp: payload.timestamp,
       senderName: payload.senderName,
       senderNumber: payload.senderNumber,
-      media: payload.media as Record<string, unknown> | undefined,
-      contact: payload.contact as Record<string, unknown> | undefined,
+      participant: payload.participant,
+      media: payload.media as unknown as Record<string, unknown> | undefined,
+      contact: payload.contact as unknown as Record<string, unknown> | undefined,
     });
     msUpsertMeta(instance, payload.jid, {
       lastMessage: payload.text,
@@ -1296,12 +1321,14 @@ function ingestMessagesToCache(
       id?: string;
       remoteJid?: string;
       fromMe?: boolean;
+      participant?: string;
     };
     const remoteJid = String(key.remoteJid ?? '').trim();
     const id = String(key.id ?? '').trim();
     if (!remoteJid || !id) continue;
 
     const message = msg.message;
+    if (isSkippableSystemMessage(message)) continue;
     const timestamp = normalizeTimestamp((msg as { messageTimestamp?: unknown }).messageTimestamp);
     const text = extractMessageText(message);
     const sender = extractSender(msg);
@@ -1318,6 +1345,7 @@ function ingestMessagesToCache(
       incrementUnread: fromHistory ? false : !Boolean(key.fromMe),
       senderName: sender.senderName,
       senderNumber: sender.senderNumber,
+      participant: typeof key.participant === 'string' ? key.participant.trim() || undefined : undefined,
       media: mediaMeta
         ? {
             kind: mediaMeta.kind,
@@ -1462,12 +1490,27 @@ export async function createInstance(
       return { ok: false, instance: name, error: proxyAgentResult.error };
     }
 
+    // Silent logger for Baileys: disables [BAILEYS] console.log spam (Message received,
+    // Event buffer flushed, Event buffering started, histNotification, etc.) and the
+    // pino histNotification info logs. Only fatal errors are kept.
+    const silentLogger: any = {
+      level: 'fatal',
+      fatal: (..._args: any[]) => {},
+      error: (..._args: any[]) => {},
+      warn: (..._args: any[]) => {},
+      info: (..._args: any[]) => {},
+      debug: (..._args: any[]) => {},
+      trace: (..._args: any[]) => {},
+      child: () => silentLogger,
+    };
+
     const socketOptions: any = {
       auth: state,
       printQRInTerminal: false,
       version,
       browser: Browsers.windows('Chrome'),
       syncFullHistory: generalSettings.syncFullHistory,
+      logger: silentLogger,
     };
 
     if (proxyAgentResult.agent) {
@@ -1545,6 +1588,30 @@ export async function createInstance(
 
         startAlwaysOnline(name, ctx);
         startContinuousHistorySync(name, ctx);
+
+        // Auto-create Chatwoot inbox if configured + auto-sync history if Import Messages is enabled.
+        // Wait a few seconds before sync so initial history sync has had time to populate the SQLite store.
+        void (async () => {
+          try {
+            await autoCreateChatwootInbox(name, linkedNumber ?? null);
+          } catch (err) {
+            console.error(`[whatsapp][${name}] autoCreateChatwootInbox error`, err);
+          }
+          try {
+            const { getInstanceIntegrations: getInteg } = await import('./integrations.js');
+            const { syncHistoryToChatwoot: syncHist } = await import('./chatwoot-bridge.js');
+            const cfg = getInteg(name).chatwoot;
+            if (cfg.enabled && cfg.importMessages === true && cfg.baseUrl && cfg.accountId && cfg.apiAccessToken && cfg.inboxId) {
+              // Wait 8s after connect for initial Baileys history sync to populate SQLite
+              await new Promise(r => setTimeout(r, 8000));
+              syncHist(name, undefined, 200, 'connect').catch((err) => {
+                console.warn(`[whatsapp][${name}] connect-trigger sync failed:`, (err as Error).message);
+              });
+            }
+          } catch (err) {
+            console.warn(`[whatsapp][${name}] connect-trigger sync error:`, (err as Error).message);
+          }
+        })();
       }
 
         if (connection === 'close') {
@@ -1665,8 +1732,19 @@ export async function createInstance(
           };
           emitWebhookEvent('messages.upsert', payloadForEvents, name);
           await emitInstanceEvent(name, 'MESSAGES_UPSERT', payloadForEvents);
-          // Forward to Chatwoot if integration is enabled (best-effort, non-blocking)
-          void dispatchToChatwoot(name, outboundMessages as unknown as Parameters<typeof dispatchToChatwoot>[1]);
+          // Forward to Chatwoot if integration is enabled (best-effort, non-blocking).
+          // Pre-filter system messages (protocolMessage, senderKeyDistributionMessage,
+          // historySyncNotification, reactionMessage) — they are not real user messages
+          // and should not even reach the bridge to avoid log spam and wasted work.
+          const realMessages = outboundMessages.filter((m: any) => {
+            const raw = m?.message;
+            if (!raw) return false;
+            if (raw.protocolMessage || raw.senderKeyDistributionMessage || raw.reactionMessage) return false;
+            return true;
+          });
+          if (realMessages.length > 0) {
+            void dispatchToChatwoot(name, realMessages as unknown as Parameters<typeof dispatchToChatwoot>[1]);
+          }
         })();
       }
 
@@ -2071,11 +2149,12 @@ export function getInstanceChatList(name: string): Array<{
   if (memChats) {
     for (const chat of memChats.values()) {
       const existing = result.get(chat.jid);
+      const memMessageCount = existing?.messageCount ?? chat.messages.length;
       result.set(chat.jid, {
         jid: chat.jid,
         title: chat.title || existing?.title || chat.jid.split('@')[0],
         unreadCount: chat.unreadCount,
-        messageCount: Math.max(chat.messages.length, existing?.messageCount ?? 0),
+        messageCount: memMessageCount,
         lastMessage: chat.lastMessage || existing?.lastMessage || '',
         lastTimestamp: Math.max(chat.lastTimestamp, existing?.lastTimestamp ?? 0),
       });
@@ -2100,6 +2179,7 @@ function toPublicCachedMessage(instance: string, message: CachedMessageInternal)
     timestamp: message.timestamp,
     senderName: message.senderName,
     senderNumber: message.senderNumber,
+    participant: message.participant,
     media,
     contact: message.contact,
   };
@@ -2141,6 +2221,28 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
   const chats = chatCache.get(name);
   const memMessages = chats?.get(jid)?.messages ?? [];
 
+  const mapStoredMessage = (m: {
+    id: string;
+    fromMe: boolean;
+    text: string;
+    timestamp: number;
+    senderName?: string;
+    senderNumber?: string;
+    participant?: string;
+    media?: Record<string, unknown>;
+    contact?: Record<string, unknown>;
+  }): CachedMessageInternal => ({
+    id: m.id,
+    fromMe: m.fromMe,
+    text: m.text,
+    timestamp: m.timestamp,
+    senderName: m.senderName,
+    senderNumber: m.senderNumber,
+    participant: m.participant,
+    media: m.media as unknown as CachedMedia | undefined,
+    contact: m.contact as unknown as CachedContact | undefined,
+  });
+
   // Se não há mensagens em memória, carrega do SQLite
   if (memMessages.length === 0) {
     try {
@@ -2156,28 +2258,10 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
             unreadCount: 0,
             lastMessage: stored[stored.length - 1]?.text ?? '',
             lastTimestamp: stored[stored.length - 1]?.timestamp ?? 0,
-            messages: stored.map((m) => ({
-              id: m.id,
-              fromMe: m.fromMe,
-              text: m.text,
-              timestamp: m.timestamp,
-              senderName: m.senderName,
-              senderNumber: m.senderNumber,
-              media: m.media as CachedMedia | undefined,
-              contact: m.contact as CachedContact | undefined,
-            })),
+            messages: stored.map(mapStoredMessage),
           });
         }
-        return stored.map((m) => ({
-          id: m.id,
-          fromMe: m.fromMe,
-          text: m.text,
-          timestamp: m.timestamp,
-          senderName: m.senderName,
-          senderNumber: m.senderNumber,
-          media: m.media as CachedMedia | undefined,
-          contact: m.contact as CachedContact | undefined,
-        }));
+        return stored.map(mapStoredMessage);
       }
     } catch {
       // best-effort
@@ -2187,23 +2271,15 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
 
   // Mescla memória + SQLite para garantir mensagens históricas não em memória
   try {
-    const stored = msListMessages(name, jid, config.messages.maxPerChat);
-    if (stored.length > memMessages.length) {
+    const storedCount = msCountMessages(name, jid);
+    if (storedCount > memMessages.length) {
+      const stored = msListMessages(name, jid, config.messages.maxPerChat);
       const memIds = new Set(memMessages.map((m) => m.id));
       const extra = stored.filter((m) => !memIds.has(m.id));
       if (extra.length > 0) {
         const allMessages: CachedMessageInternal[] = [
           ...memMessages,
-          ...extra.map((m) => ({
-            id: m.id,
-            fromMe: m.fromMe,
-            text: m.text,
-            timestamp: m.timestamp,
-            senderName: m.senderName,
-            senderNumber: m.senderNumber,
-            media: m.media as CachedMedia | undefined,
-            contact: m.contact as CachedContact | undefined,
-          })),
+          ...extra.map(mapStoredMessage),
         ];
         return allMessages.sort((a, b) => a.timestamp - b.timestamp);
       }
@@ -2215,13 +2291,61 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
   return [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
 }
 
+function buildQuotedMessage(name: string, jid: string, replyToId: string): Record<string, unknown> | null {
+  // Only quote messages that are already present in the live in-memory chat cache.
+  // Quoting older/stale SQLite-only messages tends to produce a temporary
+  // "Aguardando mensagem" placeholder on the device.
+  const target = chatCache.get(name)?.get(jid)?.messages.find((item) => item.id === replyToId);
+  if (!target) return null;
+
+  let message: Record<string, unknown>;
+  if (target.media?.kind === 'image') {
+    message = { imageMessage: { caption: target.media.caption || target.text || '' } };
+  } else if (target.media?.kind === 'video') {
+    message = { videoMessage: { caption: target.media.caption || target.text || '' } };
+  } else if (target.media?.kind === 'document') {
+    message = { documentMessage: { fileName: target.media.fileName || 'file', caption: target.media.caption || target.text || '' } };
+  } else if (target.media?.kind === 'audio') {
+    message = { audioMessage: {} };
+  } else if (target.contact?.displayName || target.contact?.number) {
+    message = { contactMessage: { displayName: target.contact.displayName || target.contact.number || '' } };
+  } else {
+    message = { conversation: target.text || ' ' };
+  }
+
+  return {
+    key: {
+      remoteJid: jid,
+      fromMe: target.fromMe,
+      id: target.id,
+      participant: target.participant,
+    },
+    message,
+  };
+}
+
+function normalizeSignDelimiter(value?: string): string {
+  if (!value) return '\n';
+  return value
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t');
+}
+
 export function getInstanceChatMessages(name: string, jid: string): CachedMessage[] {
   return getInstanceChatMessagesInternal(name, jid).map((item) => toPublicCachedMessage(name, item));
 }
 
-export async function getInstanceChatMessagesWithMedia(name: string, jid: string): Promise<CachedMessage[]> {
+export async function getInstanceChatMessagesWithMedia(
+  name: string,
+  jid: string,
+  onlyIds?: ReadonlySet<string>,
+): Promise<CachedMessage[]> {
   purgeExpiredMediaBinaries();
-  const list = getInstanceChatMessagesInternal(name, jid);
+  const source = getInstanceChatMessagesInternal(name, jid);
+  const list = onlyIds?.size
+    ? source.filter((message) => onlyIds.has(message.id))
+    : source;
   for (const message of list) {
     await ensureCachedMessageMedia(name, message);
   }
@@ -2399,13 +2523,21 @@ export async function sendInstanceTextMessage(
   name: string,
   jid: string,
   text: string,
+  options?: { replyToId?: string; agentName?: string; signDelimiter?: string },
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
   const ctx = instances.get(name);
   if (!ctx || !ctx.sock) return { ok: false, error: 'instance_not_found' };
   if (typeof ctx.sock.sendMessage !== 'function') return { ok: false, error: 'send_not_available' };
   try {
-    const sent = await ctx.sock.sendMessage(jid, { text }) as { key?: { id?: string } } | null;
-    return { ok: true, id: sent?.key?.id ?? undefined };
+    const delimiter = normalizeSignDelimiter(options?.signDelimiter);
+    const finalText = options?.agentName
+      ? `*${options.agentName}*:${delimiter}${text}`
+      : text;
+    const quoted = options?.replyToId ? buildQuotedMessage(name, jid, options.replyToId) : undefined;
+    const sent = await (ctx.sock.sendMessage as any)(jid, { text: finalText }, quoted ? { quoted } : undefined) as { key?: { id?: string } } | null;
+    const msgId = sent?.key?.id;
+    if (msgId) markChatwootOriginated(msgId);
+    return { ok: true, id: msgId ?? undefined };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
@@ -2418,12 +2550,15 @@ export async function sendInstanceTextMessage(
 export async function sendInstanceMediaMessage(
   name: string,
   jid: string,
-  params: {
-    mediaUrl: string;
-    mimeType?: string;
-    fileName?: string;
-    caption?: string;
-  },
+    params: {
+      mediaUrl: string;
+      mimeType?: string;
+      fileName?: string;
+      caption?: string;
+      replyToId?: string;
+      agentName?: string;
+      signDelimiter?: string;
+    },
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
   const ctx = instances.get(name);
   if (!ctx || !ctx.sock) return { ok: false, error: 'instance_not_found' };
@@ -2431,12 +2566,16 @@ export async function sendInstanceMediaMessage(
 
   try {
     const mime = params.mimeType ?? 'application/octet-stream';
+    const delimiter = normalizeSignDelimiter(params.signDelimiter);
+    const signedCaption = params.agentName
+      ? `*${params.agentName}*:${delimiter}${params.caption ?? ''}`.trim()
+      : (params.caption ?? '');
     let content: Record<string, unknown>;
 
     if (mime.startsWith('image/')) {
-      content = { image: { url: params.mediaUrl }, caption: params.caption ?? '' };
+      content = { image: { url: params.mediaUrl }, caption: signedCaption };
     } else if (mime.startsWith('video/')) {
-      content = { video: { url: params.mediaUrl }, caption: params.caption ?? '' };
+      content = { video: { url: params.mediaUrl }, caption: signedCaption };
     } else if (mime.startsWith('audio/')) {
       content = { audio: { url: params.mediaUrl }, mimetype: mime };
     } else {
@@ -2444,12 +2583,15 @@ export async function sendInstanceMediaMessage(
         document: { url: params.mediaUrl },
         mimetype: mime,
         fileName: params.fileName ?? 'file',
-        caption: params.caption ?? '',
+        caption: signedCaption,
       };
     }
 
-    const sent = await ctx.sock.sendMessage(jid, content) as { key?: { id?: string } } | null;
-    return { ok: true, id: sent?.key?.id ?? undefined };
+    const quoted = params.replyToId ? buildQuotedMessage(name, jid, params.replyToId) : undefined;
+    const sent = await (ctx.sock.sendMessage as any)(jid, content, quoted ? { quoted } : undefined) as { key?: { id?: string } } | null;
+    const msgId = sent?.key?.id;
+    if (msgId) markChatwootOriginated(msgId);
+    return { ok: true, id: msgId ?? undefined };
   } catch (err) {
     return { ok: false, error: String(err) };
   }

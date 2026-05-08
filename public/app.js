@@ -1,71 +1,404 @@
 (function () {
+  'use strict';
   const API = '';
-  const apiKeyInput = document.getElementById('apiKey');
   const API_KEY_STORAGE_KEY = 'rscara_api_key';
 
+  // ============ API key storage ============
   function getStoredApiKey() {
-    return localStorage.getItem(API_KEY_STORAGE_KEY) || sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
+    try {
+      const ls = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (ls) return ls;
+      const ss = sessionStorage.getItem(API_KEY_STORAGE_KEY);
+      if (ss) {
+        localStorage.setItem(API_KEY_STORAGE_KEY, ss);
+        return ss;
+      }
+    } catch {}
+    return '';
+  }
+  function storeApiKey(k) {
+    try {
+      if (k) {
+        localStorage.setItem(API_KEY_STORAGE_KEY, k);
+        sessionStorage.setItem(API_KEY_STORAGE_KEY, k);
+      } else {
+        localStorage.removeItem(API_KEY_STORAGE_KEY);
+        sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+      }
+    } catch {}
   }
 
-  function storeApiKey(key) {
-    if (key) {
-      localStorage.setItem(API_KEY_STORAGE_KEY, key);
-      sessionStorage.setItem(API_KEY_STORAGE_KEY, key);
-      return;
-    }
-    localStorage.removeItem(API_KEY_STORAGE_KEY);
-    sessionStorage.removeItem(API_KEY_STORAGE_KEY);
-  }
-
-  const cachedApiKey = getStoredApiKey();
-  if (cachedApiKey && !apiKeyInput.value) {
-    apiKeyInput.value = cachedApiKey;
-  }
-
-  apiKeyInput.addEventListener('input', () => {
-    storeApiKey(apiKeyInput.value.trim());
-  });
+  const apiKeyInput = document.getElementById('apiKey');
+  const stored = getStoredApiKey();
+  if (stored && !apiKeyInput.value) apiKeyInput.value = stored;
+  apiKeyInput.addEventListener('input', () => storeApiKey(apiKeyInput.value.trim()));
 
   function headers() {
     const h = { 'Content-Type': 'application/json' };
-    const key = apiKeyInput.value.trim() || getStoredApiKey();
-    if (key) {
-      h['x-api-key'] = key;
-      storeApiKey(key);
+    const k = apiKeyInput.value.trim() || getStoredApiKey();
+    if (k) {
+      h['x-api-key'] = k;
+      storeApiKey(k);
     }
     return h;
   }
 
-  function show(el, visible) {
-    el.classList.toggle('hidden', !visible);
+  // ============ Helpers ============
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+  function show(el, visible) { if (el) el.classList.toggle('hidden', !visible); }
+  function setResult(el, msg, tone) {
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'result' + (tone ? ' ' + tone : '');
+    show(el, !!msg);
+  }
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+  function delayMs(min, max) {
+    const a = Math.max(0, Number(min) || 0);
+    const b = Math.max(a, Number(max) || a);
+    return (a + Math.random() * (b - a)) * 1000;
   }
 
-  function escapeHtml(value) {
-    return String(value || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
+  // ============ Tab switching ============
+  const navBtns = document.querySelectorAll('.nav-btn[data-tab]');
+  const sections = document.querySelectorAll('section.section');
+  const topbarTitle = document.getElementById('topbarTitle');
+  const TAB_TITLES = { conexoes: 'Instâncias', disparos: 'Disparos', integracoes: 'Integrações' };
 
-  function setListState(listEl, message, tone) {
-    if (!listEl) return;
-    const toneClass = tone ? ` ${tone}` : '';
-    listEl.innerHTML = `<li class="list-state${toneClass}">${escapeHtml(message)}</li>`;
-  }
-
-  // Tabs
-  document.querySelectorAll('.tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
-      document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
-      tab.classList.add('active');
-      document.getElementById(tab.getAttribute('data-tab')).classList.add('active');
+  function activateTab(name) {
+    navBtns.forEach((b) => {
+      const active = b.dataset.tab === name;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-selected', active ? 'true' : 'false');
     });
+    sections.forEach((s) => s.classList.toggle('active', s.id === name));
+    if (topbarTitle && TAB_TITLES[name]) topbarTitle.textContent = TAB_TITLES[name];
+    if (name === 'integracoes') loadIntegrationsForSelected();
+  }
+  navBtns.forEach((b) => b.addEventListener('click', () => activateTab(b.dataset.tab)));
+
+  // ============ Connection state ============
+  let connectingInstanceName = null;
+  let connectingMode = 'qr';
+
+  // Connection elements
+  const connectModeEl = document.getElementById('connectMode');
+  const connectPhoneRow = document.getElementById('connectPhoneRow');
+  const connectInstanceSelectEl = document.getElementById('connectInstanceSelect');
+  const connectNewNameRow = document.getElementById('connectNewNameRow');
+  const instanceNameEl = document.getElementById('instanceName');
+  const pairingPhoneEl = document.getElementById('pairingPhone');
+  const pairingContainer = document.getElementById('pairingContainer');
+  const pairingCodeValueEl = document.getElementById('pairingCodeValue');
+  const qrContainer = document.getElementById('qrContainer');
+  const qrImageEl = document.getElementById('qrImage');
+  const connectStatusEl = document.getElementById('connectStatus');
+
+  connectModeEl.addEventListener('change', () => {
+    show(connectPhoneRow, connectModeEl.value === 'pairing');
+  });
+  connectInstanceSelectEl.addEventListener('change', () => {
+    show(connectNewNameRow, !connectInstanceSelectEl.value);
   });
 
-  // Tipo de disparo
+  // ============ Instance list polling ============
+  const savedListEl = document.createElement('ul'); // not used directly, kept for compat
+  const instanceListEl = document.getElementById('instanceList');
+  const stat = {
+    saved: document.getElementById('statSavedCount'),
+    active: document.getElementById('statActiveCount'),
+    connected: document.getElementById('statConnectedCount'),
+  };
+
+  let lastInstanceListMeta = { saved: [], instances: [] };
+  let instancePollHandle = null;
+  let instancePollBusy = false;
+  let syncPollBusy = false;
+
+  function instanceListMeta(saved, instances) {
+    return {
+      saved: saved.slice().sort(),
+      instances: instances
+        .map((x) => [x.instance || '', x.status || ''])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    };
+  }
+
+  function sameSimpleList(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (Array.isArray(a[i]) || Array.isArray(b[i])) {
+        const left = a[i];
+        const right = b[i];
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+        for (let j = 0; j < left.length; j += 1) {
+          if (left[j] !== right[j]) return false;
+        }
+      } else if (a[i] !== b[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function renderUnifiedList(saved, instances) {
+    const activeNames = new Set(instances.map((i) => i.instance));
+    const items = [];
+    instances.forEach((i) => items.push({ name: i.instance, status: i.status || 'unknown', saved: saved.includes(i.instance) }));
+    saved.forEach((n) => { if (!activeNames.has(n)) items.push({ name: n, status: 'saved', saved: true }); });
+    items.sort((a, b) => a.name.localeCompare(b.name));
+
+    if (items.length === 0) {
+      instanceListEl.innerHTML = '<li class="list-empty">Nenhuma instância. Crie uma usando o painel à direita.</li>';
+      return;
+    }
+
+    instanceListEl.innerHTML = items.map((it) => {
+      const sCls =
+        it.status === 'connected' ? 'state-connected' :
+        it.status === 'qr' ? 'state-qr' :
+        it.status === 'pairing' ? 'state-pairing' :
+        it.status === 'connecting' ? 'state-connecting' : 'state-disconnected';
+      const actions = [];
+      if (it.status !== 'saved') {
+        actions.push(`<a class="btn btn-primary btn-sm" href="/instance.html?instance=${encodeURIComponent(it.name)}">Painel</a>`);
+        if (it.status === 'qr') actions.push(`<button class="btn btn-secondary btn-sm" data-action="qr" data-name="${escapeHtml(it.name)}">Ver QR</button>`);
+        if (it.status === 'connected') actions.push(`<button class="btn btn-secondary btn-sm" data-action="disconnect" data-name="${escapeHtml(it.name)}">Disconnect</button>`);
+        actions.push(`<button class="btn btn-ghost btn-sm" data-action="logout" data-name="${escapeHtml(it.name)}" title="Limpa sessão (novo QR)">Logout</button>`);
+        actions.push(`<button class="btn btn-danger btn-sm" data-action="delete" data-name="${escapeHtml(it.name)}">Deletar</button>`);
+      } else {
+        actions.push(`<button class="btn btn-primary btn-sm" data-action="connect-saved" data-name="${escapeHtml(it.name)}">Conectar</button>`);
+        actions.push(`<button class="btn btn-danger btn-sm" data-action="logout" data-name="${escapeHtml(it.name)}" title="Excluir sessão salva">Excluir</button>`);
+      }
+      const statusText = it.status === 'saved' ? 'salva (offline)' : it.status;
+      return `<li class="list-item">
+        <div class="list-item-info">
+          <div class="avatar-circle">${escapeHtml((it.name[0] || '?').toUpperCase())}</div>
+          <div>
+            <div class="list-item-name">${escapeHtml(it.name)}</div>
+            <span class="status-pill ${sCls}">${escapeHtml(statusText)}</span>
+          </div>
+        </div>
+        <div class="list-item-actions">${actions.join('')}</div>
+      </li>`;
+    }).join('');
+  }
+
+  function updateOverview(saved, instances) {
+    if (stat.saved) stat.saved.textContent = saved.length;
+    if (stat.active) stat.active.textContent = instances.length;
+    if (stat.connected) stat.connected.textContent = instances.filter((s) => s.status === 'connected').length;
+  }
+
+  function updateConnectSelect(saved) {
+    const cur = connectInstanceSelectEl.value;
+    const opts = ['<option value="">— Nova conexão —</option>']
+      .concat(saved.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`));
+    connectInstanceSelectEl.innerHTML = opts.join('');
+    show(connectNewNameRow, !connectInstanceSelectEl.value);
+  }
+
+  function updateDispatchSelect(allNames) {
+    const sel = document.getElementById('dispatchInstance');
+    const cur = sel.value;
+    const opts = allNames.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`);
+    sel.innerHTML = opts.length ? opts.join('') : '<option value="main">main</option>';
+  }
+
+  function updateIntegrationSelect(allNames) {
+    const sel = document.getElementById('integrationInstance');
+    const cur = sel.value;
+    const opts = allNames.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`);
+    sel.innerHTML = opts.length ? opts.join('') : '<option value="main">main</option>';
+  }
+
+  async function refreshInstanceList() {
+    try {
+      const res = await fetch(`${API}/v1/instances`, { headers: headers() });
+      if (!res.ok) return;
+      const data = await res.json();
+      const saved = Array.isArray(data.saved) ? data.saved : [];
+      const instances = Array.isArray(data.instances) ? data.instances : [];
+
+      const meta = instanceListMeta(saved, instances);
+      if (!sameSimpleList(meta.saved, lastInstanceListMeta.saved) || !sameSimpleList(meta.instances, lastInstanceListMeta.instances)) {
+        lastInstanceListMeta = meta;
+        renderUnifiedList(saved, instances);
+        const allNames = Array.from(new Set([...instances.map((i) => i.instance), ...saved]));
+        updateConnectSelect(saved);
+        updateDispatchSelect(allNames);
+        updateIntegrationSelect(allNames);
+      }
+      updateOverview(saved, instances);
+
+      // Active QR/pairing update
+      if (connectingInstanceName) {
+        const me = instances.find((i) => i.instance === connectingInstanceName);
+        const status = me?.status;
+        if (connectingMode === 'qr' && status === 'qr') {
+          try {
+            const r = await fetch(`${API}/v1/instances/${encodeURIComponent(connectingInstanceName)}/qr`, { headers: headers() });
+            if (r.ok) {
+              const d = await r.json();
+              if (d.qr) {
+                qrImageEl.src = d.qr;
+                show(qrContainer, true);
+                setResult(connectStatusEl, 'Escaneie o QR no WhatsApp.', '');
+              }
+            }
+          } catch {}
+        } else if (status === 'connected') {
+          setResult(connectStatusEl, 'Conectado.', 'success');
+          connectingInstanceName = null;
+          show(qrContainer, false);
+          show(pairingContainer, false);
+        } else if (status === 'disconnected') {
+          setResult(connectStatusEl, 'Desconectado.', 'error');
+          connectingInstanceName = null;
+        }
+      }
+    } catch {}
+  }
+
+  instanceListEl.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const name = btn.dataset.name;
+    const action = btn.dataset.action;
+    btn.disabled = true;
+    try {
+      if (action === 'qr') {
+        const r = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/qr`, { headers: headers() });
+        const d = await r.json();
+        if (d.qr) {
+          qrImageEl.src = d.qr;
+          show(qrContainer, true);
+          show(pairingContainer, false);
+          instanceNameEl.value = name;
+        }
+      } else if (action === 'disconnect') {
+        await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/disconnect`, { method: 'POST', headers: headers() });
+      } else if (action === 'logout') {
+        if (!confirm(`Limpar sessão "${name}"?`)) { btn.disabled = false; return; }
+        await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/logout`, { method: 'POST', headers: headers() });
+      } else if (action === 'delete') {
+        if (!confirm(`Deletar instância "${name}"?`)) { btn.disabled = false; return; }
+        await fetch(`${API}/v1/instances/${encodeURIComponent(name)}`, { method: 'DELETE', headers: headers() });
+      } else if (action === 'connect-saved') {
+        connectInstanceSelectEl.value = name;
+        instanceNameEl.value = name;
+        show(connectNewNameRow, false);
+        await doConnect(name);
+      }
+      lastInstanceListMeta = { saved: [], instances: [] }; // force render
+      await refreshInstanceList();
+    } catch (err) {
+      setResult(connectStatusEl, err.message || 'Erro de rede.', 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById('btnRefreshList').addEventListener('click', () => {
+    lastInstanceListMeta = { saved: [], instances: [] };
+    refreshInstanceList();
+  });
+
+  // ============ Connect ============
+  async function requestPairingCode(name) {
+    const phone = (pairingPhoneEl.value || '').replace(/\D/g, '');
+    if (!phone) { setResult(connectStatusEl, 'Informe o número (DDI+DDD).', 'error'); return; }
+    let attempts = 0;
+    while (attempts < 2) {
+      attempts++;
+      try {
+        const r = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/pairing-code`, {
+          method: 'POST', headers: headers(), body: JSON.stringify({ phoneNumber: phone })
+        });
+        if (r.status === 503 && attempts < 2) { await sleep(1200); continue; }
+        const d = await r.json();
+        if (!r.ok) {
+          const errMap = {
+            session_already_registered: 'Sessão já autenticada. Use Logout para novo QR.',
+            pairing_channel_not_ready: 'Canal iniciando. Tente novamente em alguns segundos.',
+            empty_pairing_code: 'WhatsApp não retornou código.',
+            pairing_code_unavailable: 'Não foi possível gerar agora.',
+            pairing_code_unstable: 'Código ficou inválido. Tente outro número.',
+            pairing_code_disabled: 'Pairing code desabilitado no servidor.',
+          };
+          setResult(connectStatusEl, errMap[d.error] || d.error || 'Falha ao gerar código.', 'error');
+          return;
+        }
+        pairingCodeValueEl.textContent = d.pairingCode;
+        show(pairingContainer, true);
+        show(qrContainer, false);
+        setResult(connectStatusEl, `Pairing code gerado para ${phone}.`, 'success');
+        return;
+      } catch (err) {
+        if (attempts < 2) { await sleep(1200); continue; }
+        setResult(connectStatusEl, err.message || 'Erro de rede.', 'error');
+      }
+    }
+  }
+
+  async function doConnect(name) {
+    const mode = connectModeEl.value;
+    connectingInstanceName = name;
+    connectingMode = mode;
+    show(qrContainer, false);
+    show(pairingContainer, false);
+    setResult(connectStatusEl, 'Conectando...', '');
+    try {
+      if (mode === 'pairing') {
+        await requestPairingCode(name);
+      } else {
+        const r = await fetch(`${API}/v1/instances`, {
+          method: 'POST', headers: headers(), body: JSON.stringify({ instance: name })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const msg = d.error === 'invalid_instance_name'
+            ? 'Nome invalido. Use apenas letras, numeros, "_" ou "-" (1-64).'
+            : (d.message || d.error || `Erro ${r.status} ao criar instancia.`);
+          setResult(connectStatusEl, msg, 'error');
+          connectingInstanceName = null;
+          return;
+        }
+        if (d.qr) {
+          qrImageEl.src = d.qr;
+          show(qrContainer, true);
+          setResult(connectStatusEl, 'Escaneie o QR no WhatsApp.', '');
+        } else if (d.status === 'connected') {
+          setResult(connectStatusEl, 'Conectado.', 'success');
+          connectingInstanceName = null;
+        } else {
+          setResult(connectStatusEl, 'Aguardando QR...', '');
+        }
+      }
+    } catch (err) {
+      setResult(connectStatusEl, err.message || 'Erro de rede.', 'error');
+    }
+    lastInstanceListMeta = { saved: [], instances: [] };
+    refreshInstanceList();
+  }
+
+  const INSTANCE_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+  document.getElementById('btnConnect').addEventListener('click', async () => {
+    const sel = connectInstanceSelectEl.value;
+    const name = sel || (instanceNameEl.value.trim() || 'main');
+    if (!INSTANCE_NAME_PATTERN.test(name)) {
+      setResult(connectStatusEl, 'Nome invalido. Use apenas letras, numeros, "_" ou "-" (1-64 caracteres). Sem espacos ou acentos.', 'error');
+      return;
+    }
+    await doConnect(name);
+  });
+
+  // ============ Dispatch ============
+  const dispatchTypeEl = document.getElementById('dispatchType');
   const dispatchForms = {
     menu: document.getElementById('formMenu'),
     buttons: document.getElementById('formButtons'),
@@ -74,414 +407,333 @@
     poll: document.getElementById('formPoll'),
     carousel: document.getElementById('formCarousel'),
   };
-  document.getElementById('dispatchType').addEventListener('change', () => {
-    const type = document.getElementById('dispatchType').value;
-    Object.values(dispatchForms).forEach((f) => f && f.classList.add('hidden'));
-    if (dispatchForms[type]) dispatchForms[type].classList.remove('hidden');
-    if (type === 'list' && !document.getElementById('listSectionsList').querySelector('.block-section')) addListSection();
-    if (type === 'carousel' && !document.getElementById('carouselCardsList').querySelector('.block-section')) addCarouselCard();
+
+  function showDispatchForm(t) {
+    Object.entries(dispatchForms).forEach(([k, el]) => show(el, k === t));
+    if (t === 'list' && document.getElementById('listSectionsList').children.length === 0) addListSection();
+    if (t === 'carousel' && document.getElementById('carouselCardsList').children.length === 0) addCarouselCard();
+  }
+  dispatchTypeEl.addEventListener('change', () => showDispatchForm(dispatchTypeEl.value));
+
+  // Dynamic adders
+  function makeRemoveBtn() {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn btn-danger btn-sm';
+    b.textContent = 'Remover';
+    b.addEventListener('click', () => b.parentElement.remove());
+    return b;
+  }
+  function makeRow(...inputs) {
+    const row = document.createElement('div');
+    row.className = 'dyn-row';
+    inputs.forEach((i) => row.appendChild(i));
+    row.appendChild(makeRemoveBtn());
+    return row;
+  }
+  function inp(field, placeholder, type = 'text') {
+    const i = document.createElement('input');
+    i.type = type; i.className = 'input'; i.placeholder = placeholder;
+    i.dataset.field = field;
+    return i;
+  }
+  function selOpts(field, options) {
+    const s = document.createElement('select');
+    s.className = 'select'; s.dataset.field = field;
+    s.innerHTML = options.map((o) => `<option value="${o.v}">${o.t}</option>`).join('');
+    return s;
+  }
+
+  function addMenuOption() {
+    const list = document.getElementById('menuOptionsList');
+    list.appendChild(makeRow(inp('id', 'ID (opcional)'), inp('text', 'Texto da opção'), inp('description', 'Descrição (opcional)')));
+  }
+  function addButtonRow() {
+    const list = document.getElementById('buttonsList');
+    list.appendChild(makeRow(inp('id', 'ID'), inp('text', 'Texto')));
+  }
+  function addInteractiveRow() {
+    const list = document.getElementById('interactiveList');
+    const sel = selOpts('type', [{ v: 'url', t: 'URL' }, { v: 'copy', t: 'Copiar' }, { v: 'call', t: 'Ligar' }]);
+    list.appendChild(makeRow(sel, inp('text', 'Texto'), inp('extra', 'URL / Código / Telefone')));
+  }
+  function addPollOption() {
+    const list = document.getElementById('pollOptionsList');
+    list.appendChild(makeRow(inp('opt', 'Opção')));
+  }
+  function addListSection() {
+    const list = document.getElementById('listSectionsList');
+    const block = document.createElement('div');
+    block.className = 'dyn-block';
+    block.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <p class="dyn-block-title">Seção</p>
+        <button type="button" class="btn btn-ghost btn-sm btn-remove-block">Remover</button>
+      </div>
+      <input type="text" class="input section-title" placeholder="Título da seção">
+      <div class="section-rows" style="display:flex; flex-direction:column; gap:6px;"></div>
+      <button type="button" class="btn btn-ghost btn-sm add-row-in-section">+ Adicionar item</button>`;
+    list.appendChild(block);
+    block.querySelector('.btn-remove-block').addEventListener('click', () => block.remove());
+    block.querySelector('.add-row-in-section').addEventListener('click', () => {
+      const rows = block.querySelector('.section-rows');
+      rows.appendChild(makeRow(inp('id', 'ID'), inp('title', 'Título'), inp('desc', 'Descrição')));
+    });
+    block.querySelector('.add-row-in-section').click();
+  }
+  function addCarouselCard() {
+    const list = document.getElementById('carouselCardsList');
+    const block = document.createElement('div');
+    block.className = 'dyn-block';
+    block.innerHTML = `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+        <p class="dyn-block-title">Card</p>
+        <button type="button" class="btn btn-ghost btn-sm btn-remove-block">Remover</button>
+      </div>
+      <div class="field-row">
+        <input type="text" class="input" data-field="title" placeholder="Título">
+        <input type="text" class="input" data-field="description" placeholder="Descrição">
+      </div>
+      <div class="field-row">
+        <input type="text" class="input" data-field="footer" placeholder="Rodapé (opcional)">
+        <input type="text" class="input mono" data-field="imageUrl" placeholder="https://imagem.png">
+      </div>
+      <div class="card-buttons" style="display:flex; flex-direction:column; gap:6px;"></div>
+      <button type="button" class="btn btn-ghost btn-sm add-card-btn">+ Botão no card</button>`;
+    list.appendChild(block);
+    block.querySelector('.btn-remove-block').addEventListener('click', () => block.remove());
+    block.querySelector('.add-card-btn').addEventListener('click', () => {
+      const rows = block.querySelector('.card-buttons');
+      rows.appendChild(makeRow(inp('id', 'ID'), inp('text', 'Texto')));
+    });
+  }
+
+  document.querySelectorAll('button.add-item').forEach((b) => {
+    const map = {
+      menuOptions: addMenuOption, buttons: addButtonRow,
+      interactive: addInteractiveRow, pollOptions: addPollOption,
+      listSections: addListSection, carouselCards: addCarouselCard,
+    };
+    b.addEventListener('click', () => map[b.dataset.for]?.());
   });
-  dispatchForms.menu.classList.remove('hidden');
+  // initial rows
+  addMenuOption(); addButtonRow(); addInteractiveRow(); addPollOption();
 
-  // Instância que estamos conectando (para atualizar QR e status em tempo real)
-  let connectingInstanceName = null;
-  let connectingMode = 'qr';
-  const lastModeByInstance = new Map();
+  function getRecipients() {
+    const raw = (document.getElementById('dispatchTo').value || '').split(/[\r\n,;]+/);
+    return raw.map((s) => s.replace(/\D/g, '')).filter((s) => s.length >= 10);
+  }
+  function gatherRow(row) {
+    const out = {};
+    row.querySelectorAll('[data-field]').forEach((el) => { out[el.dataset.field] = (el.value || '').trim(); });
+    return out;
+  }
 
-  const connectModeEl = document.getElementById('connectMode');
-  const connectPhoneRowEl = document.getElementById('connectPhoneRow');
-  const pairingContainerEl = document.getElementById('pairingContainer');
-  const pairingCodeValueEl = document.getElementById('pairingCodeValue');
+  function getMenuPayload(instance, to) {
+    const opts = Array.from(document.getElementById('menuOptionsList').children).map(gatherRow)
+      .filter((o) => o.text).map((o) => ({ id: o.id || undefined, text: o.text, description: o.description || undefined }));
+    return {
+      url: '/v1/messages/send_menu',
+      body: {
+        instance, to,
+        title: (document.getElementById('menuTitle').value || 'Menu').trim(),
+        text: (document.getElementById('menuText').value || 'Escolha uma opção:').trim(),
+        options: opts.length ? opts : [{ id: '1', text: 'Opção 1' }],
+        footer: (document.getElementById('menuFooter').value || '').trim() || undefined,
+      },
+    };
+  }
+  function getButtonsPayload(instance, to) {
+    const btns = Array.from(document.getElementById('buttonsList').children).map(gatherRow)
+      .filter((o) => o.text).slice(0, 3).map((o) => ({ id: o.id || `btn${Math.random()}`, text: o.text }));
+    return {
+      url: '/v1/messages/send_buttons_helpers',
+      body: {
+        instance, to,
+        text: (document.getElementById('buttonsText').value || '').trim(),
+        footer: (document.getElementById('buttonsFooter').value || '').trim() || undefined,
+        buttons: btns.length ? btns : [{ id: 'btn1', text: 'Opção 1' }],
+      },
+    };
+  }
+  function getInteractivePayload(instance, to) {
+    const ctas = Array.from(document.getElementById('interactiveList').children).map(gatherRow)
+      .filter((o) => o.text && o.extra).map((o) => {
+        const c = { type: o.type, text: o.text };
+        if (o.type === 'url') c.url = o.extra;
+        else if (o.type === 'copy') c.copy_code = o.extra;
+        else if (o.type === 'call') c.phone_number = o.extra;
+        return c;
+      });
+    return {
+      url: '/v1/messages/send_interactive_helpers',
+      body: {
+        instance, to,
+        text: (document.getElementById('interactiveText').value || '').trim(),
+        footer: (document.getElementById('interactiveFooter').value || '').trim() || undefined,
+        ctas,
+      },
+    };
+  }
+  function getListPayload(instance, to) {
+    const sections = Array.from(document.getElementById('listSectionsList').children).map((block) => {
+      const title = block.querySelector('.section-title').value.trim();
+      const rows = Array.from(block.querySelectorAll('.section-rows .dyn-row')).map(gatherRow)
+        .filter((o) => o.title).map((o) => ({ id: o.id || `row${Math.random()}`, title: o.title, description: o.desc || '' }));
+      return { title: title || 'Seção', rows };
+    }).filter((s) => s.rows.length > 0);
+    return {
+      url: '/v1/messages/send_list_helpers',
+      body: {
+        instance, to,
+        text: (document.getElementById('listText').value || '').trim(),
+        buttonText: (document.getElementById('listButtonText').value || 'Ver opções').trim(),
+        footer: (document.getElementById('listFooter').value || '').trim() || undefined,
+        sections: sections.length ? sections : [{ title: 'Opções', rows: [{ id: 'opt1', title: 'Opção 1', description: '' }] }],
+      },
+    };
+  }
+  function getPollPayload(instance, to) {
+    const opts = Array.from(document.getElementById('pollOptionsList').children).map((r) => r.querySelector('[data-field=opt]').value.trim()).filter(Boolean);
+    return {
+      url: '/v1/messages/send_poll',
+      body: {
+        instance, to,
+        name: (document.getElementById('pollName').value || '').trim(),
+        options: opts.length >= 2 ? opts : ['Sim', 'Não'],
+        selectableCount: Math.max(1, Number(document.getElementById('pollSelectable').value) || 1),
+      },
+    };
+  }
+  function getCarouselPayload(instance, to) {
+    const cards = Array.from(document.getElementById('carouselCardsList').children).map((block) => {
+      const c = gatherRow(block);
+      const buttons = Array.from(block.querySelectorAll('.card-buttons .dyn-row')).map(gatherRow)
+        .filter((o) => o.text).map((o) => ({ id: o.id || `b${Math.random()}`, text: o.text }));
+      return {
+        title: c.title, description: c.description,
+        footer: c.footer || undefined,
+        imageUrl: c.imageUrl || undefined,
+        buttons,
+      };
+    }).filter((c) => c.title);
+    return {
+      url: '/v1/messages/send_carousel_helpers',
+      body: {
+        instance, to,
+        text: (document.getElementById('carouselText').value || '').trim() || undefined,
+        footer: (document.getElementById('carouselFooter').value || '').trim() || undefined,
+        cards,
+      },
+    };
+  }
 
+  document.getElementById('btnSend').addEventListener('click', async () => {
+    const recipients = getRecipients();
+    const sendResultEl = document.getElementById('sendResult');
+    if (recipients.length === 0) { setResult(sendResultEl, 'Informe ao menos um número (com DDI).', 'error'); return; }
+
+    const t = dispatchTypeEl.value;
+    const instance = document.getElementById('dispatchInstance').value || 'main';
+    const builders = {
+      menu: getMenuPayload, buttons: getButtonsPayload, interactive: getInteractivePayload,
+      list: getListPayload, poll: getPollPayload, carousel: getCarouselPayload,
+    };
+    if (t === 'interactive') {
+      const probe = builders[t](instance, recipients[0]);
+      if (!probe.body.ctas.length) { setResult(sendResultEl, 'Adicione ao menos um CTA.', 'error'); return; }
+    }
+
+    const dMin = Number(document.getElementById('dispatchDelayMin').value) || 0;
+    const dMax = Number(document.getElementById('dispatchDelayMax').value) || dMin;
+
+    const btn = document.getElementById('btnSend');
+    btn.disabled = true;
+    let sent = 0, failed = 0;
+    for (let i = 0; i < recipients.length; i++) {
+      const to = recipients[i];
+      const payload = builders[t](instance, to);
+      setResult(sendResultEl, `Enviando ${i + 1}/${recipients.length}... (${to})`, '');
+      try {
+        const r = await fetch(`${API}${payload.url}`, { method: 'POST', headers: headers(), body: JSON.stringify(payload.body) });
+        if (r.ok) sent++; else failed++;
+      } catch { failed++; }
+      if (i < recipients.length - 1) {
+        const ms = delayMs(dMin, dMax);
+        setResult(sendResultEl, `Aguardando ${(ms / 1000).toFixed(1)}s antes do próximo... (${i + 1}/${recipients.length})`, '');
+        await sleep(ms);
+      }
+    }
+    setResult(sendResultEl, `Concluído: ${sent} enviados, ${failed} falhas.`, failed ? (sent ? 'warning' : 'error') : 'success');
+    btn.disabled = false;
+  });
+
+  // ============ Integrations (index — Chatwoot + n8n) ============
   const integrationInstanceEl = document.getElementById('integrationInstance');
   const integrationStatusEl = document.getElementById('integrationStatus');
   const chatwootResultEl = document.getElementById('chatwootResult');
   const n8nResultEl = document.getElementById('n8nResult');
 
-  function setResult(el, message, tone) {
-    if (!el) return;
-    el.textContent = message;
-    el.className = tone ? `result ${tone}` : 'result';
-    show(el, true);
-  }
-
-  function setIntegrationStatus(message, tone) {
-    if (!integrationStatusEl) return;
-    integrationStatusEl.textContent = message;
-    integrationStatusEl.className = tone ? `status ${tone}` : 'status';
-    show(integrationStatusEl, true);
-  }
-
-  connectModeEl.addEventListener('change', () => {
-    const isPairing = connectModeEl.value === 'pairing';
-    show(connectPhoneRowEl, isPairing);
-    if (!isPairing) {
-      show(pairingContainerEl, false);
-      pairingCodeValueEl.textContent = '';
-    }
-  });
-
-  // --- Conexões: listar salvas e conectar ao clicar ---
-  function renderSavedList(saved) {
-    const ul = document.getElementById('savedList');
-    if (!saved || saved.length === 0) {
-      setListState(ul, 'Nenhuma sessao autenticada. Conecte por nome e ela aparecera aqui.');
-      return;
-    }
-    ul.innerHTML = saved
-      .map(
-        (name) =>
-          `<li class="saved-item-row">
-            <span class="instance-name">${escapeHtml(name)}</span>
-            <div class="saved-item-actions">
-              <button type="button" class="btn btn-primary btn-connect-saved" data-connect-name="${name}">Conectar</button>
-              <button type="button" class="btn btn-small btn-danger" data-delete-saved-name="${name}" title="Excluir sessão autenticada (será necessário novo QR para conectar)">Deletar</button>
-            </div>
-          </li>`
-      )
-      .join('');
-    ul.querySelectorAll('[data-connect-name]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const name = btn.getAttribute('data-connect-name');
-        document.getElementById('connectInstanceSelect').value = name;
-        document.getElementById('instanceName').value = name;
-        connectNewNameRow.style.display = 'none';
-        doConnect(name);
-      });
-    });
-    ul.querySelectorAll('[data-delete-saved-name]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const name = btn.getAttribute('data-delete-saved-name');
-        if (!name || !confirm(`Excluir a sessão autenticada "${name}"? Será necessário escanear o QR de novo para conectar.`)) return;
-        try {
-          const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/logout`, {
-            method: 'POST',
-            headers: headers(),
-          });
-          const data = await res.json();
-          if (data.ok) refreshInstanceList();
-        } catch (_) {
-          refreshInstanceList();
-        }
-      });
-    });
-  }
-
-  async function requestPairingCode(name) {
-    const rawPhone = document.getElementById('pairingPhone').value.trim();
-    if (!rawPhone) {
-      return { ok: false, error: 'Informe o número para gerar o pairing code.' };
-    }
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/pairing-code`, {
-          method: 'POST',
-          headers: headers(),
-          body: JSON.stringify({ phoneNumber: rawPhone }),
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-          if (res.status === 503 && attempt < 2) {
-            await new Promise((resolve) => setTimeout(resolve, 1200));
-            continue;
-          }
-
-          const msgByCode = {
-            session_already_registered: 'Essa sessão já está autenticada. Use "Novo QR" para limpar e tentar de novo.',
-            pairing_channel_not_ready: 'Canal do WhatsApp ainda iniciando. Tente novamente em alguns segundos.',
-            empty_pairing_code: 'O WhatsApp não retornou código de pareamento. Tente novamente.',
-            pairing_code_unavailable: 'Não foi possível gerar o pairing code agora. Tente novamente em alguns segundos.',
-            pairing_code_unstable: 'O código ficou inválido durante a inicialização. Gere um novo código e tente imediatamente.',
-            pairing_code_disabled: 'Pairing code está desabilitado no servidor.',
-          };
-          return { ok: false, error: msgByCode[data.error] || data.error || 'Erro ao gerar pairing code.' };
-        }
-
-        if (!data.pairingCode) {
-          return { ok: false, error: 'Não foi possível obter o pairing code. Tente novamente.' };
-        }
-
-        return { ok: true, pairingCode: data.pairingCode, phoneNumber: data.phoneNumber || '' };
-      } catch (e) {
-        if (attempt >= 2) {
-          return { ok: false, error: e.message || 'Erro de rede ao gerar pairing code.' };
-        }
-      }
-    }
-
-    return { ok: false, error: 'Não foi possível gerar pairing code.' };
-  }
-
-  async function resetInstanceOnModeSwitch(name, nextMode) {
-    const previousMode = lastModeByInstance.get(name);
-    if (!previousMode || previousMode === nextMode) return;
-
-    try {
-      await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/disconnect`, {
-        method: 'POST',
-        headers: headers(),
-      });
-    } catch (_) {}
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-
-  async function doConnect(name) {
-    const nextMode = connectModeEl.value === 'pairing' ? 'pairing' : 'qr';
-    const statusEl = document.getElementById('connectStatus');
-    const qrContainer = document.getElementById('qrContainer');
-    const qrImage = document.getElementById('qrImage');
-
-    await resetInstanceOnModeSwitch(name, nextMode);
-
-    connectingInstanceName = name;
-    connectingMode = nextMode;
-    lastModeByInstance.set(name, connectingMode);
-    show(statusEl, false);
-    show(qrContainer, false);
-    show(pairingContainerEl, false);
-    pairingCodeValueEl.textContent = '';
-
-    if (connectingMode === 'pairing') {
-      const pairing = await requestPairingCode(name);
-      if (!pairing.ok) {
-        statusEl.textContent = pairing.error || 'Erro ao gerar pairing code';
-        statusEl.className = 'status error';
-        show(statusEl, true);
-        connectingInstanceName = null;
-        return;
-      }
-      pairingCodeValueEl.textContent = pairing.pairingCode;
-      show(pairingContainerEl, true);
-      show(qrContainer, false);
-      statusEl.textContent = `Pairing code gerado para ${pairing.phoneNumber || 'o número informado'}.`;
-      statusEl.className = 'status success';
-      show(statusEl, true);
-      refreshInstanceList();
-      return;
-    }
-
-    try {
-      const res = await fetch(`${API}/v1/instances`, {
-        method: 'POST',
-        headers: headers(),
-        body: JSON.stringify({ instance: name }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        statusEl.textContent = data.error || 'Erro ao conectar';
-        statusEl.className = 'status error';
-        show(statusEl, true);
-        connectingInstanceName = null;
-        return;
-      }
-      if (data.qr) {
-        qrImage.src = data.qr;
-        show(qrContainer, true);
-        show(pairingContainerEl, false);
-        statusEl.textContent = 'Escaneie o QR no WhatsApp.';
-        statusEl.className = 'status success';
-      } else if (data.status === 'connected') {
-        show(qrContainer, false);
-        show(pairingContainerEl, false);
-        statusEl.textContent = 'Conectado.';
-        statusEl.className = 'status success';
-        connectingInstanceName = null;
-      } else {
-        statusEl.textContent = 'Aguardando QR...';
-        statusEl.className = 'status';
-        show(qrContainer, false);
-      }
-      show(statusEl, true);
-      refreshInstanceList();
-    } catch (e) {
-      statusEl.textContent = e.message || 'Erro de rede';
-      statusEl.className = 'status error';
-      show(statusEl, true);
-      connectingInstanceName = null;
-    }
-  }
-
-  const connectInstanceSelect = document.getElementById('connectInstanceSelect');
-  const connectNewNameRow = document.getElementById('connectNewNameRow');
-
-  connectInstanceSelect.addEventListener('change', () => {
-    const isNew = connectInstanceSelect.value === '';
-    connectNewNameRow.style.display = isNew ? '' : 'none';
-  });
-
-  document.getElementById('btnConnect').addEventListener('click', () => {
-    const selected = connectInstanceSelect.value;
-    const name = selected ? selected : (document.getElementById('instanceName').value.trim() || 'main');
-    doConnect(name);
-  });
-
-  async function fetchQrAndShow(name, qrImage, qrContainer) {
-    try {
-      const res = await fetch(`${API}/v1/instances/${encodeURIComponent(name)}/qr`, { headers: headers() });
-      const data = await res.json();
-      if (data.qr) {
-        qrImage.src = data.qr;
-        show(qrContainer, true);
-      }
-    } catch (_) {}
-  }
-
-  function renderInstanceList(list) {
-    const ul = document.getElementById('instanceList');
-    if (!list.length) {
-      setListState(ul, 'Nenhuma instancia ativa no momento.');
-      return;
-    }
-    ul.innerHTML = list
-      .map(
-        (i) =>
-          `<li class="instance-row">
-            <span class="instance-name">${escapeHtml(i.instance)}</span>
-            <span class="badge ${escapeHtml(i.status)}">${escapeHtml(i.status)}</span>
-            <div class="instance-actions">
-              <a class="btn btn-small btn-primary" href="/instance.html?instance=${encodeURIComponent(i.instance)}">Painel</a>
-              ${i.status === 'qr' ? `<button type="button" class="btn btn-small btn-ghost" data-action="qr" data-name="${i.instance}">Ver QR</button>` : ''}
-              ${i.status === 'connected' ? `<button type="button" class="btn btn-small btn-ghost" data-action="disconnect" data-name="${i.instance}">Desconectar</button>` : ''}
-              <button type="button" class="btn btn-small btn-ghost" data-action="logout" data-name="${i.instance}" title="Novo QR na próxima conexão">Novo QR</button>
-              <button type="button" class="btn btn-small btn-danger" data-action="delete" data-name="${i.instance}">Deletar</button>
-            </div>
-          </li>`
-      )
-      .join('');
-    ul.querySelectorAll('[data-action]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const action = btn.getAttribute('data-action');
-        const name = btn.getAttribute('data-name');
-        if (!name) return;
-        const base = `${API}/v1/instances/${encodeURIComponent(name)}`;
-        try {
-          if (action === 'qr') {
-            const res = await fetch(`${base}/qr`, { headers: headers() });
-            const data = await res.json();
-            if (data.qr) {
-              document.getElementById('qrImage').src = data.qr;
-              document.getElementById('instanceName').value = name;
-              show(document.getElementById('qrContainer'), true);
-              show(pairingContainerEl, false);
-              show(document.getElementById('connectStatus'), false);
-            }
-          } else if (action === 'disconnect') {
-            await fetch(`${base}/disconnect`, { method: 'POST', headers: headers() });
-            refreshInstanceList();
-          } else if (action === 'logout') {
-            await fetch(`${base}/logout`, { method: 'POST', headers: headers() });
-            refreshInstanceList();
-          } else if (action === 'delete') {
-            await fetch(base, { method: 'DELETE', headers: headers() });
-            refreshInstanceList();
-          }
-        } catch (_) {}
-        refreshInstanceList();
-      });
-    });
-  }
-
-  function updateConnectSelect(saved) {
-    const sel = document.getElementById('connectInstanceSelect');
-    const current = sel.value;
-    sel.innerHTML = '<option value="">— Nova conexão —</option>' +
-      (saved || []).map((n) => `<option value="${escapeHtml(n)}" ${n === current ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
-    connectNewNameRow.style.display = sel.value === '' ? '' : 'none';
-  }
-
-  function updateIntegrationSelect(names) {
-    if (!integrationInstanceEl) return;
-    const current = integrationInstanceEl.value;
-    const list = Array.isArray(names) ? names : [];
-    if (!list.length) {
-      integrationInstanceEl.innerHTML = '<option value="main">main</option>';
-      return;
-    }
-    integrationInstanceEl.innerHTML = list
-      .map((name) => `<option value="${escapeHtml(name)}" ${name === current ? 'selected' : ''}>${escapeHtml(name)}</option>`)
-      .join('');
-    if (!list.includes(current)) integrationInstanceEl.selectedIndex = 0;
-  }
-
-  function updateOverviewStats(saved, instances) {
-    const safeSaved = Array.isArray(saved) ? saved : [];
-    const safeInstances = Array.isArray(instances) ? instances : [];
-    const connectedCount = safeInstances.filter((entry) => String(entry.status || '') === 'connected').length;
-    const statSaved = document.getElementById('statSavedCount');
-    const statActive = document.getElementById('statActiveCount');
-    const statConnected = document.getElementById('statConnectedCount');
-    if (statSaved) statSaved.textContent = String(safeSaved.length);
-    if (statActive) statActive.textContent = String(safeInstances.length);
-    if (statConnected) statConnected.textContent = String(connectedCount);
-  }
+  // Sync progress polling state
+  let syncPollHandle = null;
 
   function fillIntegrationsForm(integration) {
-    const chatwoot = integration?.chatwoot || {};
-    document.getElementById('chatwootEnabled').checked = Boolean(chatwoot.enabled);
-    document.getElementById('chatwootBaseUrl').value = chatwoot.baseUrl || '';
-    document.getElementById('chatwootAccountId').value = chatwoot.accountId || '';
-    document.getElementById('chatwootInboxId').value = chatwoot.inboxId || '';
-    document.getElementById('chatwootToken').value = chatwoot.apiAccessToken || '';
-    document.getElementById('chatwootSignMessages').checked = Boolean(chatwoot.signMessages);
-    document.getElementById('chatwootSignDelimiter').value = chatwoot.signDelimiter ?? '\\n';
-    document.getElementById('chatwootNameInbox').value = chatwoot.nameInbox || 'WhatsApp';
-    document.getElementById('chatwootOrganization').value = chatwoot.organization || '';
-    document.getElementById('chatwootLogoUrl').value = chatwoot.logoUrl || '';
-    document.getElementById('chatwootConversationPending').checked = Boolean(chatwoot.conversationPending);
-    document.getElementById('chatwootReopenConversation').checked = chatwoot.reopenConversation !== false;
-    document.getElementById('chatwootImportContacts').checked = Boolean(chatwoot.importContacts);
-    document.getElementById('chatwootImportMessages').checked = chatwoot.importMessages !== false;
-    document.getElementById('chatwootDaysLimit').value = chatwoot.daysLimitImportMessages ?? 7;
-    document.getElementById('chatwootIgnoreJids').value = Array.isArray(chatwoot.ignoreJids) ? chatwoot.ignoreJids.join('\n') : '';
-    document.getElementById('chatwootAutoCreate').checked = Boolean(chatwoot.autoCreate);
-
-    // Show webhook URL for selected instance
-    const webhookInfo = document.getElementById('chatwootWebhookInfo');
-    const webhookUrlEl = document.getElementById('chatwootWebhookUrl');
-    if (webhookInfo && webhookUrlEl && integrationInstanceEl?.value) {
-      const origin = window.location.origin;
-      const inst = integrationInstanceEl.value.trim();
-      webhookUrlEl.textContent = `${origin}/v1/integrations/${encodeURIComponent(inst)}/chatwoot/webhook`;
-      webhookInfo.style.display = '';
-    }
+    const cw = integration?.chatwoot || {};
+    document.getElementById('chatwootEnabled').checked = !!cw.enabled;
+    document.getElementById('chatwootBaseUrl').value = cw.baseUrl || '';
+    document.getElementById('chatwootAccountId').value = cw.accountId || '';
+    document.getElementById('chatwootInboxId').value = cw.inboxId || '';
+    document.getElementById('chatwootToken').value = cw.apiAccessToken || '';
+    document.getElementById('chatwootSignMessages').checked = !!cw.signMessages;
+    document.getElementById('chatwootSignDelimiter').value = cw.signDelimiter || '';
+    document.getElementById('chatwootNameInbox').value = cw.nameInbox || '';
+    document.getElementById('chatwootWebhookSlug').value = cw.webhookSlug || '';
+    document.getElementById('chatwootOrganization').value = cw.organization || '';
+    document.getElementById('chatwootLogoUrl').value = cw.logoUrl || '';
+    document.getElementById('chatwootConversationPending').checked = !!cw.conversationPending;
+    document.getElementById('chatwootReopenConversation').checked = cw.reopenConversation !== false;
+    document.getElementById('chatwootImportContacts').checked = !!cw.importContacts;
+    document.getElementById('chatwootImportMessages').checked = cw.importMessages !== false;
+    document.getElementById('chatwootDaysLimit').value = cw.daysLimitImportMessages || 7;
+    document.getElementById('chatwootIgnoreJids').value = Array.isArray(cw.ignoreJids) ? cw.ignoreJids.join('\n') : '';
+    document.getElementById('chatwootAutoCreate').checked = !!cw.autoCreate;
 
     const n8n = integration?.n8n || {};
-    document.getElementById('n8nEnabled').checked = Boolean(n8n.enabled);
+    document.getElementById('n8nEnabled').checked = !!n8n.enabled;
     document.getElementById('n8nWebhookUrl').value = n8n.webhookUrl || '';
-    document.getElementById('n8nAuthHeaderName').value = n8n.authHeaderName || 'x-api-key';
+    document.getElementById('n8nAuthHeaderName').value = n8n.authHeaderName || '';
     document.getElementById('n8nAuthHeaderValue').value = n8n.authHeaderValue || '';
+
+    // Webhook URL display
+    const slug = (cw.webhookSlug || integrationInstanceEl.value || 'main').trim();
+    const url = `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+    document.getElementById('chatwootWebhookUrl').textContent = url;
+    show(document.getElementById('chatwootWebhookInfo'), true);
   }
 
   async function loadIntegrationsForSelected() {
-    if (!integrationInstanceEl) return;
-    const instance = (integrationInstanceEl.value || '').trim();
+    const instance = (integrationInstanceEl?.value || '').trim();
     if (!instance) return;
-
+    setResult(integrationStatusEl, 'Carregando...', '');
     try {
       const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}`, { headers: headers() });
       const data = await res.json();
-      if (!res.ok || !data.integration) {
-        setIntegrationStatus(data.error || 'Erro ao carregar integrações.', 'error');
-        return;
-      }
+      if (!res.ok) { setResult(integrationStatusEl, data.error || 'Falha ao carregar.', 'error'); return; }
       fillIntegrationsForm(data.integration);
-      setIntegrationStatus(`Integrações carregadas para ${instance}.`, 'success');
-    } catch (error) {
-      setIntegrationStatus(error.message || 'Erro de rede ao carregar integrações.', 'error');
+      setResult(integrationStatusEl, `Configuração carregada para "${instance}".`, 'success');
+      const link = document.getElementById('btnOpenIntegrationPanel');
+      if (link) link.href = `/instance.html?instance=${encodeURIComponent(instance)}#integrations`;
+      // Pull current sync status once
+      pollSyncOnce(instance);
+    } catch (err) {
+      setResult(integrationStatusEl, err.message || 'Erro de rede.', 'error');
     }
   }
 
-  async function saveChatwootConfig() {
-    const instance = (integrationInstanceEl?.value || '').trim();
-    if (!instance) return;
-    const rawJids = document.getElementById('chatwootIgnoreJids').value;
-    const ignoreJids = rawJids
-      .split(/[\n,;]+/)
-      .map((j) => j.trim())
-      .filter(Boolean);
-    const body = {
+  function buildChatwootBody() {
+    const ignoreJids = (document.getElementById('chatwootIgnoreJids').value || '')
+      .split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    return {
       enabled: document.getElementById('chatwootEnabled').checked,
       baseUrl: document.getElementById('chatwootBaseUrl').value.trim(),
       accountId: document.getElementById('chatwootAccountId').value.trim(),
@@ -490,6 +742,7 @@
       signMessages: document.getElementById('chatwootSignMessages').checked,
       signDelimiter: document.getElementById('chatwootSignDelimiter').value,
       nameInbox: document.getElementById('chatwootNameInbox').value.trim(),
+      webhookSlug: document.getElementById('chatwootWebhookSlug').value.trim(),
       organization: document.getElementById('chatwootOrganization').value.trim(),
       logoUrl: document.getElementById('chatwootLogoUrl').value.trim(),
       conversationPending: document.getElementById('chatwootConversationPending').checked,
@@ -500,543 +753,228 @@
       ignoreJids,
       autoCreate: document.getElementById('chatwootAutoCreate').checked,
     };
+  }
+
+  async function saveChatwootConfig() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
     try {
-      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot`, {
-        method: 'PATCH',
-        headers: headers(),
-        body: JSON.stringify(body),
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot`, {
+        method: 'PATCH', headers: headers(), body: JSON.stringify(buildChatwootBody()),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setResult(chatwootResultEl, data.error || 'Erro ao salvar Chatwoot.', 'error');
-        return;
-      }
-      fillIntegrationsForm(data.integration);
+      const d = await r.json();
+      if (!r.ok) { setResult(chatwootResultEl, d.error || 'Falha ao salvar.', 'error'); return; }
+      fillIntegrationsForm(d.integration);
       setResult(chatwootResultEl, 'Configuração Chatwoot salva.', 'success');
-    } catch (error) {
-      setResult(chatwootResultEl, error.message || 'Erro de rede ao salvar Chatwoot.', 'error');
-    }
+    } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
   }
 
   async function testChatwootConfig() {
-    const instance = (integrationInstanceEl?.value || '').trim();
+    const instance = integrationInstanceEl.value.trim();
     if (!instance) return;
     try {
-      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/test`, {
-        method: 'POST',
-        headers: headers(),
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/test`, { method: 'POST', headers: headers() });
+      const d = await r.json();
+      if (!r.ok) { setResult(chatwootResultEl, d.error || 'Teste falhou.', 'error'); return; }
+      setResult(chatwootResultEl, `Chatwoot OK (status ${d.status || 200}).`, 'success');
+    } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
+  }
+
+  async function autoCreateChatwoot() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
+    setResult(chatwootResultEl, 'Criando inbox...', '');
+    try {
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/autocreate`, { method: 'POST', headers: headers() });
+      const d = await r.json();
+      if (!r.ok || !d.ok) { setResult(chatwootResultEl, d.error || 'Falha.', 'error'); return; }
+      const res = d.result || {};
+      setResult(chatwootResultEl, `Inbox "${res.inboxName || ''}" (id=${res.inboxId || '?'}) criado/atualizado.`, 'success');
+      await loadIntegrationsForSelected();
+    } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
+  }
+
+  async function syncContactNamesChatwoot() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
+    setResult(chatwootResultEl, 'Sincronizando nomes de contatos...', '');
+    try {
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-contact-names`, {
+        method: 'POST', headers: headers()
       });
-      const data = await res.json();
-      if (!res.ok) {
-        setResult(chatwootResultEl, data.error || 'Teste Chatwoot falhou.', 'error');
-        return;
+      const d = await r.json();
+      if (!r.ok || !d.ok) { setResult(chatwootResultEl, d.error || 'Falha ao sincronizar nomes.', 'error'); return; }
+      const res = d.result || {};
+      setResult(chatwootResultEl, `Sync de nomes concluído: ${res.updated || 0} atualizados, ${res.skipped || 0} ignorados, ${res.errors || 0} erros.`, 'success');
+    } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
+  }
+
+  async function startSyncHistory() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
+    try {
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-history`, {
+        method: 'POST', headers: headers(), body: JSON.stringify({})
+      });
+      const d = await r.json();
+      if (!r.ok) { setResult(chatwootResultEl, d.error || 'Falha ao iniciar.', 'error'); return; }
+      setResult(chatwootResultEl, 'Sincronização iniciada — acompanhe abaixo.', 'success');
+      startSyncPolling(instance);
+    } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
+  }
+
+  async function cancelSync() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
+    try {
+      await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-cancel`, { method: 'POST', headers: headers() });
+    } catch {}
+  }
+
+  function renderSyncProgress(p) {
+    const panel = document.getElementById('chatwootSyncProgress');
+    const badge = document.getElementById('chatwootSyncBadge');
+    const fill = document.getElementById('chatwootSyncFill');
+    const cur = document.getElementById('chatwootSyncCurrent');
+    const elChats = document.getElementById('chatwootSyncChats');
+    const elSent = document.getElementById('chatwootSyncSent');
+    const elSkipped = document.getElementById('chatwootSyncSkipped');
+    const elErrors = document.getElementById('chatwootSyncErrors');
+    const btnCancel = document.getElementById('btnCancelSyncChatwoot');
+    if (!panel) return;
+
+    if (!p || p.status === 'idle') {
+      show(panel, false);
+      return;
+    }
+    show(panel, true);
+
+    const statusMap = {
+      running: { txt: 'rodando', cls: 'info' },
+      cancelling: { txt: 'cancelando', cls: 'warning' },
+      completed: { txt: 'concluído', cls: 'success' },
+      cancelled: { txt: 'cancelado', cls: 'warning' },
+      failed: { txt: 'falhou', cls: 'danger' },
+    };
+    const s = statusMap[p.status] || { txt: p.status, cls: '' };
+    badge.textContent = s.txt;
+    badge.className = 'badge ' + s.cls;
+    show(btnCancel, p.status === 'running');
+
+    elChats.textContent = `${p.processedChats || 0}/${p.totalChats || 0}`;
+    elSent.textContent = String(p.syncedMessages || 0);
+    elSkipped.textContent = String(p.skippedMessages || 0);
+    elErrors.textContent = String(p.errorCount || 0);
+
+    cur.textContent = p.currentChatTitle || (p.lastError ? 'erro: ' + p.lastError : (p.status === 'running' ? 'preparando...' : ''));
+
+    fill.classList.remove('indeterminate');
+    if (p.status === 'running') {
+      if (p.totalChats > 0) {
+        const pct = Math.min(100, Math.round((p.processedChats / p.totalChats) * 100));
+        fill.style.width = pct + '%';
+      } else {
+        fill.classList.add('indeterminate');
+        fill.style.width = '';
       }
-      setResult(chatwootResultEl, `Chatwoot OK (status ${data.status || 200}).`, 'success');
-    } catch (error) {
-      setResult(chatwootResultEl, error.message || 'Erro de rede no teste Chatwoot.', 'error');
+    } else if (p.status === 'completed') {
+      fill.style.width = '100%';
     }
   }
 
-  async function saveN8nConfig() {
-    const instance = (integrationInstanceEl?.value || '').trim();
-    if (!instance) return;
-    const body = {
-      enabled: document.getElementById('n8nEnabled').checked,
-      webhookUrl: document.getElementById('n8nWebhookUrl').value.trim(),
-      authHeaderName: document.getElementById('n8nAuthHeaderName').value.trim(),
-      authHeaderValue: document.getElementById('n8nAuthHeaderValue').value.trim(),
-    };
+  async function pollSyncOnce(instance) {
     try {
-      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
-        method: 'PATCH',
-        headers: headers(),
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setResult(n8nResultEl, data.error || 'Erro ao salvar n8n.', 'error');
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-status`, { headers: headers() });
+      if (r.ok) {
+        const d = await r.json();
+        renderSyncProgress(d.progress);
+        return d.progress;
+      }
+    } catch {}
+    return null;
+  }
+
+  function stopSyncPolling() {
+    if (syncPollHandle) { clearTimeout(syncPollHandle); syncPollHandle = null; }
+    syncPollBusy = false;
+  }
+
+  function startSyncPolling(instance) {
+    stopSyncPolling();
+    const run = async () => {
+      if (syncPollBusy) return;
+      syncPollBusy = true;
+      const p = await pollSyncOnce(instance);
+      syncPollBusy = false;
+      if (p && p.status !== 'running' && p.status !== 'cancelling') {
+        stopSyncPolling();
         return;
       }
-      fillIntegrationsForm(data.integration);
+      syncPollHandle = setTimeout(run, 1000);
+    };
+    run();
+  }
+
+  function startInstancePolling() {
+    if (instancePollHandle) clearTimeout(instancePollHandle);
+    const run = async () => {
+      const activeTab = document.querySelector('.nav-btn.active')?.dataset.tab;
+      if (activeTab === 'conexoes' && !instancePollBusy) {
+        instancePollBusy = true;
+        try {
+          await refreshInstanceList();
+        } finally {
+          instancePollBusy = false;
+        }
+      }
+      instancePollHandle = setTimeout(run, 2500);
+    };
+    run();
+  }
+
+  document.getElementById('btnSaveChatwoot').addEventListener('click', saveChatwootConfig);
+  document.getElementById('btnTestChatwoot').addEventListener('click', testChatwootConfig);
+  document.getElementById('btnAutoCreateChatwoot').addEventListener('click', autoCreateChatwoot);
+  document.getElementById('btnSyncContactNamesChatwoot').addEventListener('click', syncContactNamesChatwoot);
+  document.getElementById('btnSyncHistoryChatwoot').addEventListener('click', startSyncHistory);
+  document.getElementById('btnCancelSyncChatwoot').addEventListener('click', cancelSync);
+  document.getElementById('btnIntegrationReload').addEventListener('click', loadIntegrationsForSelected);
+  integrationInstanceEl.addEventListener('change', loadIntegrationsForSelected);
+
+  async function saveN8nConfig() {
+    const instance = integrationInstanceEl.value.trim();
+    if (!instance) return;
+    try {
+      const body = {
+        enabled: document.getElementById('n8nEnabled').checked,
+        webhookUrl: document.getElementById('n8nWebhookUrl').value.trim(),
+        authHeaderName: document.getElementById('n8nAuthHeaderName').value.trim(),
+        authHeaderValue: document.getElementById('n8nAuthHeaderValue').value.trim(),
+      };
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
+        method: 'PATCH', headers: headers(), body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) { setResult(n8nResultEl, d.error || 'Falha.', 'error'); return; }
       setResult(n8nResultEl, 'Configuração n8n salva.', 'success');
-    } catch (error) {
-      setResult(n8nResultEl, error.message || 'Erro de rede ao salvar n8n.', 'error');
-    }
+    } catch (err) { setResult(n8nResultEl, err.message || 'Erro.', 'error'); }
   }
 
   async function testN8nConfig() {
-    const instance = (integrationInstanceEl?.value || '').trim();
+    const instance = integrationInstanceEl.value.trim();
     if (!instance) return;
     try {
-      const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n/test`, {
-        method: 'POST',
-        headers: headers(),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setResult(n8nResultEl, data.error || 'Teste n8n falhou.', 'error');
-        return;
-      }
-      setResult(n8nResultEl, `n8n OK (status ${data.status || 200}).`, 'success');
-    } catch (error) {
-      setResult(n8nResultEl, error.message || 'Erro de rede no teste n8n.', 'error');
-    }
+      const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n/test`, { method: 'POST', headers: headers() });
+      const d = await r.json();
+      if (!r.ok) { setResult(n8nResultEl, d.error || 'Falha.', 'error'); return; }
+      setResult(n8nResultEl, `n8n OK (status ${d.status || 200}).`, 'success');
+    } catch (err) { setResult(n8nResultEl, err.message || 'Erro.', 'error'); }
   }
+  document.getElementById('btnSaveN8n').addEventListener('click', saveN8nConfig);
+  document.getElementById('btnTestN8n').addEventListener('click', testN8nConfig);
 
-  async function refreshInstanceList() {
-    const statusEl = document.getElementById('connectStatus');
-    const qrContainer = document.getElementById('qrContainer');
-    const qrImage = document.getElementById('qrImage');
-    try {
-      const res = await fetch(`${API}/v1/instances`, { headers: headers() });
-      const data = await res.json();
-      if (data.saved) {
-        renderSavedList(data.saved);
-        updateConnectSelect(data.saved);
-      } else {
-        renderSavedList([]);
-        updateConnectSelect([]);
-      }
-      if (data.instances) {
-        renderInstanceList(data.instances);
-        const sel = document.getElementById('dispatchInstance');
-        const current = sel.value;
-        const names = [...new Set([...data.instances.map((i) => i.instance), ...(data.saved || [])])];
-        sel.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}" ${n === current ? 'selected' : ''}>${escapeHtml(n)}</option>`).join('');
-        if (!names.includes(current)) sel.selectedIndex = 0;
-        updateIntegrationSelect(names);
-
-        // Atualização ativa: se estamos conectando uma instância, atualizar QR e status
-        if (connectingInstanceName) {
-          const inst = data.instances.find((i) => i.instance === connectingInstanceName);
-          if (inst) {
-            if (inst.status === 'qr' && connectingMode === 'qr') {
-              try {
-                const qrRes = await fetch(`${API}/v1/instances/${encodeURIComponent(connectingInstanceName)}/qr`, { headers: headers() });
-                const qrData = await qrRes.json();
-                if (qrData.qr) {
-                  qrImage.src = qrData.qr;
-                  show(qrContainer, true);
-                  show(pairingContainerEl, false);
-                  statusEl.textContent = 'Escaneie o QR no WhatsApp.';
-                  statusEl.className = 'status success';
-                  show(statusEl, true);
-                }
-              } catch (_) {}
-            } else if (inst.status !== 'connected' && connectingMode === 'pairing') {
-              const currentPairingCode = String(pairingCodeValueEl.textContent || '').trim();
-              show(qrContainer, false);
-              if (currentPairingCode) {
-                show(pairingContainerEl, true);
-                statusEl.textContent = 'Digite o pairing code no WhatsApp para concluir a conexão.';
-                statusEl.className = 'status success';
-              } else {
-                show(pairingContainerEl, false);
-                statusEl.textContent = 'Aguardando geração do pairing code...';
-                statusEl.className = 'status';
-              }
-              show(statusEl, true);
-            } else if (inst.status === 'connected') {
-              show(qrContainer, false);
-              show(pairingContainerEl, false);
-              statusEl.textContent = 'Conectado.';
-              statusEl.className = 'status success';
-              show(statusEl, true);
-              connectingInstanceName = null;
-            } else if (inst.status === 'disconnected') {
-              show(pairingContainerEl, false);
-              statusEl.textContent = 'Desconectado. Clique em Conectar novamente.';
-              statusEl.className = 'status error';
-              show(statusEl, true);
-              connectingInstanceName = null;
-            }
-          } else {
-            connectingInstanceName = null;
-          }
-        }
-      }
-      updateOverviewStats(data.saved || [], data.instances || []);
-    } catch (_) {
-      renderSavedList([]);
-      renderInstanceList([]);
-      updateConnectSelect([]);
-      updateOverviewStats([], []);
-    }
-  }
-
-  document.getElementById('btnRefreshList').addEventListener('click', refreshInstanceList);
-  if (integrationInstanceEl) {
-    document.getElementById('btnIntegrationReload').addEventListener('click', loadIntegrationsForSelected);
-    integrationInstanceEl.addEventListener('change', loadIntegrationsForSelected);
-    document.getElementById('btnSaveChatwoot').addEventListener('click', saveChatwootConfig);
-    document.getElementById('btnTestChatwoot').addEventListener('click', testChatwootConfig);
-    document.getElementById('btnSaveN8n').addEventListener('click', saveN8nConfig);
-    document.getElementById('btnTestN8n').addEventListener('click', testN8nConfig);
-    const btnOpenIntegrationPanel = document.getElementById('btnOpenIntegrationPanel');
-    if (btnOpenIntegrationPanel) {
-      btnOpenIntegrationPanel.addEventListener('click', () => {
-        const name = (integrationInstanceEl.value || '').trim();
-        if (!name) return;
-        window.location.href = `/instance.html?instance=${encodeURIComponent(name)}#integrations`;
-      });
-    }
-  }
-
-  const integrationsTab = document.querySelector('[data-tab="integracoes"]');
-  if (integrationsTab) {
-    integrationsTab.addEventListener('click', () => {
-      loadIntegrationsForSelected();
-    });
-  }
-
-  show(connectPhoneRowEl, false);
+  // ============ Boot ============
+  showDispatchForm('menu');
   refreshInstanceList();
-  if (integrationInstanceEl) {
-    loadIntegrationsForSelected();
-  }
-
-  // Polling ativo: atualizar lista, QR e status a cada 2s quando a aba Conexões estiver visível
-  setInterval(() => {
-    if (document.getElementById('conexoes').classList.contains('active')) {
-      refreshInstanceList();
-    }
-  }, 2000);
-
-  // --- Formulários dinâmicos (add/remove e montagem do payload) ---
-  function addRow(containerId, html, removeClass) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    const div = document.createElement('div');
-    div.className = removeClass || 'item-row';
-    div.innerHTML = html + (removeClass ? '' : ' <button type="button" class="btn btn-small btn-ghost btn-remove">Remover</button>');
-    const removeBtn = div.querySelector('.btn-remove');
-    if (removeBtn) removeBtn.addEventListener('click', () => div.remove());
-    container.appendChild(div);
-  }
-
-  function addMenuOption() {
-    addRow('menuOptionsList', '<input type="text" placeholder="ID (opcional)" data-field="id"><input type="text" placeholder="Texto da opcao" data-field="text"><input type="text" placeholder="Descricao (opcional)" data-field="description">');
-  }
-  function addButtonRow() {
-    addRow('buttonsList', '<input type="text" placeholder="ID do botão" data-field="id"><input type="text" placeholder="Texto do botão" data-field="text">');
-  }
-  function addInteractiveRow() {
-    addRow(
-      'interactiveList',
-      `<select data-field="type"><option value="url">URL</option><option value="copy">Copiar</option><option value="call">Ligar</option></select>
-       <input type="text" placeholder="Texto do botão" data-field="text">
-       <input type="text" placeholder="URL / Código / Telefone" data-field="extra">`
-    );
-  }
-  function addPollOption() {
-    addRow('pollOptionsList', '<input type="text" placeholder="Opção" data-field="opt">');
-  }
-
-  function addListSection() {
-    const container = document.getElementById('listSectionsList');
-    const block = document.createElement('div');
-    block.className = 'block-section';
-    block.innerHTML = `
-      <div class="block-title">Seção</div>
-      <input type="text" class="section-title" placeholder="Título da seção">
-      <div class="sub-list section-rows"></div>
-      <button type="button" class="btn btn-small btn-ghost add-row-in-section">+ Adicionar item</button>
-      <button type="button" class="btn btn-small btn-danger btn-remove-block">Remover seção</button>
-    `;
-    block.querySelector('.add-row-in-section').addEventListener('click', () => {
-      const row = document.createElement('div');
-      row.className = 'item-row';
-      row.innerHTML = `
-        <input type="text" placeholder="ID" data-field="id">
-        <input type="text" placeholder="Título" data-field="title">
-        <input type="text" placeholder="Descrição" data-field="desc">
-        <button type="button" class="btn btn-small btn-ghost btn-remove">Remover</button>
-      `;
-      row.querySelector('.btn-remove').onclick = () => row.remove();
-      block.querySelector('.section-rows').appendChild(row);
-    });
-    block.querySelector('.btn-remove-block').onclick = () => block.remove();
-    container.appendChild(block);
-  }
-
-  function addCarouselCard() {
-    const container = document.getElementById('carouselCardsList');
-    const block = document.createElement('div');
-    block.className = 'block-section';
-    block.innerHTML = `
-      <div class="block-title">Card</div>
-      <div class="form-row"><input type="text" placeholder="Título" data-field="title"></div>
-      <div class="form-row"><input type="text" placeholder="Descricao" data-field="description"></div>
-      <div class="form-row"><input type="text" placeholder="Rodapé" data-field="footer"></div>
-      <div class="form-row"><input type="text" placeholder="URL da imagem" data-field="imageUrl"></div>
-      <div class="sub-list card-buttons"></div>
-      <button type="button" class="btn btn-small btn-ghost add-card-btn">+ Botão no card</button>
-      <button type="button" class="btn btn-small btn-danger btn-remove-block">Remover card</button>
-    `;
-    block.querySelector('.add-card-btn').addEventListener('click', () => {
-      const row = document.createElement('div');
-      row.className = 'item-row';
-      row.innerHTML = `
-        <input type="text" placeholder="ID" data-field="id">
-        <input type="text" placeholder="Texto" data-field="text">
-        <button type="button" class="btn btn-small btn-ghost btn-remove">Remover</button>
-      `;
-      row.querySelector('.btn-remove').onclick = () => row.remove();
-      block.querySelector('.card-buttons').appendChild(row);
-    });
-    block.querySelector('.btn-remove-block').onclick = () => block.remove();
-    container.appendChild(block);
-  }
-
-  document.querySelectorAll('.add-item').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const forId = btn.getAttribute('data-for');
-      if (forId === 'menuOptions') addMenuOption();
-      else if (forId === 'buttons') addButtonRow();
-      else if (forId === 'interactive') addInteractiveRow();
-      else if (forId === 'listSections') addListSection();
-      else if (forId === 'pollOptions') addPollOption();
-      else if (forId === 'carouselCards') addCarouselCard();
-    });
-  });
-
-  // Inicializar um item vazio por tipo
-  addMenuOption();
-  addButtonRow();
-  addInteractiveRow();
-  addPollOption();
-
-  // Coletar dados dos formulários e montar payload
-  function getMenuPayload() {
-    const options = [];
-    document.querySelectorAll('#menuOptionsList .item-row').forEach((row, idx) => {
-      const id = row.querySelector('[data-field="id"]')?.value?.trim();
-      const text = row.querySelector('[data-field="text"]')?.value?.trim();
-      const description = row.querySelector('[data-field="description"]')?.value?.trim();
-      if (!text) return;
-      options.push({
-        id: id || String(idx + 1),
-        text,
-        ...(description ? { description } : {}),
-      });
-    });
-    return {
-      url: '/v1/messages/send_menu',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        title: document.getElementById('menuTitle').value.trim() || 'Menu',
-        text: document.getElementById('menuText').value.trim() || 'Escolha uma opção:',
-        options: options.length ? options : [{ id: '1', text: 'Opcao 1' }],
-        footer: document.getElementById('menuFooter').value.trim() || undefined,
-      },
-    };
-  }
-  function getButtonsPayload() {
-    const buttons = [];
-    document.querySelectorAll('#buttonsList .item-row').forEach((row) => {
-      const id = row.querySelector('[data-field="id"]')?.value?.trim();
-      const text = row.querySelector('[data-field="text"]')?.value?.trim();
-      if (id && text) buttons.push({ id, text });
-    });
-    return {
-      url: '/v1/messages/send_buttons_helpers',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        text: document.getElementById('buttonsText').value.trim() || 'Escolha:',
-        footer: document.getElementById('buttonsFooter').value.trim() || undefined,
-        buttons: buttons.length ? buttons.slice(0, 3) : [{ id: 'btn1', text: 'Opção 1' }],
-      },
-    };
-  }
-  function getInteractivePayload() {
-    const ctas = [];
-    document.querySelectorAll('#interactiveList .item-row').forEach((row) => {
-      const type = row.querySelector('[data-field="type"]')?.value || 'url';
-      const text = row.querySelector('[data-field="text"]')?.value?.trim();
-      const extra = row.querySelector('[data-field="extra"]')?.value?.trim();
-      if (!text || !extra) return;
-      const cta = { type, text };
-      if (type === 'url') cta.url = extra;
-      else if (type === 'copy') cta.copy_code = extra;
-      else if (type === 'call') cta.phone_number = extra;
-      ctas.push(cta);
-    });
-    return {
-      url: '/v1/messages/send_interactive_helpers',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        text: document.getElementById('interactiveText').value.trim() || 'Confira:',
-        footer: document.getElementById('interactiveFooter').value.trim() || undefined,
-        ctas,
-      },
-    };
-  }
-  function getListPayload() {
-    const sections = [];
-    document.querySelectorAll('#listSectionsList .block-section').forEach((block) => {
-      const title = block.querySelector('.section-title')?.value?.trim() || 'Seção';
-      const rows = [];
-      block.querySelectorAll('.section-rows .item-row').forEach((row) => {
-        const id = row.querySelector('[data-field="id"]')?.value?.trim();
-        const titleR = row.querySelector('[data-field="title"]')?.value?.trim();
-        const desc = row.querySelector('[data-field="desc"]')?.value?.trim();
-        if (id && titleR) rows.push({ id, title: titleR, description: desc || '' });
-      });
-      if (rows.length) sections.push({ title, rows });
-    });
-    return {
-      url: '/v1/messages/send_list_helpers',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        text: document.getElementById('listText').value.trim() || 'Escolha:',
-        buttonText: document.getElementById('listButtonText').value.trim() || 'Ver opções',
-        footer: document.getElementById('listFooter').value.trim() || undefined,
-        sections: sections.length ? sections : [{ title: 'Opções', rows: [{ id: 'opt1', title: 'Opção 1', description: '' }] }],
-      },
-    };
-  }
-  function getPollPayload() {
-    const options = [];
-    document.querySelectorAll('#pollOptionsList .item-row input[data-field="opt"]').forEach((inp) => {
-      const v = inp.value.trim();
-      if (v) options.push(v);
-    });
-    return {
-      url: '/v1/messages/send_poll',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        name: document.getElementById('pollName').value.trim() || 'Enquete',
-        options: options.length >= 2 ? options : ['Sim', 'Não'],
-        selectableCount: parseInt(document.getElementById('pollSelectable').value, 10) || 1,
-      },
-    };
-  }
-  function getCarouselPayload() {
-    const cards = [];
-    document.querySelectorAll('#carouselCardsList .block-section').forEach((block) => {
-      const title = block.querySelector('[data-field="title"]')?.value?.trim();
-      const description = block.querySelector('[data-field="description"]')?.value?.trim();
-      const footer = block.querySelector('[data-field="footer"]')?.value?.trim();
-      const imageUrl = block.querySelector('[data-field="imageUrl"]')?.value?.trim();
-      const buttons = [];
-      block.querySelectorAll('.card-buttons .item-row').forEach((row) => {
-        const id = row.querySelector('[data-field="id"]')?.value?.trim();
-        const text = row.querySelector('[data-field="text"]')?.value?.trim();
-        if (id && text) buttons.push({ id, text });
-      });
-      cards.push({
-        title: title || '',
-        description: description || '',
-        footer: footer || undefined,
-        imageUrl: imageUrl || undefined,
-        buttons: buttons.length ? buttons : [{ id: 'btn1', text: 'Ver' }],
-      });
-    });
-    return {
-      url: '/v1/messages/send_carousel_helpers',
-      body: {
-        instance: document.getElementById('dispatchInstance').value,
-        to: document.getElementById('dispatchTo').value.trim(),
-        text: document.getElementById('carouselText').value.trim() || undefined,
-        footer: document.getElementById('carouselFooter').value.trim() || undefined,
-        cards: cards.length ? cards : [{ title: 'Card', description: '', buttons: [{ id: 'b1', text: 'Botao' }] }],
-      },
-    };
-  }
-
-  /**
-   * Lê destinatários do campo e normaliza: aceita +55, espaços, traços, vírgulas etc.
-   * Ex: "+55 35 9882-8503," vira "553598828503".
-   */
-  function getRecipients() {
-    const raw = document.getElementById('dispatchTo').value.trim();
-    if (!raw) return [];
-    return raw
-      .split(/[\r\n,;]+/)
-      .map((s) => s.replace(/\D/g, ''))
-      .filter((n) => n.length >= 10);
-  }
-
-  function delayMs(minSec, maxSec) {
-    const min = Math.max(0, Number(minSec) || 0);
-    const max = Math.max(min, Number(maxSec) || min);
-    const sec = min + Math.random() * (max - min);
-    return Math.round(sec * 1000);
-  }
-
-  document.getElementById('btnSend').addEventListener('click', async () => {
-    const recipients = getRecipients();
-    const resultEl = document.getElementById('sendResult');
-    const btnSend = document.getElementById('btnSend');
-    if (!recipients.length) {
-      resultEl.textContent = 'Informe ao menos um número (um por linha, com DDI).';
-      resultEl.className = 'result error';
-      show(resultEl, true);
-      return;
-    }
-    const type = document.getElementById('dispatchType').value;
-    let payload;
-    switch (type) {
-      case 'menu': payload = getMenuPayload(); break;
-      case 'buttons': payload = getButtonsPayload(); break;
-      case 'interactive': payload = getInteractivePayload(); break;
-      case 'list': payload = getListPayload(); break;
-      case 'poll': payload = getPollPayload(); break;
-      case 'carousel': payload = getCarouselPayload(); break;
-      default:
-        resultEl.textContent = 'Tipo não implementado.';
-        resultEl.className = 'result error';
-        show(resultEl, true);
-        return;
-    }
-    if (type === 'interactive' && (!payload.body.ctas || payload.body.ctas.length === 0)) {
-      resultEl.textContent = 'Adicione ao menos um botão CTA.';
-      resultEl.className = 'result error';
-      show(resultEl, true);
-      return;
-    }
-
-    const delayMin = document.getElementById('dispatchDelayMin').value;
-    const delayMax = document.getElementById('dispatchDelayMax').value;
-    let sent = 0;
-    let failed = 0;
-    btnSend.disabled = true;
-    show(resultEl, true);
-    resultEl.className = 'result';
-
-    for (let i = 0; i < recipients.length; i++) {
-      const to = recipients[i];
-      payload.body.to = to;
-      resultEl.textContent = `Enviando ${i + 1}/${recipients.length}... (${to})`;
-      try {
-        const res = await fetch(`${API}${payload.url}`, {
-          method: 'POST',
-          headers: headers(),
-          body: JSON.stringify(payload.body),
-        });
-        const data = await res.json();
-        if (res.ok) {
-          sent++;
-        } else {
-          failed++;
-        }
-      } catch (_) {
-        failed++;
-      }
-      if (i < recipients.length - 1) {
-        const wait = delayMs(delayMin, delayMax);
-        resultEl.textContent = `Aguardando ${wait / 1000}s antes do próximo... (${i + 1}/${recipients.length})`;
-        await new Promise((r) => setTimeout(r, wait));
-      }
-    }
-
-    resultEl.textContent = `Concluído: ${sent} enviados${failed ? `, ${failed} falhas` : ''}.`;
-    resultEl.className = failed === 0 ? 'result success' : failed === recipients.length ? 'result error' : 'result';
-    btnSend.disabled = false;
-  });
+  startInstancePolling();
 })();

@@ -1,0 +1,2316 @@
+import path from 'node:path';
+import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { config } from '../config.js';
+import { isValidInstanceName } from '../utils/helpers.js';
+import { signMediaUrlToken } from '../utils/media-signature.js';
+import { emitWebhookEvent } from './webhooks.js';
+import { emitInstanceEvent, getInstanceGeneral, getInstancePanelConfig } from './instance-config.js';
+import { upsertMessage as msUpsert, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, clearInstance as msClearInstance, } from './message-store.js';
+import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
+import { markChatwootOriginated } from './chatwoot-tracking.js';
+const instances = new Map();
+const reconnectAttempts = new Map();
+const pairingIssuedAt = new Map();
+const alwaysOnlineIntervals = new Map();
+const syncHistoryIntervals = new Map();
+const syncHistoryCursor = new Map();
+const runtimePath = path.resolve(process.cwd(), '.runtime');
+const startupStatePath = path.join(runtimePath, 'autostart-instances.json');
+const autostartInstances = new Set();
+const lastStatePath = path.join(runtimePath, 'instance-last-state.json');
+const lastInstanceState = new Map();
+const mediaStoragePath = path.resolve(process.cwd(), 'data', 'chat-media');
+const mediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
+const CONTINUOUS_HISTORY_SYNC_MS = 7000;
+const CONTINUOUS_HISTORY_BATCH_CHATS = 6;
+const CONTINUOUS_HISTORY_FETCH_COUNT = 120;
+const MESSAGE_WRAPPER_KEYS = [
+    'ephemeralMessage',
+    'viewOnceMessage',
+    'viewOnceMessageV2',
+    'viewOnceMessageV2Extension',
+    'documentWithCaptionMessage',
+];
+const MEDIA_NODE_BY_KIND = {
+    audio: { field: 'audioMessage', downloadType: 'audio' },
+    image: { field: 'imageMessage', downloadType: 'image' },
+    video: { field: 'videoMessage', downloadType: 'video' },
+    sticker: { field: 'stickerMessage', downloadType: 'sticker' },
+    document: { field: 'documentMessage', downloadType: 'document' },
+};
+const EXTERNAL_MESSAGE_STRIP_KEYS = new Set([
+    'fileEncSha256',
+    'fileSha256',
+    'waveform',
+    'messageContextInfo',
+]);
+function isRecord(value) {
+    return typeof value === 'object' && value !== null;
+}
+const chatCache = new Map();
+const chatMediaBinaryStore = new Map();
+function buildMediaUrl(instance, mediaId) {
+    const exp = Math.floor(Date.now() / 1000) + config.media.signedUrlTtlSeconds;
+    const sig = signMediaUrlToken(config.media.signedUrlSecret, instance, mediaId, exp);
+    return `/v1/media/${encodeURIComponent(instance)}/${encodeURIComponent(mediaId)}?exp=${exp}&sig=${encodeURIComponent(sig)}`;
+}
+function mediaFileExtension(kind, mimeType) {
+    const value = String(mimeType ?? '').trim().toLowerCase();
+    if (value === 'image/jpeg')
+        return 'jpg';
+    if (value === 'image/png')
+        return 'png';
+    if (value === 'image/webp')
+        return 'webp';
+    if (value === 'image/gif')
+        return 'gif';
+    if (value === 'video/mp4')
+        return 'mp4';
+    if (value === 'video/webm')
+        return 'webm';
+    if (value === 'audio/ogg')
+        return 'ogg';
+    if (value === 'audio/mpeg')
+        return 'mp3';
+    if (value === 'audio/mp4')
+        return 'm4a';
+    if (value === 'application/pdf')
+        return 'pdf';
+    if (kind === 'video')
+        return 'mp4';
+    if (kind === 'audio')
+        return 'ogg';
+    if (kind === 'sticker')
+        return 'webp';
+    if (kind === 'image')
+        return 'jpg';
+    return 'bin';
+}
+function loadMediaIndex() {
+    chatMediaBinaryStore.clear();
+    try {
+        if (!fs.existsSync(mediaIndexPath))
+            return;
+        const raw = fs.readFileSync(mediaIndexPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object')
+            return;
+        for (const [mediaId, value] of Object.entries(parsed)) {
+            if (!value || typeof value !== 'object')
+                continue;
+            const entry = value;
+            if (!entry.instance || !entry.relativePath || !entry.mimeType || !entry.kind)
+                continue;
+            const normalized = {
+                mediaId,
+                instance: String(entry.instance),
+                kind: entry.kind,
+                mimeType: String(entry.mimeType),
+                relativePath: String(entry.relativePath),
+                sizeBytes: Number(entry.sizeBytes ?? 0),
+                createdAt: Number(entry.createdAt ?? Date.now()),
+                expiresAt: Number(entry.expiresAt ?? Date.now()),
+            };
+            const absolutePath = path.join(mediaStoragePath, normalized.relativePath);
+            if (fs.existsSync(absolutePath)) {
+                chatMediaBinaryStore.set(mediaId, normalized);
+            }
+        }
+    }
+    catch {
+        // ignore malformed index
+    }
+}
+function persistMediaIndex() {
+    try {
+        fs.mkdirSync(runtimePath, { recursive: true });
+        const payload = Object.fromEntries([...chatMediaBinaryStore.entries()].sort(([a], [b]) => a.localeCompare(b)));
+        fs.writeFileSync(mediaIndexPath, JSON.stringify(payload, null, 2), 'utf8');
+    }
+    catch {
+        // ignore persistence failures
+    }
+}
+function normalizeTimestamp(raw) {
+    const toMs = (value) => {
+        if (!Number.isFinite(value) || value <= 0)
+            return Date.now();
+        return value < 1000000000000 ? value * 1000 : value;
+    };
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return toMs(raw);
+    }
+    if (typeof raw === 'string') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed))
+            return toMs(parsed);
+    }
+    if (typeof raw === 'object' && raw !== null) {
+        const maybe = raw;
+        if (typeof maybe.toNumber === 'function') {
+            const val = maybe.toNumber();
+            if (Number.isFinite(val))
+                return toMs(val);
+        }
+        if (typeof maybe.low === 'number') {
+            return toMs(maybe.low);
+        }
+    }
+    return Date.now();
+}
+function extractChatTitleFromPayload(payload) {
+    const chat = (payload ?? {});
+    const title = String(chat.name ?? '').trim()
+        || String(chat.subject ?? '').trim()
+        || String(chat.pushName ?? '').trim()
+        || String(chat.notify ?? '').trim();
+    if (title)
+        return title;
+    const jid = String(chat.id ?? chat.jid ?? '').trim();
+    if (!jid)
+        return '-';
+    return jid.split('@')[0] || jid;
+}
+function loadAutostartState() {
+    autostartInstances.clear();
+    try {
+        if (!fs.existsSync(startupStatePath))
+            return;
+        const raw = fs.readFileSync(startupStatePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed))
+            return;
+        parsed
+            .map((item) => String(item ?? '').trim())
+            .filter((name) => name.length > 0)
+            .forEach((name) => autostartInstances.add(name));
+    }
+    catch {
+        // ignore malformed file
+    }
+}
+function loadLastInstanceState() {
+    lastInstanceState.clear();
+    try {
+        if (!fs.existsSync(lastStatePath))
+            return;
+        const raw = fs.readFileSync(lastStatePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object')
+            return;
+        for (const [name, value] of Object.entries(parsed)) {
+            const normalizedName = String(name ?? '').trim();
+            if (!isValidInstanceName(normalizedName))
+                continue;
+            if (!value || typeof value !== 'object')
+                continue;
+            const record = value;
+            lastInstanceState.set(normalizedName, {
+                status: String(record.status ?? 'unknown'),
+                wasConnected: Boolean(record.wasConnected),
+                stoppedByUser: Boolean(record.stoppedByUser),
+                updatedAt: String(record.updatedAt ?? new Date().toISOString()),
+            });
+        }
+    }
+    catch {
+        // ignore malformed file
+    }
+}
+function persistAutostartState() {
+    try {
+        fs.mkdirSync(runtimePath, { recursive: true });
+        const payload = JSON.stringify([...autostartInstances].sort(), null, 2);
+        fs.writeFileSync(startupStatePath, payload, 'utf8');
+    }
+    catch {
+        // ignore persistence failures
+    }
+}
+function persistLastInstanceState() {
+    try {
+        fs.mkdirSync(runtimePath, { recursive: true });
+        const payload = Object.fromEntries([...lastInstanceState.entries()]
+            .sort(([a], [b]) => a.localeCompare(b)));
+        fs.writeFileSync(lastStatePath, JSON.stringify(payload, null, 2), 'utf8');
+    }
+    catch {
+        // ignore persistence failures
+    }
+}
+function trackLastInstanceState(name, patch) {
+    const current = lastInstanceState.get(name) ?? {
+        status: 'unknown',
+        wasConnected: false,
+        stoppedByUser: false,
+        updatedAt: new Date().toISOString(),
+    };
+    const next = {
+        status: patch.status ?? current.status,
+        wasConnected: patch.wasConnected ?? current.wasConnected,
+        stoppedByUser: patch.stoppedByUser ?? current.stoppedByUser,
+        updatedAt: new Date().toISOString(),
+    };
+    lastInstanceState.set(name, next);
+    persistLastInstanceState();
+}
+function markAutostart(name, enabled) {
+    if (enabled) {
+        autostartInstances.add(name);
+    }
+    else {
+        autostartInstances.delete(name);
+    }
+    persistAutostartState();
+}
+loadAutostartState();
+loadLastInstanceState();
+loadMediaIndex();
+purgeExpiredMediaBinaries();
+function stopAlwaysOnline(name) {
+    const timer = alwaysOnlineIntervals.get(name);
+    if (timer) {
+        clearInterval(timer);
+        alwaysOnlineIntervals.delete(name);
+    }
+}
+function startAlwaysOnline(name, ctx) {
+    stopAlwaysOnline(name);
+    const settings = getInstanceGeneral(name);
+    if (!settings.alwaysOnline)
+        return;
+    if (typeof ctx.sock.sendPresenceUpdate !== 'function')
+        return;
+    ctx.sock.sendPresenceUpdate?.('available').catch(() => { });
+    const timer = setInterval(() => {
+        ctx.sock.sendPresenceUpdate?.('available').catch(() => { });
+    }, 30000);
+    alwaysOnlineIntervals.set(name, timer);
+}
+function pruneGroupChatsFromCache(name) {
+    const settings = getInstanceGeneral(name);
+    if (!settings.ignoreGroups)
+        return;
+    const chats = chatCache.get(name);
+    if (!chats)
+        return;
+    for (const jid of chats.keys()) {
+        if (jid.endsWith('@g.us')) {
+            chats.delete(jid);
+        }
+    }
+}
+function stopContinuousHistorySync(name) {
+    const timer = syncHistoryIntervals.get(name);
+    if (timer) {
+        clearInterval(timer);
+        syncHistoryIntervals.delete(name);
+    }
+    syncHistoryCursor.delete(name);
+}
+function extractMessagesFromHistoryResponse(raw) {
+    if (Array.isArray(raw)) {
+        return raw.filter((item) => typeof item === 'object' && item !== null);
+    }
+    const obj = (raw ?? {});
+    if (Array.isArray(obj.messages)) {
+        return obj.messages.filter((item) => typeof item === 'object' && item !== null);
+    }
+    if (Array.isArray(obj.msgs)) {
+        return obj.msgs.filter((item) => typeof item === 'object' && item !== null);
+    }
+    if (Array.isArray(obj.historyMessages)) {
+        return obj.historyMessages.filter((item) => typeof item === 'object' && item !== null);
+    }
+    return [];
+}
+async function runContinuousHistorySync(name, ctx) {
+    const settings = getInstanceGeneral(name);
+    if (!settings.syncFullHistory)
+        return;
+    const anySock = ctx.sock;
+    const hasFetchHistory = typeof anySock.fetchMessageHistory === 'function';
+    const hasResyncState = typeof anySock.resyncAppState === 'function';
+    if (!hasFetchHistory && !hasResyncState)
+        return;
+    const list = getInstanceChatList(name).filter((chat) => !(settings.ignoreGroups && chat.jid.endsWith('@g.us')));
+    if (list.length === 0) {
+        if (hasResyncState) {
+            try {
+                await anySock.resyncAppState(['critical_block', 'regular']);
+            }
+            catch {
+                // best effort
+            }
+        }
+        return;
+    }
+    const start = syncHistoryCursor.get(name) ?? 0;
+    const limit = Math.min(CONTINUOUS_HISTORY_BATCH_CHATS, list.length);
+    const selected = [];
+    for (let i = 0; i < limit; i++) {
+        const idx = (start + i) % list.length;
+        selected.push(list[idx]);
+    }
+    syncHistoryCursor.set(name, (start + limit) % list.length);
+    for (const chat of selected) {
+        if (!hasFetchHistory)
+            break;
+        const existing = getInstanceChatMessages(name, chat.jid);
+        const oldest = existing.length > 0 ? existing[0] : undefined;
+        const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
+        const oldestKey = oldest
+            ? {
+                remoteJid: chat.jid,
+                id: oldest.id,
+                fromMe: oldest.fromMe,
+            }
+            : undefined;
+        try {
+            const response = await anySock.fetchMessageHistory(CONTINUOUS_HISTORY_FETCH_COUNT, oldestKey, oldestTimestamp);
+            const messages = extractMessagesFromHistoryResponse(response);
+            if (messages.length > 0) {
+                ingestMessagesToCache(name, messages, { fromHistory: true });
+            }
+        }
+        catch {
+            // best effort continuous sync
+        }
+    }
+}
+function startContinuousHistorySync(name, ctx) {
+    stopContinuousHistorySync(name);
+    const settings = getInstanceGeneral(name);
+    if (!settings.syncFullHistory)
+        return;
+    void runContinuousHistorySync(name, ctx);
+    const timer = setInterval(() => {
+        void runContinuousHistorySync(name, ctx);
+    }, CONTINUOUS_HISTORY_SYNC_MS);
+    syncHistoryIntervals.set(name, timer);
+}
+async function resolveProxyAgent(instance) {
+    const proxy = getInstancePanelConfig(instance).proxy;
+    if (!proxy.enabled) {
+        return { agent: null };
+    }
+    const host = String(proxy.host || '').trim();
+    const port = Number(proxy.port || 0);
+    if (!host || !Number.isFinite(port) || port <= 0) {
+        return { agent: null, error: 'proxy_invalid_host_or_port' };
+    }
+    const protocol = proxy.protocol === 'https' ? 'https' : 'http';
+    const username = String(proxy.username || '').trim();
+    const password = String(proxy.password || '').trim();
+    const auth = username ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : '';
+    const proxyUrl = `${protocol}://${auth}${host}:${port}`;
+    try {
+        const { HttpsProxyAgent } = await import('https-proxy-agent');
+        return { agent: new HttpsProxyAgent(proxyUrl) };
+    }
+    catch {
+        return { agent: null, error: 'proxy_agent_unavailable' };
+    }
+}
+export function applyInstanceRuntimeSettings(name) {
+    const ctx = instances.get(name);
+    if (!ctx) {
+        return {
+            ok: false,
+            applied: [],
+            requiresReconnect: [],
+        };
+    }
+    stopAlwaysOnline(name);
+    startAlwaysOnline(name, ctx);
+    stopContinuousHistorySync(name);
+    startContinuousHistorySync(name, ctx);
+    pruneGroupChatsFromCache(name);
+    return {
+        ok: true,
+        applied: ['alwaysOnline', 'rejectCalls', 'ignoreGroups', 'autoReadMessages', 'readStatus', 'syncFullHistory'],
+        requiresReconnect: ['proxy'],
+    };
+}
+function extractMessageText(message) {
+    const msg = (message ?? {});
+    if (typeof msg.conversation === 'string')
+        return msg.conversation;
+    const extended = msg.extendedTextMessage;
+    if (extended?.text)
+        return extended.text;
+    const image = msg.imageMessage;
+    if (image?.caption)
+        return image.caption;
+    const video = msg.videoMessage;
+    if (video?.caption)
+        return video.caption;
+    if (msg.stickerMessage)
+        return '[sticker]';
+    if (msg.audioMessage)
+        return '[audio]';
+    if (msg.documentMessage)
+        return '[document]';
+    if (msg.contactMessage)
+        return '[contact]';
+    if (msg.locationMessage)
+        return '[location]';
+    return '[message]';
+}
+function detectRawMessageType(message, depth = 0) {
+    if (!isRecord(message) || depth > 6)
+        return 'unknown';
+    if (isRecord(message.conversation) || typeof message.conversation === 'string')
+        return 'text';
+    if (isRecord(message.extendedTextMessage))
+        return 'text';
+    if (isRecord(message.audioMessage))
+        return 'audio';
+    if (isRecord(message.imageMessage))
+        return 'image';
+    if (isRecord(message.videoMessage))
+        return 'video';
+    if (isRecord(message.stickerMessage))
+        return 'sticker';
+    if (isRecord(message.documentMessage))
+        return 'document';
+    if (isRecord(message.locationMessage))
+        return 'location';
+    if (isRecord(message.contactMessage) || isRecord(message.contactsArrayMessage))
+        return 'contact';
+    if (isRecord(message.reactionMessage))
+        return 'reaction';
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        const nested = detectRawMessageType(wrapper.message, depth + 1);
+        if (nested !== 'unknown')
+            return nested;
+    }
+    return 'unknown';
+}
+function shouldIncludeMediaBase64(kind) {
+    if (!config.webhooks.includeIncomingMediaBase64)
+        return false;
+    if (kind === 'video')
+        return config.webhooks.includeIncomingVideoBase64;
+    return true;
+}
+function maxMediaBytes(kind, scope) {
+    if (scope === 'webhook') {
+        if (kind === 'video')
+            return config.webhooks.incomingVideoBase64MaxBytes;
+        return config.webhooks.incomingMediaBase64MaxBytes;
+    }
+    if (kind === 'video')
+        return config.limits.chatVideoMaxBytes;
+    return config.limits.chatInlineMediaMaxBytes;
+}
+function purgeExpiredMediaBinaries(now = Date.now()) {
+    const ttl = config.limits.chatMediaRetentionMs;
+    let changed = false;
+    for (const [mediaId, item] of chatMediaBinaryStore.entries()) {
+        if (item.expiresAt <= now || now - item.createdAt > ttl) {
+            const absolutePath = path.join(mediaStoragePath, item.relativePath);
+            try {
+                if (fs.existsSync(absolutePath))
+                    fs.rmSync(absolutePath, { force: true });
+            }
+            catch {
+                // ignore deletion failures
+            }
+            chatMediaBinaryStore.delete(mediaId);
+            changed = true;
+        }
+    }
+    if (changed)
+        persistMediaIndex();
+}
+function clearInstanceMediaBinaries(instance, force = false) {
+    if (!force)
+        return;
+    let changed = false;
+    for (const [mediaId, item] of chatMediaBinaryStore.entries()) {
+        if (item.instance === instance) {
+            const absolutePath = path.join(mediaStoragePath, item.relativePath);
+            try {
+                if (fs.existsSync(absolutePath))
+                    fs.rmSync(absolutePath, { force: true });
+            }
+            catch {
+                // ignore deletion failures
+            }
+            chatMediaBinaryStore.delete(mediaId);
+            changed = true;
+        }
+    }
+    if (changed)
+        persistMediaIndex();
+}
+function isSafeInlineMime(kind, mimeType) {
+    const value = String(mimeType ?? '').trim().toLowerCase();
+    if (!value)
+        return kind !== 'video';
+    if (kind === 'image')
+        return value.startsWith('image/') && value !== 'image/svg+xml';
+    if (kind === 'audio')
+        return value.startsWith('audio/');
+    if (kind === 'sticker')
+        return value === 'image/webp' || value === 'image/png';
+    if (kind === 'video')
+        return value.startsWith('video/');
+    return false;
+}
+function storeMediaBinary(instance, media) {
+    if (!media.base64)
+        return media;
+    const mimeType = media.mimeType || (media.kind === 'video' ? 'video/mp4' : 'application/octet-stream');
+    if (!isSafeInlineMime(media.kind, mimeType) && media.kind !== 'document') {
+        return {
+            ...media,
+            base64: undefined,
+            omittedReason: 'download_failed',
+        };
+    }
+    let bytes;
+    try {
+        bytes = Buffer.from(media.base64, 'base64');
+    }
+    catch {
+        return {
+            ...media,
+            base64: undefined,
+            omittedReason: 'download_failed',
+        };
+    }
+    if (!bytes.length || bytes.length > maxMediaBytes(media.kind, 'chat')) {
+        return {
+            ...media,
+            base64: undefined,
+            omittedReason: 'too_large',
+        };
+    }
+    const createdAt = Date.now();
+    const expiresAt = createdAt + config.limits.chatMediaRetentionMs;
+    const mediaId = randomUUID();
+    const ext = mediaFileExtension(media.kind, mimeType);
+    const year = new Date(createdAt).getUTCFullYear();
+    const month = String(new Date(createdAt).getUTCMonth() + 1).padStart(2, '0');
+    const day = String(new Date(createdAt).getUTCDate()).padStart(2, '0');
+    const relativePath = path.join(instance, String(year), month, day, `${mediaId}.${ext}`);
+    const absolutePath = path.join(mediaStoragePath, relativePath);
+    try {
+        fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+        fs.writeFileSync(absolutePath, bytes);
+    }
+    catch {
+        return {
+            ...media,
+            base64: undefined,
+            omittedReason: 'download_failed',
+        };
+    }
+    chatMediaBinaryStore.set(mediaId, {
+        instance,
+        mediaId,
+        kind: media.kind,
+        mimeType,
+        relativePath,
+        sizeBytes: bytes.length,
+        createdAt,
+        expiresAt,
+    });
+    persistMediaIndex();
+    return {
+        ...media,
+        mediaId,
+        base64: undefined,
+        bytes: bytes.length,
+    };
+}
+function findMediaNode(message, depth = 0) {
+    if (!isRecord(message) || depth > 6)
+        return null;
+    for (const [kind, configByKind] of Object.entries(MEDIA_NODE_BY_KIND)) {
+        const candidate = message[configByKind.field];
+        if (isRecord(candidate)) {
+            return { kind, node: candidate };
+        }
+    }
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        const nested = findMediaNode(wrapper.message, depth + 1);
+        if (nested)
+            return nested;
+    }
+    return null;
+}
+function injectMediaBase64(message, kind, base64, depth = 0) {
+    if (!isRecord(message) || depth > 6)
+        return message;
+    const mediaField = MEDIA_NODE_BY_KIND[kind].field;
+    if (isRecord(message[mediaField])) {
+        return {
+            ...message,
+            [mediaField]: {
+                ...message[mediaField],
+                base64,
+            },
+        };
+    }
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        return {
+            ...message,
+            [wrapperKey]: {
+                ...wrapper,
+                message: injectMediaBase64(wrapper.message, kind, base64, depth + 1),
+            },
+        };
+    }
+    return message;
+}
+async function downloadMediaBase64(node, kind, scope = 'webhook') {
+    if (scope === 'webhook' && !shouldIncludeMediaBase64(kind))
+        return null;
+    try {
+        const module = (await import('baileys'));
+        if (typeof module.downloadContentFromMessage !== 'function')
+            return { omittedReason: 'download_failed' };
+        const stream = await module.downloadContentFromMessage(node, MEDIA_NODE_BY_KIND[kind].downloadType);
+        const chunks = [];
+        let total = 0;
+        const limit = maxMediaBytes(kind, scope);
+        for await (const chunk of stream) {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            total += buffer.length;
+            if (total > limit) {
+                return { omittedReason: 'too_large' };
+            }
+            chunks.push(buffer);
+        }
+        if (!chunks.length)
+            return { omittedReason: 'download_failed' };
+        return {
+            base64: Buffer.concat(chunks).toString('base64'),
+            bytes: total,
+        };
+    }
+    catch {
+        return { omittedReason: 'download_failed' };
+    }
+}
+function extractMediaMeta(message) {
+    const found = findMediaNode(message);
+    if (!found)
+        return null;
+    const mimeType = typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined;
+    const caption = typeof found.node.caption === 'string' ? found.node.caption : undefined;
+    const fileName = typeof found.node.fileName === 'string' ? found.node.fileName : undefined;
+    const base64 = typeof found.node.base64 === 'string' ? found.node.base64 : undefined;
+    return {
+        kind: found.kind,
+        mimeType,
+        caption,
+        fileName,
+        base64,
+    };
+}
+function parsePhoneFromVcard(vcardRaw) {
+    const match = vcardRaw.match(/TEL[^:]*:([^\r\n]+)/i);
+    if (!match || !match[1])
+        return undefined;
+    return match[1].replace(/[^0-9+]/g, '').trim() || undefined;
+}
+function extractContactMeta(message) {
+    if (!isRecord(message))
+        return null;
+    const contact = isRecord(message.contactMessage) ? message.contactMessage : null;
+    if (contact) {
+        const displayName = typeof contact.displayName === 'string' ? contact.displayName.trim() : undefined;
+        const number = typeof contact.number === 'string'
+            ? contact.number.trim()
+            : typeof contact.vcard === 'string'
+                ? parsePhoneFromVcard(contact.vcard)
+                : undefined;
+        if (!displayName && !number)
+            return null;
+        return {
+            displayName: displayName || undefined,
+            number: number || undefined,
+        };
+    }
+    const contactsArray = isRecord(message.contactsArrayMessage) ? message.contactsArrayMessage : null;
+    const contactsList = Array.isArray(contactsArray?.contacts) ? contactsArray.contacts : null;
+    if (contactsList && contactsList.length > 0) {
+        const first = isRecord(contactsList[0]) ? contactsList[0] : null;
+        if (!first)
+            return null;
+        const displayName = typeof first.displayName === 'string' ? first.displayName.trim() : undefined;
+        const number = typeof first.number === 'string'
+            ? first.number.trim()
+            : typeof first.vcard === 'string'
+                ? parsePhoneFromVcard(first.vcard)
+                : undefined;
+        if (!displayName && !number)
+            return null;
+        return {
+            displayName: displayName || undefined,
+            number: number || undefined,
+        };
+    }
+    return null;
+}
+function extractSender(rawMessage) {
+    const key = isRecord(rawMessage.key) ? rawMessage.key : {};
+    const participant = typeof key.participant === 'string' ? key.participant : '';
+    const remoteJid = typeof key.remoteJid === 'string' ? key.remoteJid : '';
+    const senderJid = participant || remoteJid;
+    const senderNumber = senderJid ? senderJid.split('@')[0] : undefined;
+    const senderName = typeof rawMessage.pushName === 'string' ? rawMessage.pushName.trim() : undefined;
+    return {
+        senderName: senderName || undefined,
+        senderNumber,
+    };
+}
+function isSkippableSystemMessage(message) {
+    if (!isRecord(message))
+        return false;
+    if (isRecord(message.protocolMessage) || isRecord(message.senderKeyDistributionMessage))
+        return true;
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        if (isSkippableSystemMessage(wrapper.message))
+            return true;
+    }
+    return false;
+}
+async function enrichIncomingMediaBase64(messages) {
+    if (!config.webhooks.includeIncomingMediaBase64 || messages.length === 0)
+        return messages;
+    const enriched = [...messages];
+    for (let i = 0; i < messages.length; i += 1) {
+        const current = messages[i];
+        const message = isRecord(current.message) ? current.message : null;
+        if (!message)
+            continue;
+        const found = findMediaNode(message);
+        if (!found)
+            continue;
+        const mediaData = await downloadMediaBase64(found.node, found.kind, 'webhook');
+        if (!mediaData?.base64)
+            continue;
+        enriched[i] = {
+            ...current,
+            message: injectMediaBase64(message, found.kind, mediaData.base64),
+        };
+    }
+    return enriched;
+}
+function stripMessageNoise(value, depth = 0) {
+    if (!isRecord(value) || depth > 8)
+        return value;
+    const output = {};
+    for (const [key, entry] of Object.entries(value)) {
+        if (EXTERNAL_MESSAGE_STRIP_KEYS.has(key))
+            continue;
+        output[key] = stripMessageNoise(entry, depth + 1);
+    }
+    return output;
+}
+function findMessageContextInfoNode(message, depth = 0) {
+    if (!isRecord(message) || depth > 6)
+        return null;
+    if (isRecord(message.messageContextInfo))
+        return message.messageContextInfo;
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        const nested = findMessageContextInfoNode(wrapper.message, depth + 1);
+        if (nested)
+            return nested;
+    }
+    return null;
+}
+function extractCompactCryptoContext(rawMessage) {
+    const message = isRecord(rawMessage.message) ? rawMessage.message : null;
+    if (!message)
+        return null;
+    const ctx = findMessageContextInfoNode(message);
+    if (!ctx)
+        return null;
+    const metadata = isRecord(ctx.deviceListMetadata) ? ctx.deviceListMetadata : null;
+    const senderKeyHash = metadata && typeof metadata.senderKeyHash === 'string' ? metadata.senderKeyHash : undefined;
+    const recipientKeyHash = metadata && typeof metadata.recipientKeyHash === 'string' ? metadata.recipientKeyHash : undefined;
+    const messageSecret = typeof ctx.messageSecret === 'string' ? ctx.messageSecret : undefined;
+    if (!senderKeyHash && !recipientKeyHash && !messageSecret)
+        return null;
+    return {
+        senderKeyHash,
+        recipientKeyHash,
+        messageSecret,
+    };
+}
+function findReactionMessageNode(message, depth = 0) {
+    if (!isRecord(message) || depth > 6)
+        return null;
+    if (isRecord(message.reactionMessage))
+        return message.reactionMessage;
+    for (const wrapperKey of MESSAGE_WRAPPER_KEYS) {
+        const wrapper = message[wrapperKey];
+        if (!isRecord(wrapper) || !isRecord(wrapper.message))
+            continue;
+        const nested = findReactionMessageNode(wrapper.message, depth + 1);
+        if (nested)
+            return nested;
+    }
+    return null;
+}
+function extractReactionReference(rawMessage) {
+    const rootMessage = isRecord(rawMessage.message) ? rawMessage.message : null;
+    if (!rootMessage)
+        return null;
+    const reaction = findReactionMessageNode(rootMessage);
+    if (!reaction)
+        return null;
+    const reactionKey = isRecord(reaction.key) ? reaction.key : null;
+    const targetMessageId = typeof reactionKey?.id === 'string'
+        ? reactionKey.id.trim()
+        : typeof reaction.stanzaId === 'string'
+            ? reaction.stanzaId.trim()
+            : '';
+    const targetRemoteJid = typeof reactionKey?.remoteJid === 'string'
+        ? reactionKey.remoteJid.trim()
+        : typeof reaction.remoteJid === 'string'
+            ? reaction.remoteJid.trim()
+            : '';
+    const targetParticipant = typeof reactionKey?.participant === 'string'
+        ? reactionKey.participant.trim()
+        : typeof reaction.participant === 'string'
+            ? reaction.participant.trim()
+            : '';
+    const emoji = typeof reaction.text === 'string' ? reaction.text : undefined;
+    return {
+        emoji,
+        targetMessageId: targetMessageId || undefined,
+        targetRemoteJid: targetRemoteJid || undefined,
+        targetParticipant: targetParticipant || undefined,
+    };
+}
+async function resolveReactionTarget(instance, rawMessage) {
+    const ref = extractReactionReference(rawMessage);
+    if (!ref || !ref.targetMessageId)
+        return null;
+    const currentKey = isRecord(rawMessage.key) ? rawMessage.key : null;
+    const fallbackJid = typeof currentKey?.remoteJid === 'string' ? currentKey.remoteJid.trim() : '';
+    const chatJid = ref.targetRemoteJid || fallbackJid;
+    if (!chatJid) {
+        return {
+            id: ref.targetMessageId,
+            emoji: ref.emoji,
+            found: false,
+        };
+    }
+    const chats = chatCache.get(instance);
+    const chat = chats?.get(chatJid);
+    const target = chat?.messages.find((item) => item.id === ref.targetMessageId) ?? null;
+    if (!target) {
+        return {
+            id: ref.targetMessageId,
+            chatJid,
+            participant: ref.targetParticipant,
+            emoji: ref.emoji,
+            found: false,
+        };
+    }
+    await ensureCachedMessageMedia(instance, target);
+    const targetType = target.media?.kind ?? (target.contact ? 'contact' : 'text');
+    return {
+        id: target.id,
+        chatJid,
+        participant: ref.targetParticipant,
+        emoji: ref.emoji,
+        found: true,
+        type: targetType,
+        text: target.text,
+        sender: {
+            name: target.senderName,
+            number: target.senderNumber,
+        },
+        contact: target.contact
+            ? {
+                displayName: target.contact.displayName,
+                number: target.contact.number,
+            }
+            : undefined,
+        media: target.media
+            ? {
+                kind: target.media.kind,
+                mimeType: target.media.mimeType,
+                fileName: target.media.fileName,
+                caption: target.media.caption,
+                mediaId: target.media.mediaId,
+                url: target.media.mediaId ? buildMediaUrl(instance, target.media.mediaId) : undefined,
+                bytes: target.media.bytes,
+            }
+            : undefined,
+    };
+}
+function getCachedMessageForRaw(instance, rawMessage) {
+    const key = isRecord(rawMessage.key) ? rawMessage.key : null;
+    const jid = key && typeof key.remoteJid === 'string' ? key.remoteJid.trim() : '';
+    const id = key && typeof key.id === 'string' ? key.id.trim() : '';
+    if (!jid || !id)
+        return null;
+    const chats = chatCache.get(instance);
+    const chat = chats?.get(jid);
+    if (!chat)
+        return null;
+    return chat.messages.find((item) => item.id === id) ?? null;
+}
+async function normalizeUpsertMessagesForExternal(instance, messages) {
+    const normalized = [];
+    for (const raw of messages) {
+        const cleaned = stripMessageNoise(raw);
+        const inferredType = detectRawMessageType(raw.message);
+        cleaned.message_type = inferredType;
+        cleaned.messageType = inferredType;
+        const cryptoContext = extractCompactCryptoContext(raw);
+        if (cryptoContext) {
+            cleaned.crypto = cryptoContext;
+        }
+        const senderFallback = extractSender(raw);
+        cleaned.sender = {
+            name: senderFallback.senderName,
+            number: senderFallback.senderNumber,
+        };
+        const cached = getCachedMessageForRaw(instance, raw);
+        if (cached) {
+            await ensureCachedMessageMedia(instance, cached);
+            cleaned.text = cached.text;
+            const resolvedType = cached.media?.kind ?? inferredType;
+            cleaned.message_type = resolvedType;
+            cleaned.messageType = resolvedType;
+            cleaned.sender = {
+                name: cached.senderName,
+                number: cached.senderNumber,
+            };
+            if (cached.media) {
+                cleaned.media = {
+                    kind: cached.media.kind,
+                    mimeType: cached.media.mimeType,
+                    fileName: cached.media.fileName,
+                    caption: cached.media.caption,
+                    mediaId: cached.media.mediaId,
+                    url: cached.media.mediaId ? buildMediaUrl(instance, cached.media.mediaId) : undefined,
+                    base64: config.webhooks.includeIncomingMediaBase64 ? cached.media.base64 : undefined,
+                    bytes: cached.media.bytes,
+                    omittedReason: cached.media.omittedReason,
+                };
+            }
+        }
+        if (cleaned.message_type === 'reaction' || cleaned.messageType === 'reaction') {
+            const reactionTarget = await resolveReactionTarget(instance, raw);
+            if (reactionTarget) {
+                cleaned.reaction_target = reactionTarget;
+                cleaned.reactionTarget = reactionTarget;
+            }
+        }
+        normalized.push(cleaned);
+    }
+    return normalized;
+}
+function ensureInstanceChatMap(instance) {
+    let map = chatCache.get(instance);
+    if (!map) {
+        map = new Map();
+        chatCache.set(instance, map);
+    }
+    return map;
+}
+function updateCachedMessage(instance, payload) {
+    const chats = ensureInstanceChatMap(instance);
+    const existing = chats.get(payload.jid);
+    const title = existing?.title || payload.jid.split('@')[0];
+    const chat = existing ?? {
+        jid: payload.jid,
+        title,
+        unreadCount: 0,
+        lastMessage: '',
+        lastTimestamp: 0,
+        messages: [],
+    };
+    const existingMessage = chat.messages.find((message) => message.id === payload.id);
+    if (existingMessage) {
+        if (payload.senderName)
+            existingMessage.senderName = payload.senderName;
+        if (payload.senderNumber)
+            existingMessage.senderNumber = payload.senderNumber;
+        if (payload.media) {
+            existingMessage.media = {
+                ...(existingMessage.media ?? {}),
+                ...payload.media,
+            };
+        }
+        if (payload.contact) {
+            existingMessage.contact = {
+                ...(existingMessage.contact ?? {}),
+                ...payload.contact,
+            };
+        }
+        if (payload.mediaSource) {
+            existingMessage.mediaSource = payload.mediaSource;
+        }
+        chats.set(payload.jid, chat);
+        return false;
+    }
+    chat.lastMessage = payload.text;
+    chat.lastTimestamp = payload.timestamp;
+    const incrementUnread = payload.incrementUnread ?? !payload.fromMe;
+    if (incrementUnread) {
+        chat.unreadCount += 1;
+    }
+    chat.messages.push({
+        id: payload.id,
+        fromMe: payload.fromMe,
+        text: payload.text,
+        timestamp: payload.timestamp,
+        senderName: payload.senderName,
+        senderNumber: payload.senderNumber,
+        participant: payload.participant,
+        media: payload.media,
+        contact: payload.contact,
+        mediaSource: payload.mediaSource,
+    });
+    chats.set(payload.jid, chat);
+    // ── Persistência SQLite ────────────────────────────────────────────────────
+    try {
+        msUpsert(instance, payload.jid, {
+            id: payload.id,
+            fromMe: payload.fromMe,
+            text: payload.text,
+            timestamp: payload.timestamp,
+            senderName: payload.senderName,
+            senderNumber: payload.senderNumber,
+            participant: payload.participant,
+            media: payload.media,
+            contact: payload.contact,
+        });
+        msUpsertMeta(instance, payload.jid, {
+            lastMessage: payload.text,
+            lastTimestamp: payload.timestamp,
+        });
+        if (incrementUnread) {
+            msIncrementUnread(instance, payload.jid);
+        }
+    }
+    catch {
+        // Persistência é best-effort; nunca bloqueia o fluxo normal
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+    return true;
+}
+function upsertCachedChatMeta(instance, payload) {
+    const chats = ensureInstanceChatMap(instance);
+    const existing = chats.get(payload.jid);
+    const fallbackTitle = payload.jid.split('@')[0] || payload.jid;
+    const title = String(payload.title ?? '').trim() || existing?.title || fallbackTitle;
+    const chat = existing ?? {
+        jid: payload.jid,
+        title,
+        unreadCount: 0,
+        lastMessage: '',
+        lastTimestamp: Number(payload.timestamp ?? 0),
+        messages: [],
+    };
+    chat.title = title;
+    if (payload.timestamp && payload.timestamp > chat.lastTimestamp) {
+        chat.lastTimestamp = payload.timestamp;
+    }
+    chats.set(payload.jid, chat);
+    // ── Persistência SQLite ────────────────────────────────────────────────────
+    try {
+        msUpsertMeta(instance, payload.jid, {
+            title,
+            ...(payload.timestamp ? { lastTimestamp: payload.timestamp } : {}),
+        });
+    }
+    catch {
+        // best-effort
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+}
+function formatDisconnectInfo(lastDisconnect) {
+    const info = (lastDisconnect ?? {});
+    const code = info.error?.output?.statusCode;
+    const message = info.error?.message ?? info.error?.data;
+    return { code, message };
+}
+function isPairingWindowActive(name) {
+    const issuedAt = pairingIssuedAt.get(name);
+    if (!issuedAt)
+        return false;
+    return Date.now() - issuedAt <= 120000;
+}
+function ingestMessagesToCache(instance, rawMessages, options) {
+    const settings = getInstanceGeneral(instance);
+    const fromHistory = Boolean(options?.fromHistory);
+    const list = settings.ignoreGroups
+        ? rawMessages.filter((msg) => {
+            const key = (msg.key ?? {});
+            const remoteJid = String(key.remoteJid ?? '').trim();
+            return !remoteJid.endsWith('@g.us');
+        })
+        : rawMessages;
+    let inserted = 0;
+    for (const msg of list) {
+        const key = (msg.key ?? {});
+        const remoteJid = String(key.remoteJid ?? '').trim();
+        const id = String(key.id ?? '').trim();
+        if (!remoteJid || !id)
+            continue;
+        const message = msg.message;
+        if (isSkippableSystemMessage(message))
+            continue;
+        const timestamp = normalizeTimestamp(msg.messageTimestamp);
+        const text = extractMessageText(message);
+        const sender = extractSender(msg);
+        const mediaMeta = extractMediaMeta(message);
+        const contactMeta = extractContactMeta(message);
+        const mediaFound = findMediaNode(message);
+        const wasInserted = updateCachedMessage(instance, {
+            jid: remoteJid,
+            id,
+            fromMe: Boolean(key.fromMe),
+            text,
+            timestamp,
+            incrementUnread: fromHistory ? false : !Boolean(key.fromMe),
+            senderName: sender.senderName,
+            senderNumber: sender.senderNumber,
+            participant: typeof key.participant === 'string' ? key.participant.trim() || undefined : undefined,
+            media: mediaMeta
+                ? {
+                    kind: mediaMeta.kind,
+                    mimeType: mediaMeta.mimeType,
+                    fileName: mediaMeta.fileName,
+                    caption: mediaMeta.caption,
+                    base64: mediaMeta.base64,
+                }
+                : undefined,
+            contact: contactMeta ?? undefined,
+            mediaSource: mediaFound ?? undefined,
+        });
+        if (wasInserted)
+            inserted += 1;
+    }
+    return { list, inserted };
+}
+function closeSocket(sock) {
+    try {
+        sock.ws?.close?.();
+    }
+    catch {
+        // ignore
+    }
+}
+/**
+ * Retorna o contexto da instância pelo nome, ou undefined se não existir.
+ */
+export function getInstance(name) {
+    return instances.get(name);
+}
+/**
+ * Retorna todas as instâncias.
+ */
+export function getAllInstances() {
+    return Array.from(instances.values());
+}
+export async function reconnectPreviouslyActiveInstances(authFolder) {
+    const authPath = path.resolve(process.cwd(), authFolder);
+    const failed = [];
+    if (!fs.existsSync(authPath)) {
+        return { attempted: 0, started: 0, failed };
+    }
+    const savedSessions = new Set(fs
+        .readdirSync(authPath, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && isValidInstanceName(entry.name))
+        .map((entry) => entry.name.trim()));
+    const queue = [...savedSessions].filter((name) => {
+        if (!isValidInstanceName(name))
+            return false;
+        const state = lastInstanceState.get(name);
+        if (state?.stoppedByUser)
+            return false;
+        if (state?.wasConnected)
+            return true;
+        if (autostartInstances.has(name))
+            return true;
+        // Backward compatibility: sessions salvas antigas (sem estado persistido)
+        // devem tentar restaurar no startup, exceto quando foram explicitamente paradas.
+        return !state;
+    });
+    let started = 0;
+    for (const name of queue) {
+        const result = await createInstance(name, authFolder);
+        if (result.ok) {
+            started += 1;
+        }
+        else {
+            failed.push(`${name}:${result.error ?? 'unknown_error'}`);
+        }
+        await sleep(250);
+    }
+    return {
+        attempted: queue.length,
+        started,
+        failed,
+    };
+}
+/**
+ * Cria e inicia uma nova instância WhatsApp (InfiniteAPI/Baileys).
+ * Gera QR code até o usuário escanear e conectar.
+ * Em 515 (restartRequired) recria o socket automaticamente após 2s.
+ */
+export async function createInstance(name, authFolder) {
+    const normalizedName = String(name ?? '').trim();
+    if (!isValidInstanceName(normalizedName)) {
+        return { ok: false, instance: normalizedName || String(name ?? ''), error: 'invalid_instance_name' };
+    }
+    name = normalizedName;
+    if (instances.has(name)) {
+        const ctx = instances.get(name);
+        if (ctx.status === 'connected') {
+            markAutostart(name, true);
+            return { ok: true, instance: name };
+        }
+        if (ctx.status === 'qr' && ctx.qr) {
+            return { ok: true, instance: name, qr: ctx.qr };
+        }
+        // disconnected ou connecting: remove e recria para nova tentativa
+        closeSocket(ctx.sock);
+        instances.delete(name);
+    }
+    try {
+        const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestWaWebVersion, Browsers, } = await import('baileys');
+        const authPath = path.resolve(process.cwd(), authFolder, name);
+        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        let version;
+        try {
+            const wa = await fetchLatestWaWebVersion({});
+            const v = wa.version;
+            version = Array.isArray(v) && v.length >= 3 ? [v[0], v[1], v[2]] : [2, 3000, 1032884366];
+        }
+        catch {
+            version = [2, 3000, 1032884366];
+        }
+        const generalSettings = getInstanceGeneral(name);
+        const proxyAgentResult = await resolveProxyAgent(name);
+        if (proxyAgentResult.error) {
+            return { ok: false, instance: name, error: proxyAgentResult.error };
+        }
+        // Silent logger for Baileys: disables [BAILEYS] console.log spam (Message received,
+        // Event buffer flushed, Event buffering started, histNotification, etc.) and the
+        // pino histNotification info logs. Only fatal errors are kept.
+        const silentLogger = {
+            level: 'fatal',
+            fatal: (..._args) => { },
+            error: (..._args) => { },
+            warn: (..._args) => { },
+            info: (..._args) => { },
+            debug: (..._args) => { },
+            trace: (..._args) => { },
+            child: () => silentLogger,
+        };
+        const socketOptions = {
+            auth: state,
+            printQRInTerminal: false,
+            version,
+            browser: Browsers.windows('Chrome'),
+            syncFullHistory: generalSettings.syncFullHistory,
+            logger: silentLogger,
+        };
+        if (proxyAgentResult.agent) {
+            socketOptions.agent = proxyAgentResult.agent;
+            socketOptions.fetchAgent = proxyAgentResult.agent;
+        }
+        const sock = makeWASocket(socketOptions);
+        const ctx = {
+            name,
+            sock,
+            status: 'connecting',
+            qr: null,
+            createdAt: new Date(),
+            authFolder,
+        };
+        instances.set(name, ctx);
+        reconnectAttempts.set(name, 0);
+        sock.ev.on('creds.update', (creds) => {
+            void saveCreds();
+            const registered = Boolean(creds?.registered);
+            if (registered) {
+                pairingIssuedAt.delete(name);
+            }
+        });
+        sock.ev.on('connection.update', ((update) => {
+            emitWebhookEvent('connection.update', { instance: name, update }, name);
+            void emitInstanceEvent(name, 'CONNECTION_UPDATE', { update });
+            const { connection, qr, lastDisconnect } = (update ?? {});
+            if (qr) {
+                ctx.status = 'qr';
+                ctx.qr = qr;
+                void emitInstanceEvent(name, 'QRCODE_UPDATED', { hasQr: true });
+            }
+            if (connection === 'open') {
+                ctx.status = 'connected';
+                ctx.qr = null;
+                reconnectAttempts.set(name, 0);
+                markAutostart(name, true);
+                trackLastInstanceState(name, {
+                    status: 'connected',
+                    wasConnected: true,
+                    stoppedByUser: false,
+                });
+                const currentUser = ctx.sock.user ?? {};
+                const linkedJid = String(currentUser.id ?? '').trim();
+                const linkedNumber = linkedJid ? linkedJid.split(':')[0].split('@')[0] : '';
+                ctx.linkedNumber = linkedNumber || null;
+                ctx.profileName = String(currentUser.name ?? '').trim() || null;
+                if (typeof ctx.sock.profilePictureUrl === 'function' && linkedJid) {
+                    ctx.sock
+                        .profilePictureUrl(linkedJid)
+                        .then((url) => {
+                        if (instances.get(name) === ctx) {
+                            ctx.profilePictureUrl = url || null;
+                        }
+                    })
+                        .catch(() => {
+                        if (instances.get(name) === ctx) {
+                            ctx.profilePictureUrl = null;
+                        }
+                    });
+                }
+                startAlwaysOnline(name, ctx);
+                startContinuousHistorySync(name, ctx);
+                // Auto-create Chatwoot inbox if configured + auto-sync history if Import Messages is enabled.
+                // Wait a few seconds before sync so initial history sync has had time to populate the SQLite store.
+                void (async () => {
+                    try {
+                        await autoCreateChatwootInbox(name, linkedNumber ?? null);
+                    }
+                    catch (err) {
+                        console.error(`[whatsapp][${name}] autoCreateChatwootInbox error`, err);
+                    }
+                    try {
+                        const { getInstanceIntegrations: getInteg } = await import('./integrations.js');
+                        const { syncHistoryToChatwoot: syncHist } = await import('./chatwoot-bridge.js');
+                        const cfg = getInteg(name).chatwoot;
+                        if (cfg.enabled && cfg.importMessages === true && cfg.baseUrl && cfg.accountId && cfg.apiAccessToken && cfg.inboxId) {
+                            // Wait 8s after connect for initial Baileys history sync to populate SQLite
+                            await new Promise(r => setTimeout(r, 8000));
+                            syncHist(name, undefined, 200, 'connect').catch((err) => {
+                                console.warn(`[whatsapp][${name}] connect-trigger sync failed:`, err.message);
+                            });
+                        }
+                    }
+                    catch (err) {
+                        console.warn(`[whatsapp][${name}] connect-trigger sync error:`, err.message);
+                    }
+                })();
+            }
+            if (connection === 'close') {
+                // Ignore close events from stale sockets that are no longer current.
+                if (instances.get(name) !== ctx) {
+                    return;
+                }
+                const previousStatus = ctx.status;
+                const { code, message } = formatDisconnectInfo(lastDisconnect);
+                ctx.status = 'disconnected';
+                ctx.qr = null;
+                trackLastInstanceState(name, {
+                    status: 'disconnected',
+                });
+                console.log(`[whatsapp][${name}] connection_close code=${String(code ?? 'n/a')} message=${String(message ?? 'n/a')}`);
+                if (code === DisconnectReason.loggedOut || code === DisconnectReason.connectionReplaced) {
+                    if (isPairingWindowActive(name)) {
+                        console.log(`[whatsapp][${name}] pairing_window_close code=${String(code)} (holding disconnected; no auto-recreate)`);
+                        closeSocket(ctx.sock);
+                        ctx.status = 'disconnected';
+                        ctx.qr = null;
+                        reconnectAttempts.set(name, 0);
+                        stopAlwaysOnline(name);
+                        stopContinuousHistorySync(name);
+                        return;
+                    }
+                    const attempts = (reconnectAttempts.get(name) ?? 0) + 1;
+                    const allowRecovery = previousStatus === 'connected' && attempts <= 6;
+                    if (allowRecovery) {
+                        reconnectAttempts.set(name, attempts);
+                        const folder = ctx.authFolder;
+                        const delayMs = Math.min(1000 * attempts, 6000);
+                        console.log(`[whatsapp][${name}] auth_close_recover code=${String(code)} attempt=${attempts} delay_ms=${delayMs}`);
+                        closeSocket(ctx.sock);
+                        ctx.status = 'connecting';
+                        setTimeout(() => {
+                            createInstance(name, folder).catch(() => { });
+                        }, delayMs);
+                        return;
+                    }
+                    closeSocket(ctx.sock);
+                    instances.delete(name);
+                    reconnectAttempts.delete(name);
+                    markAutostart(name, false);
+                    trackLastInstanceState(name, {
+                        status: 'disconnected',
+                        wasConnected: false,
+                        stoppedByUser: true,
+                    });
+                    chatCache.delete(name);
+                    clearInstanceMediaBinaries(name, true);
+                    stopAlwaysOnline(name);
+                    stopContinuousHistorySync(name);
+                    return;
+                }
+                // 515 = restartRequired: pairing concluído, WA pede reinício. Recriar socket com o mesmo auth.
+                if (code === DisconnectReason.restartRequired) {
+                    const folder = ctx.authFolder;
+                    closeSocket(ctx.sock);
+                    ctx.status = 'connecting';
+                    stopAlwaysOnline(name);
+                    stopContinuousHistorySync(name);
+                    setTimeout(() => {
+                        createInstance(name, folder).catch(() => { });
+                    }, 2000);
+                    return;
+                }
+                // For transient closes (timeout/network/stream), only auto-recreate if it was already connected.
+                if (previousStatus !== 'connected') {
+                    return;
+                }
+                const attempts = (reconnectAttempts.get(name) ?? 0) + 1;
+                reconnectAttempts.set(name, attempts);
+                if (attempts <= 6) {
+                    const folder = ctx.authFolder;
+                    const delayMs = Math.min(1000 * attempts, 6000);
+                    console.log(`[whatsapp][${name}] reconnect_attempt=${attempts} delay_ms=${delayMs}`);
+                    closeSocket(ctx.sock);
+                    ctx.status = 'connecting';
+                    stopAlwaysOnline(name);
+                    stopContinuousHistorySync(name);
+                    setTimeout(() => {
+                        createInstance(name, folder).catch(() => { });
+                    }, delayMs);
+                }
+                else {
+                    console.log(`[whatsapp][${name}] reconnect_exhausted attempts=${attempts}`);
+                }
+            }
+        }));
+        sock.ev.on('messages.upsert', (payload) => {
+            const data = (payload ?? {});
+            const originalList = Array.isArray(data.messages) ? data.messages : [];
+            const ingested = ingestMessagesToCache(name, originalList, { fromHistory: false });
+            const list = ingested.list;
+            if (list.length > 0) {
+                void (async () => {
+                    const enrichedList = await enrichIncomingMediaBase64(list);
+                    const outboundMessages = await normalizeUpsertMessagesForExternal(name, enrichedList);
+                    const payloadObject = (typeof payload === 'object' && payload !== null ? payload : {});
+                    const payloadForEvents = {
+                        type: typeof payloadObject.type === 'string' ? payloadObject.type : 'notify',
+                        messages: outboundMessages,
+                    };
+                    emitWebhookEvent('messages.upsert', payloadForEvents, name);
+                    await emitInstanceEvent(name, 'MESSAGES_UPSERT', payloadForEvents);
+                    // Forward to Chatwoot if integration is enabled (best-effort, non-blocking).
+                    // Pre-filter system messages (protocolMessage, senderKeyDistributionMessage,
+                    // historySyncNotification, reactionMessage) — they are not real user messages
+                    // and should not even reach the bridge to avoid log spam and wasted work.
+                    const realMessages = outboundMessages.filter((m) => {
+                        const raw = m?.message;
+                        if (!raw)
+                            return false;
+                        if (raw.protocolMessage || raw.senderKeyDistributionMessage || raw.reactionMessage)
+                            return false;
+                        return true;
+                    });
+                    if (realMessages.length > 0) {
+                        void dispatchToChatwoot(name, realMessages);
+                    }
+                })();
+            }
+            const settings = getInstanceGeneral(name);
+            const keysToRead = new Map();
+            const addKeyToRead = (entry) => {
+                keysToRead.set(`${entry.remoteJid}:${entry.id}`, entry);
+            };
+            for (const msg of list) {
+                const key = (msg.key ?? {});
+                const remoteJid = String(key.remoteJid ?? '').trim();
+                const id = String(key.id ?? '').trim();
+                if (!remoteJid || !id)
+                    continue;
+                if (!key.fromMe && settings.autoReadMessages && remoteJid !== 'status@broadcast' && typeof ctx.sock.readMessages === 'function') {
+                    addKeyToRead({
+                        remoteJid,
+                        id,
+                        participant: key.participant,
+                        fromMe: false,
+                    });
+                }
+                if (remoteJid === 'status@broadcast' && settings.readStatus && typeof ctx.sock.readMessages === 'function') {
+                    addKeyToRead({
+                        remoteJid,
+                        id,
+                        participant: key.participant,
+                        fromMe: false,
+                    });
+                }
+            }
+            if (keysToRead.size && typeof ctx.sock.readMessages === 'function') {
+                ctx.sock.readMessages([...keysToRead.values()]).catch(() => { });
+            }
+        });
+        sock.ev.on('messages.set', (payload) => {
+            const data = (payload ?? {});
+            const originalList = Array.isArray(data.messages) ? data.messages : [];
+            const ingested = ingestMessagesToCache(name, originalList, { fromHistory: true });
+            if (ingested.list.length > 0) {
+                void emitInstanceEvent(name, 'MESSAGES_SET', {
+                    ...(typeof payload === 'object' && payload !== null ? payload : {}),
+                    messages: ingested.list,
+                });
+            }
+        });
+        sock.ev.on('messaging-history.set', (payload) => {
+            const data = (payload ?? {});
+            const settings = getInstanceGeneral(name);
+            const chats = Array.isArray(data.chats) ? data.chats : [];
+            for (const item of chats) {
+                const jid = String(item.id ?? item.jid ?? '').trim();
+                if (!jid)
+                    continue;
+                if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                    continue;
+                upsertCachedChatMeta(name, {
+                    jid,
+                    title: extractChatTitleFromPayload(item),
+                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                });
+            }
+            const originalList = Array.isArray(data.messages) ? data.messages : [];
+            const ingested = ingestMessagesToCache(name, originalList, { fromHistory: true });
+            if (ingested.list.length > 0) {
+                void emitInstanceEvent(name, 'MESSAGES_SET', { payload: { messages: ingested.list } });
+            }
+            if (chats.length > 0) {
+                void emitInstanceEvent(name, 'CHATS_SET', { payload: { chats } });
+            }
+        });
+        sock.ev.on('messages.update', (payload) => {
+            emitWebhookEvent('messages.update', { instance: name, payload }, name);
+            void emitInstanceEvent(name, 'MESSAGES_UPDATE', { payload });
+        });
+        sock.ev.on('message-receipt.update', (payload) => {
+            emitWebhookEvent('message-receipt.update', { instance: name, payload }, name);
+        });
+        sock.ev.on('chats.update', (payload) => {
+            emitWebhookEvent('chats.update', { instance: name, payload }, name);
+            void emitInstanceEvent(name, 'CHATS_UPDATE', { payload });
+            const settings = getInstanceGeneral(name);
+            const updates = Array.isArray(payload) ? payload : [];
+            for (const item of updates) {
+                const jid = String(item.id ?? item.jid ?? '').trim();
+                if (!jid)
+                    continue;
+                if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                    continue;
+                upsertCachedChatMeta(name, {
+                    jid,
+                    title: extractChatTitleFromPayload(item),
+                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                });
+            }
+        });
+        sock.ev.on('groups.update', (payload) => {
+            emitWebhookEvent('groups.update', { instance: name, payload }, name);
+            void emitInstanceEvent(name, 'GROUP_UPDATE', { payload });
+        });
+        sock.ev.on('chats.set', (payload) => {
+            void emitInstanceEvent(name, 'CHATS_SET', { payload });
+            const settings = getInstanceGeneral(name);
+            const data = (payload ?? {});
+            const chats = Array.isArray(data.chats) ? data.chats : [];
+            for (const item of chats) {
+                const jid = String(item.id ?? item.jid ?? '').trim();
+                if (!jid)
+                    continue;
+                if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                    continue;
+                upsertCachedChatMeta(name, {
+                    jid,
+                    title: extractChatTitleFromPayload(item),
+                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                });
+            }
+        });
+        sock.ev.on('chats.upsert', (payload) => {
+            void emitInstanceEvent(name, 'CHATS_UPSERT', { payload });
+            const settings = getInstanceGeneral(name);
+            const list = Array.isArray(payload) ? payload : [];
+            for (const item of list) {
+                const jid = String(item.id ?? item.jid ?? '').trim();
+                if (!jid)
+                    continue;
+                if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                    continue;
+                upsertCachedChatMeta(name, {
+                    jid,
+                    title: extractChatTitleFromPayload(item),
+                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                });
+            }
+        });
+        sock.ev.on('contacts.set', (payload) => {
+            void emitInstanceEvent(name, 'CONTACTS_SET', { payload });
+        });
+        sock.ev.on('contacts.update', (payload) => {
+            void emitInstanceEvent(name, 'CONTACTS_UPDATE', { payload });
+        });
+        sock.ev.on('contacts.upsert', (payload) => {
+            void emitInstanceEvent(name, 'CONTACTS_UPSERT', { payload });
+        });
+        sock.ev.on('groups.upsert', (payload) => {
+            void emitInstanceEvent(name, 'GROUPS_UPSERT', { payload });
+        });
+        sock.ev.on('group-participants.update', (payload) => {
+            void emitInstanceEvent(name, 'GROUP_PARTICIPANTS_UPDATE', { payload });
+        });
+        sock.ev.on('call', (payload) => {
+            void emitInstanceEvent(name, 'CALL', { payload });
+            const settings = getInstanceGeneral(name);
+            if (!settings.rejectCalls)
+                return;
+            const entries = Array.isArray(payload) ? payload : [payload];
+            for (const item of entries) {
+                const call = item;
+                const callId = String(call?.id ?? '').trim();
+                const callFrom = String(call?.from ?? call?.chatId ?? '').trim();
+                const callStatus = String(call?.status ?? '').trim().toLowerCase();
+                if (!callId || !callFrom)
+                    continue;
+                if (callStatus && callStatus !== 'offer' && callStatus !== 'ringing')
+                    continue;
+                if (typeof ctx.sock.rejectCall === 'function') {
+                    ctx.sock.rejectCall(callId, callFrom).catch(() => { });
+                }
+            }
+        });
+        return { ok: true, instance: name, qr: ctx.qr ?? undefined };
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, instance: name, error: message };
+    }
+}
+export function normalizePairingPhoneNumber(rawPhone, defaultCountryCode) {
+    const digits = rawPhone.replace(/\D/g, '');
+    if (!digits)
+        return '';
+    const countryCode = defaultCountryCode.replace(/\D/g, '');
+    if (!countryCode)
+        return digits;
+    if (digits.startsWith(countryCode))
+        return digits;
+    if (digits.length <= 11)
+        return `${countryCode}${digits}`;
+    return digits;
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+export async function requestInstancePairingCode(name, phoneNumber) {
+    const ctx = instances.get(name);
+    if (!ctx) {
+        return { ok: false, error: 'instance_not_found' };
+    }
+    if (ctx.status === 'connected') {
+        return { ok: false, error: 'instance_already_connected', status: ctx.status };
+    }
+    if (typeof ctx.sock.requestPairingCode !== 'function') {
+        return { ok: false, error: 'pairing_code_not_supported' };
+    }
+    let lastError = 'pairing_code_unavailable';
+    for (let attempt = 1; attempt <= 8; attempt++) {
+        const current = instances.get(name);
+        if (!current) {
+            return { ok: false, error: 'instance_not_found' };
+        }
+        if (current.status === 'connected') {
+            return { ok: false, error: 'instance_already_connected', status: current.status };
+        }
+        const requestPairingCode = current.sock.requestPairingCode;
+        if (typeof requestPairingCode !== 'function') {
+            return { ok: false, error: 'pairing_code_not_supported' };
+        }
+        try {
+            const pairingCode = await requestPairingCode(phoneNumber);
+            const code = String(pairingCode ?? '').trim();
+            if (code) {
+                pairingIssuedAt.set(name, Date.now());
+                await sleep(1200);
+                const afterIssue = instances.get(name);
+                if (!afterIssue || afterIssue.status === 'disconnected') {
+                    return { ok: false, error: 'pairing_code_unstable', status: afterIssue?.status };
+                }
+                return { ok: true, pairingCode: code, status: afterIssue.status };
+            }
+            lastError = 'empty_pairing_code';
+        }
+        catch (err) {
+            const message = (err instanceof Error ? err.message : String(err)).trim();
+            const normalized = message.toLowerCase();
+            if (normalized.includes('not linked') || normalized.includes('registered') || normalized.includes('logged in')) {
+                return { ok: false, error: 'session_already_registered', status: current.status };
+            }
+            if (normalized.includes('connection closed') || normalized.includes('closed')) {
+                lastError = 'pairing_channel_not_ready';
+            }
+            else {
+                lastError = message || 'pairing_code_unavailable';
+            }
+        }
+        if (attempt < 8) {
+            await sleep(1000);
+        }
+    }
+    return { ok: false, error: lastError, status: instances.get(name)?.status };
+}
+/**
+ * Desconecta e remove a instância da memória (credenciais permanecem em disco).
+ */
+export function disconnectInstance(name, options) {
+    const ctx = instances.get(name);
+    if (!ctx)
+        return false;
+    closeSocket(ctx.sock);
+    instances.delete(name);
+    reconnectAttempts.delete(name);
+    if (!options?.keepAutostart) {
+        markAutostart(name, false);
+        trackLastInstanceState(name, {
+            status: 'disconnected',
+            wasConnected: false,
+            stoppedByUser: true,
+        });
+    }
+    else {
+        trackLastInstanceState(name, {
+            status: 'disconnected',
+            stoppedByUser: false,
+        });
+    }
+    pairingIssuedAt.delete(name);
+    chatCache.delete(name);
+    clearInstanceMediaBinaries(name, true);
+    stopAlwaysOnline(name);
+    stopContinuousHistorySync(name);
+    return true;
+}
+/**
+ * Logout + apaga pasta de auth e remove instância. Próxima conexão gerará novo QR.
+ */
+export async function logoutInstance(name, authFolder) {
+    const normalizedName = String(name ?? '').trim();
+    if (!isValidInstanceName(normalizedName)) {
+        return { ok: false, error: 'invalid_instance_name' };
+    }
+    name = normalizedName;
+    const ctx = instances.get(name);
+    if (ctx) {
+        try {
+            if (typeof ctx.sock.logout === 'function') {
+                await ctx.sock.logout();
+            }
+        }
+        catch {
+            // ignore
+        }
+        closeSocket(ctx.sock);
+        instances.delete(name);
+        reconnectAttempts.delete(name);
+        markAutostart(name, false);
+        trackLastInstanceState(name, {
+            status: 'disconnected',
+            wasConnected: false,
+            stoppedByUser: true,
+        });
+        pairingIssuedAt.delete(name);
+        chatCache.delete(name);
+        clearInstanceMediaBinaries(name, true);
+        stopAlwaysOnline(name);
+        stopContinuousHistorySync(name);
+    }
+    const authPath = path.resolve(process.cwd(), authFolder, name);
+    try {
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true });
+        }
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: message };
+    }
+    // Apaga mensagens persistidas ao fazer logout (sessão encerrada definitivamente)
+    try {
+        msClearInstance(name);
+    }
+    catch { /* best-effort */ }
+    return { ok: true };
+}
+/**
+ * Remove a instância (fecha socket e remove do mapa). Não apaga credenciais.
+ */
+export function removeInstance(name) {
+    return disconnectInstance(name);
+}
+export function getInstanceChatList(name) {
+    // Combina cache em memória com dados persistidos no SQLite
+    // Chats do SQLite que não estão em memória ainda aparecem na lista
+    const memChats = chatCache.get(name);
+    const dbChats = (() => { try {
+        return msListChats(name);
+    }
+    catch {
+        return [];
+    } })();
+    const result = new Map();
+    // Primeiro: dados do banco
+    for (const c of dbChats) {
+        result.set(c.jid, {
+            jid: c.jid,
+            title: c.title || c.jid.split('@')[0],
+            unreadCount: c.unreadCount,
+            messageCount: c.messageCount,
+            lastMessage: c.lastMessage,
+            lastTimestamp: c.lastTimestamp,
+        });
+    }
+    // Sobrescreve/mescla com dados mais frescos do cache em memória
+    if (memChats) {
+        for (const chat of memChats.values()) {
+            const existing = result.get(chat.jid);
+            result.set(chat.jid, {
+                jid: chat.jid,
+                title: chat.title || existing?.title || chat.jid.split('@')[0],
+                unreadCount: chat.unreadCount,
+                messageCount: existing?.messageCount ?? chat.messages.length,
+                lastMessage: chat.lastMessage || existing?.lastMessage || '',
+                lastTimestamp: Math.max(chat.lastTimestamp, existing?.lastTimestamp ?? 0),
+            });
+        }
+    }
+    return [...result.values()].sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+}
+function toPublicCachedMessage(instance, message) {
+    const media = message.media
+        ? {
+            ...message.media,
+            url: message.media.mediaId ? buildMediaUrl(instance, message.media.mediaId) : undefined,
+        }
+        : undefined;
+    return {
+        id: message.id,
+        fromMe: message.fromMe,
+        text: message.text,
+        timestamp: message.timestamp,
+        senderName: message.senderName,
+        senderNumber: message.senderNumber,
+        participant: message.participant,
+        media,
+        contact: message.contact,
+    };
+}
+async function ensureCachedMessageMedia(instance, message) {
+    if (!message.media || message.media.base64 || message.media.omittedReason || !message.mediaSource)
+        return;
+    const downloaded = await downloadMediaBase64(message.mediaSource.node, message.mediaSource.kind, 'chat');
+    if (downloaded?.base64) {
+        const nextMimeType = message.media.mimeType ?? message.mediaSource.node.mimetype;
+        if (!isSafeInlineMime(message.mediaSource.kind, typeof nextMimeType === 'string' ? nextMimeType : undefined)) {
+            message.media = {
+                ...message.media,
+                omittedReason: 'download_failed',
+            };
+            return;
+        }
+        message.media = {
+            ...message.media,
+            base64: downloaded.base64,
+            bytes: downloaded.bytes,
+        };
+        message.media = storeMediaBinary(instance, message.media);
+        return;
+    }
+    if (downloaded?.omittedReason) {
+        message.media = {
+            ...message.media,
+            omittedReason: downloaded.omittedReason,
+        };
+    }
+}
+function getInstanceChatMessagesInternal(name, jid) {
+    const chats = chatCache.get(name);
+    const memMessages = chats?.get(jid)?.messages ?? [];
+    // Se não há mensagens em memória, carrega do SQLite
+    if (memMessages.length === 0) {
+        try {
+            const stored = msListMessages(name, jid, config.messages.maxPerChat);
+            if (stored.length > 0) {
+                // Carrega no cache de memória para uso futuro
+                const map = ensureInstanceChatMap(name);
+                const existing = map.get(jid);
+                if (!existing) {
+                    map.set(jid, {
+                        jid,
+                        title: jid.split('@')[0],
+                        unreadCount: 0,
+                        lastMessage: stored[stored.length - 1]?.text ?? '',
+                        lastTimestamp: stored[stored.length - 1]?.timestamp ?? 0,
+                        messages: stored.map((m) => ({
+                            id: m.id,
+                            fromMe: m.fromMe,
+                            text: m.text,
+                            timestamp: m.timestamp,
+                            senderName: m.senderName,
+                            senderNumber: m.senderNumber,
+                            participant: m.participant,
+                            media: m.media,
+                            contact: m.contact,
+                        })),
+                    });
+                }
+                return stored.map((m) => ({
+                    id: m.id,
+                    fromMe: m.fromMe,
+                    text: m.text,
+                    timestamp: m.timestamp,
+                    senderName: m.senderName,
+                    senderNumber: m.senderNumber,
+                    participant: m.participant,
+                    media: m.media,
+                    contact: m.contact,
+                }));
+            }
+        }
+        catch {
+            // best-effort
+        }
+        return memMessages.slice().sort((a, b) => a.timestamp - b.timestamp);
+    }
+    // Mescla memória + SQLite para garantir mensagens históricas não em memória
+    try {
+        const stored = msListMessages(name, jid, config.messages.maxPerChat);
+        if (stored.length > memMessages.length) {
+            const memIds = new Set(memMessages.map((m) => m.id));
+            const extra = stored.filter((m) => !memIds.has(m.id));
+            if (extra.length > 0) {
+                const allMessages = [
+                    ...memMessages,
+                    ...extra.map((m) => ({
+                        id: m.id,
+                        fromMe: m.fromMe,
+                        text: m.text,
+                        timestamp: m.timestamp,
+                        senderName: m.senderName,
+                        senderNumber: m.senderNumber,
+                        participant: m.participant,
+                        media: m.media,
+                        contact: m.contact,
+                    })),
+                ];
+                return allMessages.sort((a, b) => a.timestamp - b.timestamp);
+            }
+        }
+    }
+    catch {
+        // best-effort
+    }
+    return [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
+}
+function buildQuotedMessage(name, jid, replyToId) {
+    const list = getInstanceChatMessagesInternal(name, jid);
+    const target = list.find((item) => item.id === replyToId);
+    if (!target)
+        return null;
+    let message;
+    if (target.media?.kind === 'image') {
+        message = { imageMessage: { caption: target.media.caption || target.text || '' } };
+    }
+    else if (target.media?.kind === 'video') {
+        message = { videoMessage: { caption: target.media.caption || target.text || '' } };
+    }
+    else if (target.media?.kind === 'document') {
+        message = { documentMessage: { fileName: target.media.fileName || 'file', caption: target.media.caption || target.text || '' } };
+    }
+    else if (target.media?.kind === 'audio') {
+        message = { audioMessage: {} };
+    }
+    else if (target.contact?.displayName || target.contact?.number) {
+        message = { contactMessage: { displayName: target.contact.displayName || target.contact.number || '' } };
+    }
+    else {
+        message = { conversation: target.text || ' ' };
+    }
+    return {
+        key: {
+            remoteJid: jid,
+            fromMe: target.fromMe,
+            id: target.id,
+            participant: target.participant,
+        },
+        message,
+    };
+}
+function normalizeSignDelimiter(value) {
+    if (!value)
+        return '\n';
+    return value
+        .replace(/\\n/g, '\n')
+        .replace(/\\r/g, '\r')
+        .replace(/\\t/g, '\t');
+}
+export function getInstanceChatMessages(name, jid) {
+    return getInstanceChatMessagesInternal(name, jid).map((item) => toPublicCachedMessage(name, item));
+}
+export async function getInstanceChatMessagesWithMedia(name, jid) {
+    purgeExpiredMediaBinaries();
+    const list = getInstanceChatMessagesInternal(name, jid);
+    for (const message of list) {
+        await ensureCachedMessageMedia(name, message);
+    }
+    return list.map((item) => toPublicCachedMessage(name, item));
+}
+export function getInstanceChatMediaBinary(name, mediaId) {
+    purgeExpiredMediaBinaries();
+    const item = chatMediaBinaryStore.get(mediaId);
+    if (!item || item.instance !== name) {
+        return { ok: false, error: 'not_found' };
+    }
+    const absolutePath = path.join(mediaStoragePath, item.relativePath);
+    let bytes;
+    try {
+        if (!fs.existsSync(absolutePath)) {
+            chatMediaBinaryStore.delete(mediaId);
+            persistMediaIndex();
+            return { ok: false, error: 'not_found' };
+        }
+        bytes = fs.readFileSync(absolutePath);
+    }
+    catch {
+        return { ok: false, error: 'not_found' };
+    }
+    return {
+        ok: true,
+        mimeType: item.mimeType,
+        bytes,
+    };
+}
+export async function syncInstanceChatHistory(name, jid, options) {
+    const ctx = instances.get(name);
+    if (!ctx) {
+        return { ok: false, imported: 0, batches: 0, done: false, error: 'instance_not_found' };
+    }
+    if (ctx.status !== 'connected') {
+        return { ok: false, imported: 0, batches: 0, done: false, error: 'instance_not_connected' };
+    }
+    const settings = getInstanceGeneral(name);
+    if (settings.ignoreGroups && jid.endsWith('@g.us')) {
+        return { ok: false, imported: 0, batches: 0, done: false, error: 'groups_ignored_by_settings' };
+    }
+    const anySock = ctx.sock;
+    if (typeof anySock.fetchMessageHistory !== 'function') {
+        return { ok: false, imported: 0, batches: 0, done: false, error: 'history_fetch_not_supported' };
+    }
+    const maxBatches = Math.max(1, Math.min(Number(options?.maxBatches ?? 15), 50));
+    const fetchCount = Math.max(10, Math.min(Number(options?.fetchCount ?? CONTINUOUS_HISTORY_FETCH_COUNT), 500));
+    let imported = 0;
+    let batches = 0;
+    let done = false;
+    for (let i = 0; i < maxBatches; i++) {
+        const current = getInstanceChatMessages(name, jid);
+        const oldest = current.length > 0 ? current[0] : undefined;
+        // fetchMessageHistory requires a valid key object — use a sentinel when no messages exist
+        const oldestKey = {
+            remoteJid: jid,
+            id: oldest?.id ?? '3EB0',
+            fromMe: oldest?.fromMe ?? false,
+        };
+        const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
+        let response;
+        try {
+            response = await anySock.fetchMessageHistory(fetchCount, oldestKey, oldestTimestamp);
+        }
+        catch (err) {
+            // First batch with sentinel key may fail if WAM is not ready — treat as empty, not error
+            if (batches === 0 && imported === 0) {
+                return { ok: true, imported: 0, batches: 0, done: true };
+            }
+            return { ok: false, imported, batches, done: false, error: 'history_fetch_failed' };
+        }
+        const raw = extractMessagesFromHistoryResponse(response).filter((msg) => {
+            const key = (msg.key ?? {});
+            return String(key.remoteJid ?? '').trim() === jid;
+        });
+        if (raw.length === 0) {
+            done = true;
+            break;
+        }
+        const result = ingestMessagesToCache(name, raw, { fromHistory: true });
+        imported += result.inserted;
+        batches += 1;
+        if (result.inserted === 0) {
+            done = true;
+            break;
+        }
+    }
+    return { ok: true, imported, batches, done };
+}
+export function markInstanceChatAsRead(name, jid) {
+    const chats = chatCache.get(name);
+    if (!chats)
+        return;
+    const chat = chats.get(jid);
+    if (!chat)
+        return;
+    chat.unreadCount = 0;
+    chats.set(jid, chat);
+    try {
+        msResetUnread(name, jid);
+    }
+    catch { /* best-effort */ }
+}
+export async function applyReadSettingsToCachedMessages(name) {
+    const ctx = instances.get(name);
+    if (!ctx || typeof ctx.sock.readMessages !== 'function') {
+        return { ok: false, count: 0 };
+    }
+    const settings = getInstanceGeneral(name);
+    if (!settings.autoReadMessages && !settings.readStatus) {
+        return { ok: true, count: 0 };
+    }
+    const chats = chatCache.get(name);
+    if (!chats) {
+        return { ok: true, count: 0 };
+    }
+    const keys = new Map();
+    for (const [jid, chat] of chats.entries()) {
+        if (settings.ignoreGroups && jid.endsWith('@g.us'))
+            continue;
+        const readNormalChat = settings.autoReadMessages && jid !== 'status@broadcast';
+        const readStatusChat = settings.readStatus && jid === 'status@broadcast';
+        if (!readNormalChat && !readStatusChat)
+            continue;
+        for (const message of chat.messages) {
+            if (message.fromMe)
+                continue;
+            keys.set(`${jid}:${message.id}`, {
+                remoteJid: jid,
+                id: message.id,
+                fromMe: false,
+            });
+        }
+        chat.unreadCount = 0;
+        chats.set(jid, chat);
+    }
+    if (!keys.size) {
+        return { ok: true, count: 0 };
+    }
+    try {
+        await ctx.sock.readMessages([...keys.values()]);
+        return { ok: true, count: keys.size };
+    }
+    catch {
+        return { ok: false, count: keys.size };
+    }
+}
+/**
+ * Send a plain-text message via an active WhatsApp instance.
+ * Used by the Chatwoot webhook handler to reply from Chatwoot to WhatsApp.
+ */
+export async function sendInstanceTextMessage(name, jid, text, options) {
+    const ctx = instances.get(name);
+    if (!ctx || !ctx.sock)
+        return { ok: false, error: 'instance_not_found' };
+    if (typeof ctx.sock.sendMessage !== 'function')
+        return { ok: false, error: 'send_not_available' };
+    try {
+        const delimiter = normalizeSignDelimiter(options?.signDelimiter);
+        const finalText = options?.agentName
+            ? `${options.agentName}${delimiter}${text}`
+            : text;
+        const quoted = options?.replyToId ? buildQuotedMessage(name, jid, options.replyToId) : undefined;
+        const sent = await ctx.sock.sendMessage(jid, { text: finalText }, quoted ? { quoted } : undefined);
+        const msgId = sent?.key?.id;
+        if (msgId)
+            markChatwootOriginated(msgId);
+        return { ok: true, id: msgId ?? undefined };
+    }
+    catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+/**
+ * Send a URL-based media message via an active WhatsApp instance.
+ * Used when Chatwoot sends an attachment back to WhatsApp.
+ */
+export async function sendInstanceMediaMessage(name, jid, params) {
+    const ctx = instances.get(name);
+    if (!ctx || !ctx.sock)
+        return { ok: false, error: 'instance_not_found' };
+    if (typeof ctx.sock.sendMessage !== 'function')
+        return { ok: false, error: 'send_not_available' };
+    try {
+        const mime = params.mimeType ?? 'application/octet-stream';
+        const delimiter = normalizeSignDelimiter(params.signDelimiter);
+        const signedCaption = params.agentName
+            ? `${params.agentName}${delimiter}${params.caption ?? ''}`.trim()
+            : (params.caption ?? '');
+        let content;
+        if (mime.startsWith('image/')) {
+            content = { image: { url: params.mediaUrl }, caption: signedCaption };
+        }
+        else if (mime.startsWith('video/')) {
+            content = { video: { url: params.mediaUrl }, caption: signedCaption };
+        }
+        else if (mime.startsWith('audio/')) {
+            content = { audio: { url: params.mediaUrl }, mimetype: mime };
+        }
+        else {
+            content = {
+                document: { url: params.mediaUrl },
+                mimetype: mime,
+                fileName: params.fileName ?? 'file',
+                caption: signedCaption,
+            };
+        }
+        const quoted = params.replyToId ? buildQuotedMessage(name, jid, params.replyToId) : undefined;
+        const sent = await ctx.sock.sendMessage(jid, content, quoted ? { quoted } : undefined);
+        const msgId = sent?.key?.id;
+        if (msgId)
+            markChatwootOriginated(msgId);
+        return { ok: true, id: msgId ?? undefined };
+    }
+    catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+//# sourceMappingURL=whatsapp.js.map

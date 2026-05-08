@@ -1,1540 +1,1324 @@
 (function () {
+  'use strict';
   const API = '';
+  const API_KEY_STORAGE_KEY = 'rscara_api_key';
+
   const REQUIRED_EVENTS = [
-    'APPLICATION_STARTUP',
-    'CALL',
-    'CHATS_DELETE',
-    'CHATS_SET',
-    'CHATS_UPDATE',
-    'CHATS_UPSERT',
-    'CONNECTION_UPDATE',
-    'CONTACTS_SET',
-    'CONTACTS_UPDATE',
-    'CONTACTS_UPSERT',
-    'GROUP_PARTICIPANTS_UPDATE',
-    'GROUP_UPDATE',
-    'GROUPS_UPSERT',
-    'LABELS_ASSOCIATION',
-    'LABELS_EDIT',
-    'LOGOUT_INSTANCE',
-    'MESSAGES_DELETE',
-    'MESSAGES_SET',
-    'MESSAGES_UPDATE',
-    'MESSAGES_UPSERT',
-    'PRESENCE_UPDATE',
-    'QRCODE_UPDATED',
-    'REMOVE_INSTANCE',
-    'SEND_MESSAGE',
-    'TYPEBOT_CHANGE_STATUS',
-    'TYPEBOT_START',
+    'APPLICATION_STARTUP', 'CALL', 'CHATS_DELETE', 'CHATS_SET', 'CHATS_UPDATE', 'CHATS_UPSERT',
+    'CONNECTION_UPDATE', 'CONTACTS_SET', 'CONTACTS_UPDATE', 'CONTACTS_UPSERT',
+    'GROUP_PARTICIPANTS_UPDATE', 'GROUP_UPDATE', 'GROUPS_UPSERT',
+    'LABELS_ASSOCIATION', 'LABELS_EDIT', 'LOGOUT_INSTANCE',
+    'MESSAGES_DELETE', 'MESSAGES_SET', 'MESSAGES_UPDATE', 'MESSAGES_UPSERT',
+    'PRESENCE_UPDATE', 'QRCODE_UPDATED', 'REMOVE_INSTANCE', 'SEND_MESSAGE',
+    'TYPEBOT_CHANGE_STATUS', 'TYPEBOT_START',
   ];
-  const VALID_SECTIONS = new Set(['dashboard', 'chat', 'settings', 'events', 'integrations']);
 
+  // ============ Instance from URL ============
   const params = new URLSearchParams(window.location.search);
-  const instance = String(params.get('instance') || '').trim();
-
+  const instance = (params.get('instance') || '').trim();
   if (!instance) {
     alert('Instância não informada. Abra a partir da lista de conexões.');
     window.location.href = '/';
     return;
   }
 
-  const API_KEY_STORAGE_KEY = 'rscara_api_key';
-
+  // ============ API key ============
   function getStoredApiKey() {
-    // localStorage persists across tabs and page reloads
-    return localStorage.getItem(API_KEY_STORAGE_KEY) || sessionStorage.getItem(API_KEY_STORAGE_KEY) || '';
+    try {
+      const ls = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (ls) return ls;
+      const ss = sessionStorage.getItem(API_KEY_STORAGE_KEY);
+      if (ss) { localStorage.setItem(API_KEY_STORAGE_KEY, ss); return ss; }
+    } catch {}
+    return '';
+  }
+  function storeApiKey(k) {
+    try {
+      if (k) { localStorage.setItem(API_KEY_STORAGE_KEY, k); sessionStorage.setItem(API_KEY_STORAGE_KEY, k); }
+      else { localStorage.removeItem(API_KEY_STORAGE_KEY); sessionStorage.removeItem(API_KEY_STORAGE_KEY); }
+    } catch {}
+  }
+  const apiKeyInput = document.getElementById('apiKey');
+  const stored = getStoredApiKey();
+  if (stored && !apiKeyInput.value) apiKeyInput.value = stored;
+  apiKeyInput.addEventListener('input', () => storeApiKey(apiKeyInput.value.trim()));
+
+  function headers() {
+    const h = {
+      'Content-Type': 'application/json',
+      'cache-control': 'no-cache',
+      'pragma': 'no-cache',
+    };
+    const k = apiKeyInput.value.trim() || getStoredApiKey();
+    if (k) { h['x-api-key'] = k; storeApiKey(k); }
+    return h;
   }
 
-  function storeApiKey(key) {
-    if (key) {
-      localStorage.setItem(API_KEY_STORAGE_KEY, key);
-      sessionStorage.setItem(API_KEY_STORAGE_KEY, key);
-      return;
+  async function api(path, options = {}) {
+    const init = { headers: headers(), cache: 'no-store', ...options };
+    if (init.headers !== options.headers) {
+      init.headers = { ...init.headers, ...(options.headers || {}) };
     }
-    localStorage.removeItem(API_KEY_STORAGE_KEY);
-    sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    const r = await fetch(API + path, init);
+    let data = null;
+    try { data = await r.json(); } catch { data = {}; }
+    return { response: r, data };
   }
 
+  async function apiBinary(path) {
+    const r = await fetch(API + path, { headers: headers(), cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.blob();
+  }
+
+  // ============ Helpers ============
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  function show(el, visible) { if (el) el.classList.toggle('hidden', !visible); }
+  function setText(el, t) { if (el && el.textContent !== t) el.textContent = t; }
+  function setResult(el, msg, tone) {
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'result' + (tone ? ' ' + tone : '');
+    show(el, !!msg);
+  }
+  const hideTimers = new Map();
+  function setResultAuto(el, msg, tone) {
+    setResult(el, msg, tone);
+    if (hideTimers.has(el)) clearTimeout(hideTimers.get(el));
+    if (tone === 'success' && msg) {
+      hideTimers.set(el, setTimeout(() => show(el, false), 4200));
+    }
+  }
+
+  // ============ State ============
   const state = {
     activeSection: 'dashboard',
     inFlight: new Set(),
     selectedChatJid: '',
     chatItems: [],
+    chatItemsBySig: new Map(),
     chatFilter: 'all',
+    chatSearch: '',
     availableEvents: [],
-    hideTimers: new Map(),
     autoSyncedChats: new Set(),
     mediaObjectUrls: new Set(),
     mediaBlobCache: new Map(),
+    mediaResolveInFlight: new Map(),
+    syncPollHandle: null,
+    syncPollBusy: false,
+    uiPollHandle: null,
+    uiPollBusy: false,
+    renderedChatJid: '',
+    renderedMessagesMeta: [],
+    loadedChatJid: '',
+    loadedMessagesMeta: [],
+    lastChatListMeta: [],
+    activeChatNode: null,
   };
-
-  const el = {
-    apiKey: document.getElementById('apiKey'),
-    title: document.getElementById('instanceTitle'),
-    subtitle: document.getElementById('instanceSubtitle'),
-    sidebarInstanceName: document.getElementById('sidebarInstanceName'),
-    topbarLastSync: document.getElementById('topbarLastSync'),
-    statusChip: document.getElementById('headerStatusChip'),
-    btnForceRefresh: document.getElementById('btnForceRefresh'),
-    dashboardStatus: document.getElementById('dashboardStatus'),
-    dashQrBox: document.getElementById('dashboardQrBox'),
-    dashQrImage: document.getElementById('dashboardQrImage'),
-    dashPairingBox: document.getElementById('dashboardPairingBox'),
-    dashPairingCode: document.getElementById('dashboardPairingCode'),
-    chatList: document.getElementById('chatList'),
-    chatHeader: document.getElementById('chatHeader'),
-    chatHeaderTitle: document.getElementById('chatHeaderTitle'),
-    chatHeaderMeta: document.getElementById('chatHeaderMeta'),
-    chatHeaderActions: document.getElementById('chatHeaderActions'),
-    chatMessages: document.getElementById('chatMessages'),
-    chatSearchInput: document.getElementById('chatSearchInput'),
-    chatComposerInput: document.getElementById('chatComposerInput'),
-    btnSendChatMessage: document.getElementById('btnSendChatMessage'),
-    btnSyncChatHistory: document.getElementById('btnSyncChatHistory'),
-    btnSyncSelectedHistory: document.getElementById('btnSyncSelectedHistory'),
-    settingsResult: document.getElementById('settingsResult'),
-    eventsResult: document.getElementById('eventsResult'),
-    integrationsResult: document.getElementById('integrationsResult'),
-  };
-
-  const cachedKey = getStoredApiKey();
-  if (cachedKey) el.apiKey.value = cachedKey;
-
-  el.apiKey.addEventListener('input', () => {
-    storeApiKey(el.apiKey.value.trim());
-  });
-
-  function headers() {
-    const out = { 'Content-Type': 'application/json' };
-    const key = el.apiKey.value.trim() || getStoredApiKey();
-    if (key) out['x-api-key'] = key;
-    return out;
-  }
-
-  function show(node, visible) {
-    if (!node) return;
-    node.classList.toggle('hidden', !visible);
-  }
-
-  function setText(id, value) {
-    const node = document.getElementById(id);
-    if (node) node.textContent = value;
-  }
-
-  function setStatus(node, message, tone) {
-    if (!node) return;
-    node.textContent = message;
-    node.className = tone ? `status ${tone}` : 'status';
-    show(node, true);
-  }
-
-  function setResult(node, message, tone) {
-    if (!node) return;
-
-    const priorTimer = state.hideTimers.get(node.id || '');
-    if (priorTimer) {
-      clearTimeout(priorTimer);
-      state.hideTimers.delete(node.id || '');
-    }
-
-    node.textContent = message;
-    node.className = tone ? `result ${tone}` : 'result';
-    show(node, true);
-
-    if (tone === 'success' && node.id) {
-      const timer = setTimeout(() => {
-        show(node, false);
-        state.hideTimers.delete(node.id);
-      }, 4200);
-      state.hideTimers.set(node.id, timer);
-    }
-  }
-
-  function setLoading(node, message) {
-    if (!node) return;
-    node.textContent = message;
-    node.className = 'status';
-    show(node, true);
-  }
-
-  function clearNode(node) {
-    while (node && node.firstChild) node.removeChild(node.firstChild);
-  }
-
-  function setLastSync(text) {
-    if (!el.topbarLastSync) return;
-    el.topbarLastSync.textContent = text;
-  }
-
-  function markSynced() {
-    setLastSync(`Atualizado as ${new Date().toLocaleTimeString('pt-BR')}`);
-  }
-
-  function sectionFromHash() {
-    const raw = window.location.hash.replace('#', '').trim().toLowerCase();
-    return VALID_SECTIONS.has(raw) ? raw : 'dashboard';
-  }
-
-  async function api(path, init = {}) {
-    const response = await fetch(`${API}${path}`, {
-      ...init,
-      cache: 'no-store',
-      headers: {
-        ...headers(),
-        'cache-control': 'no-cache',
-        pragma: 'no-cache',
-        ...(init.headers || {}),
-      },
-    });
-
-    const raw = await response.text();
-    let data;
-    try {
-      data = raw ? JSON.parse(raw) : {};
-    } catch {
-      data = { ok: false, error: 'invalid_json_response' };
-    }
-    return { response, data };
-  }
-
-  async function apiBinary(path) {
-    const response = await fetch(`${API}${path}`, {
-      cache: 'no-store',
-      headers: {
-        ...headers(),
-        'cache-control': 'no-cache',
-        pragma: 'no-cache',
-      },
-    });
-    return response;
-  }
-
-  function revokeMediaObjectUrls() {
-    state.mediaObjectUrls.forEach((value) => {
-      try {
-        URL.revokeObjectURL(value);
-      } catch (_) {}
-    });
-    state.mediaObjectUrls.clear();
-    state.mediaBlobCache.clear();
-  }
-
-  function normalizeMediaPath(url) {
-    if (typeof url !== 'string' || !url.trim()) return '';
-    if (/^https?:\/\//i.test(url)) {
-      try {
-        const parsed = new URL(url);
-        return `${parsed.pathname}${parsed.search}`;
-      } catch {
-        return '';
-      }
-    }
-    return url;
-  }
-
-  async function resolveMediaSource(media) {
-    if (!media || typeof media !== 'object') return null;
-
-    const mediaPath = normalizeMediaPath(media.url);
-    if (mediaPath) {
-      const cached = state.mediaBlobCache.get(mediaPath);
-      if (cached) return cached;
-      try {
-        const response = await apiBinary(mediaPath);
-        if (!response.ok) return null;
-        const blob = await response.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        state.mediaObjectUrls.add(objectUrl);
-        state.mediaBlobCache.set(mediaPath, objectUrl);
-        return objectUrl;
-      } catch (_) {
-        return null;
-      }
-    }
-
-    return buildMediaDataUrl(media);
-  }
-
-  async function attachMediaSource(element, media) {
-    if (!element || !media) return;
-    try {
-      const source = await resolveMediaSource(media);
-      if (!source) return;
-      element.src = source;
-    } catch (_) {}
-  }
 
   function beginLoad(key) {
     if (state.inFlight.has(key)) return false;
     state.inFlight.add(key);
     return true;
   }
+  function endLoad(key) { state.inFlight.delete(key); }
 
-  function endLoad(key) {
-    state.inFlight.delete(key);
-  }
+  // ============ Element refs ============
+  const el = {
+    sidebarInstanceName: document.getElementById('sidebarInstanceName'),
+    instanceTitle: document.getElementById('instanceTitle'),
+    instanceSubtitle: document.getElementById('instanceSubtitle'),
+    topbarLastSync: document.getElementById('topbarLastSync'),
+    headerStatusChip: document.getElementById('headerStatusChip'),
+    btnForceRefresh: document.getElementById('btnForceRefresh'),
 
+    // Dashboard
+    dashInstance: document.getElementById('dashInstance'),
+    dashNumber: document.getElementById('dashNumber'),
+    dashProfileName: document.getElementById('dashProfileName'),
+    dashConnectionStatus: document.getElementById('dashConnectionStatus'),
+    dashboardStatus: document.getElementById('dashboardStatus'),
+    dashProfilePicture: document.getElementById('dashProfilePicture'),
+    dashProfileFallback: document.getElementById('dashProfileFallback'),
+    dashboardConnectMode: document.getElementById('dashboardConnectMode'),
+    dashboardPhoneRow: document.getElementById('dashboardPhoneRow'),
+    dashboardPairingPhone: document.getElementById('dashboardPairingPhone'),
+    dashboardPairingBox: document.getElementById('dashboardPairingBox'),
+    dashboardPairingCode: document.getElementById('dashboardPairingCode'),
+    dashboardQrBox: document.getElementById('dashboardQrBox'),
+    dashboardQrImage: document.getElementById('dashboardQrImage'),
+    btnDashboardConnect: document.getElementById('btnDashboardConnect'),
+    btnDashboardRestart: document.getElementById('btnDashboardRestart'),
+    btnDashboardDisconnect: document.getElementById('btnDashboardDisconnect'),
+    dashChatsCount: document.getElementById('dashChatsCount'),
+    dashMessagesCount: document.getElementById('dashMessagesCount'),
+    dashUnreadCount: document.getElementById('dashUnreadCount'),
+
+    // Chat
+    chatList: document.getElementById('chatList'),
+    chatSearchInput: document.getElementById('chatSearchInput'),
+    chatHeaderTitle: document.getElementById('chatHeaderTitle'),
+    chatHeaderMeta: document.getElementById('chatHeaderMeta'),
+    chatHeaderAvatar: document.getElementById('chatHeaderAvatar'),
+    chatHeaderActions: document.getElementById('chatHeaderActions'),
+    chatMessages: document.getElementById('chatMessages'),
+    chatComposerInput: document.getElementById('chatComposerInput'),
+    btnSendChatMessage: document.getElementById('btnSendChatMessage'),
+    btnRefreshChats: document.getElementById('btnRefreshChats'),
+    btnSyncChatHistory: document.getElementById('btnSyncChatHistory'),
+    btnSyncSelectedHistory: document.getElementById('btnSyncSelectedHistory'),
+
+    // Settings
+    settings: {
+      rejectCalls: document.getElementById('settingRejectCalls'),
+      ignoreGroups: document.getElementById('settingIgnoreGroups'),
+      alwaysOnline: document.getElementById('settingAlwaysOnline'),
+      autoReadMessages: document.getElementById('settingAutoReadMessages'),
+      syncFullHistory: document.getElementById('settingSyncFullHistory'),
+      readStatus: document.getElementById('settingReadStatus'),
+    },
+    proxy: {
+      enabled: document.getElementById('proxyEnabled'),
+      protocol: document.getElementById('proxyProtocol'),
+      host: document.getElementById('proxyHost'),
+      port: document.getElementById('proxyPort'),
+      username: document.getElementById('proxyUsername'),
+      password: document.getElementById('proxyPassword'),
+    },
+    btnSaveGeneral: document.getElementById('btnSaveGeneral'),
+    btnSaveProxy: document.getElementById('btnSaveProxy'),
+    settingsResult: document.getElementById('settingsResult'),
+
+    // Events
+    eventsWebhookUrl: document.getElementById('eventsWebhookUrl'),
+    eventsToggles: document.getElementById('eventsToggles'),
+    btnSaveEvents: document.getElementById('btnSaveEvents'),
+    btnTestEvent: document.getElementById('btnTestEvent'),
+    btnMarkAllEvents: document.getElementById('btnMarkAllEvents'),
+    btnUnmarkAllEvents: document.getElementById('btnUnmarkAllEvents'),
+    eventsResult: document.getElementById('eventsResult'),
+
+    // Integrations
+    intChatwoot: {
+      enabled: document.getElementById('intChatwootEnabled'),
+      baseUrl: document.getElementById('intChatwootBaseUrl'),
+      accountId: document.getElementById('intChatwootAccountId'),
+      inboxId: document.getElementById('intChatwootInboxId'),
+      token: document.getElementById('intChatwootToken'),
+      signMessages: document.getElementById('intChatwootSignMessages'),
+      signDelimiter: document.getElementById('intChatwootSignDelimiter'),
+      nameInbox: document.getElementById('intChatwootNameInbox'),
+      webhookSlug: document.getElementById('intChatwootWebhookSlug'),
+      organization: document.getElementById('intChatwootOrganization'),
+      logoUrl: document.getElementById('intChatwootLogoUrl'),
+      conversationPending: document.getElementById('intChatwootConversationPending'),
+      reopenConversation: document.getElementById('intChatwootReopenConversation'),
+      importContacts: document.getElementById('intChatwootImportContacts'),
+      importMessages: document.getElementById('intChatwootImportMessages'),
+      daysLimit: document.getElementById('intChatwootDaysLimit'),
+      ignoreJids: document.getElementById('intChatwootIgnoreJids'),
+      autoCreate: document.getElementById('intChatwootAutoCreate'),
+      webhookInfo: document.getElementById('intChatwootWebhookInfo'),
+      webhookUrl: document.getElementById('intChatwootWebhookUrl'),
+    },
+    intN8n: {
+      enabled: document.getElementById('intN8nEnabled'),
+      webhookUrl: document.getElementById('intN8nWebhookUrl'),
+      headerName: document.getElementById('intN8nHeaderName'),
+      headerValue: document.getElementById('intN8nHeaderValue'),
+    },
+    btnSaveIntChatwoot: document.getElementById('btnSaveIntChatwoot'),
+    btnTestIntChatwoot: document.getElementById('btnTestIntChatwoot'),
+    btnAutoCreateIntChatwoot: document.getElementById('btnAutoCreateIntChatwoot'),
+    btnSyncContactNamesIntChatwoot: document.getElementById('btnSyncContactNamesIntChatwoot'),
+    btnSyncHistoryIntChatwoot: document.getElementById('btnSyncHistoryIntChatwoot'),
+    btnSaveIntN8n: document.getElementById('btnSaveIntN8n'),
+    btnTestIntN8n: document.getElementById('btnTestIntN8n'),
+    intAutoCreateResult: document.getElementById('intAutoCreateResult'),
+    integrationsResult: document.getElementById('integrationsResult'),
+
+    // Sync progress
+    intSyncProgress: document.getElementById('intSyncProgress'),
+    intSyncBadge: document.getElementById('intSyncBadge'),
+    intSyncCurrent: document.getElementById('intSyncCurrent'),
+    intSyncFill: document.getElementById('intSyncFill'),
+    intSyncChats: document.getElementById('intSyncChats'),
+    intSyncSent: document.getElementById('intSyncSent'),
+    intSyncSkipped: document.getElementById('intSyncSkipped'),
+    intSyncErrors: document.getElementById('intSyncErrors'),
+    btnCancelSyncInt: document.getElementById('btnCancelSyncInt'),
+  };
+
+  // ============ Status chip ============
   function updateHeaderStatus(status) {
-    const normalized = String(status || 'disconnected').toLowerCase();
-    const statusClassMap = {
-      connected: 'connected',
-      open: 'connected',
-      disconnected: 'disconnected',
-      close: 'disconnected',
-      qr: 'qr',
-      pairing: 'pairing',
-      connecting: 'connecting',
+    const s = (status || '').toLowerCase();
+    const map = {
+      connected: 'state-connected', open: 'state-connected',
+      disconnected: 'state-disconnected', close: 'state-disconnected',
+      qr: 'state-qr', pairing: 'state-pairing', connecting: 'state-connecting',
     };
-    const cssToken = statusClassMap[normalized] || 'connecting';
-    el.statusChip.className = `instance-pill state-${cssToken}`;
-    el.statusChip.textContent = normalized;
+    const cls = map[s] || 'state-disconnected';
+    el.headerStatusChip.className = 'status-pill ' + cls;
+    el.headerStatusChip.textContent = s || 'unknown';
   }
 
-  async function loadDashboardStats() {
-    try {
-      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
-      if (!response.ok || !data.ok || !Array.isArray(data.chats)) {
-        setText('dashChatsCount', '0');
-        setText('dashMessagesCount', '0');
-        setText('dashUnreadCount', '0');
-        return;
-      }
+  function markSynced() {
+    const t = new Date().toLocaleTimeString('pt-BR');
+    setText(el.topbarLastSync, `Atualizado ${t}`);
+    show(el.topbarLastSync, true);
+  }
 
-      const chats = data.chats;
-      const totalChats = chats.length;
-      const totalMessages = chats.reduce((sum, chat) => sum + Number(chat.messageCount || 0), 0);
-      const unread = chats.reduce((sum, chat) => sum + Number(chat.unreadCount || 0), 0);
+  // ============ Section switching ============
+  const navBtns = document.querySelectorAll('.nav-btn[data-section]');
+  const sections = document.querySelectorAll('section.section');
 
-      setText('dashChatsCount', String(totalChats));
-      setText('dashMessagesCount', String(totalMessages));
-      setText('dashUnreadCount', String(unread));
-    } catch {
-      setText('dashChatsCount', '0');
-      setText('dashMessagesCount', '0');
-      setText('dashUnreadCount', '0');
+  function sectionFromHash() {
+    const h = (window.location.hash || '#dashboard').replace('#', '');
+    return ['dashboard', 'chat', 'settings', 'events', 'integrations'].includes(h) ? h : 'dashboard';
+  }
+
+  function switchSection(next) {
+    state.activeSection = next;
+    navBtns.forEach((b) => {
+      const active = b.dataset.section === next;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    sections.forEach((s) => s.classList.toggle('active', s.id === 'section-' + next));
+    if (window.location.hash !== '#' + next) {
+      window.history.replaceState(null, '', '#' + next);
     }
+    loadSection(next);
+  }
+  navBtns.forEach((b) => b.addEventListener('click', () => switchSection(b.dataset.section)));
+  window.addEventListener('hashchange', () => switchSection(sectionFromHash()));
+
+  function loadSection(name) {
+    if (name === 'dashboard') loadDashboard();
+    else if (name === 'chat') loadChats();
+    else if (name === 'settings') loadSettings();
+    else if (name === 'events') loadEvents();
+    else if (name === 'integrations') loadIntegrations();
   }
 
+  // ============ Header status (always polled) ============
+  async function loadHeaderStatus() {
+    if (!beginLoad('header')) return;
+    try {
+      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/details`);
+      if (response.ok) updateHeaderStatus(data.status);
+    } catch {} finally { endLoad('header'); }
+  }
+
+  // ============ Dashboard ============
   async function loadDashboard() {
     if (!beginLoad('dashboard')) return;
     try {
-      setLoading(el.dashboardStatus, 'Carregando status da instancia...');
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/details`);
-      if (!response.ok || !data.ok) {
-        updateHeaderStatus('disconnected');
-        setStatus(el.dashboardStatus, data.error || 'Falha ao carregar dashboard.', 'error');
-        return;
-      }
+      if (!response.ok) return;
+      updateHeaderStatus(data.status);
+      setText(el.dashInstance, data.instance || instance);
+      setText(el.dashNumber, data.linkedNumber || '—');
+      setText(el.dashProfileName, data.profileName || '—');
+      setText(el.dashConnectionStatus, data.status || '—');
 
-      const status = data.status || 'disconnected';
-      updateHeaderStatus(status);
-      setText('dashInstance', data.instance || instance);
-      setText('dashConnectionStatus', status);
-      setText('dashNumber', data.linkedNumber || '-');
-      setText('dashProfileName', data.profileName || '-');
-
-      const photo = document.getElementById('dashProfilePicture');
       if (data.profilePictureUrl) {
-        photo.src = data.profilePictureUrl;
-        show(photo, true);
+        el.dashProfilePicture.src = data.profilePictureUrl;
+        show(el.dashProfilePicture, true);
+        show(el.dashProfileFallback, false);
       } else {
-        photo.src = '';
-        show(photo, false);
+        show(el.dashProfilePicture, false);
+        show(el.dashProfileFallback, true);
+        setText(el.dashProfileFallback, (data.profileName || data.instance || '?')[0].toUpperCase());
       }
 
-      if (status !== 'qr') {
-        show(el.dashQrBox, false);
-      }
-      if (status === 'connected') {
-        show(el.dashPairingBox, false);
-      }
-
-      if (status === 'qr') {
-        const qr = await api(`/v1/instances/${encodeURIComponent(instance)}/qr`);
-        if (qr.response.ok && qr.data.qr) {
-          el.dashQrImage.src = qr.data.qr;
-          show(el.dashQrBox, true);
-        } else {
-          setStatus(el.dashboardStatus, 'Aguardando QR atualizado da instância.', '');
+      // QR / pairing
+      if (data.status === 'qr') {
+        const qrRes = await api(`/v1/instances/${encodeURIComponent(instance)}/qr`);
+        if (qrRes.response.ok && qrRes.data.qr) {
+          el.dashboardQrImage.src = qrRes.data.qr;
+          show(el.dashboardQrBox, true);
         }
+      } else {
+        show(el.dashboardQrBox, false);
       }
+      if (data.status === 'connected') show(el.dashboardPairingBox, false);
 
-      const tone = status === 'connected' ? 'success' : status === 'disconnected' ? 'error' : '';
-      setStatus(el.dashboardStatus, `Status: ${status}`, tone);
-      await loadDashboardStats();
+      // Stats
+      const statsRes = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
+      if (statsRes.response.ok) {
+        applyDashboardStats(Array.isArray(statsRes.data.chats) ? statsRes.data.chats : []);
+      }
       markSynced();
-    } catch (error) {
-      updateHeaderStatus('disconnected');
-      setStatus(el.dashboardStatus, error.message || 'Erro de rede no dashboard.', 'error');
-    } finally {
-      endLoad('dashboard');
-    }
+    } catch {} finally { endLoad('dashboard'); }
   }
 
+  function applyDashboardStats(chats) {
+    const totalMsg = chats.reduce((a, c) => a + (Number(c.messageCount) || 0), 0);
+    const totalUnread = chats.reduce((a, c) => a + (Number(c.unreadCount) || 0), 0);
+    setText(el.dashChatsCount, String(chats.length));
+    setText(el.dashMessagesCount, String(totalMsg));
+    setText(el.dashUnreadCount, String(totalUnread));
+  }
+
+  el.dashboardConnectMode.addEventListener('change', () => {
+    show(el.dashboardPhoneRow, el.dashboardConnectMode.value === 'pairing');
+  });
+
   async function connectFromDashboard() {
-    const connectButton = document.getElementById('btnDashboardConnect');
-    connectButton.disabled = true;
-    const mode = document.getElementById('dashboardConnectMode').value;
-    show(el.dashQrBox, false);
-    show(el.dashPairingBox, false);
-    el.dashPairingCode.textContent = '';
-
+    setResult(el.dashboardStatus, 'Conectando...', '');
     try {
-      if (mode === 'pairing') {
-        const phoneNumber = document.getElementById('dashboardPairingPhone').value.trim();
-        if (!phoneNumber) {
-          setStatus(el.dashboardStatus, 'Informe o número para pairing code.', 'error');
-          return;
-        }
-
+      if (el.dashboardConnectMode.value === 'pairing') {
+        const phone = (el.dashboardPairingPhone.value || '').replace(/\D/g, '');
+        if (!phone) { setResult(el.dashboardStatus, 'Informe o número.', 'error'); return; }
         const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/pairing-code`, {
-          method: 'POST',
-          body: JSON.stringify({ phoneNumber }),
+          method: 'POST', body: JSON.stringify({ phoneNumber: phone })
         });
-        if (!response.ok || !data.ok) {
-          setStatus(el.dashboardStatus, data.error || 'Erro ao gerar pairing.', 'error');
-          return;
-        }
-
-        if (data.pairingCode) {
-          el.dashPairingCode.textContent = data.pairingCode;
-          show(el.dashPairingBox, true);
-          setStatus(el.dashboardStatus, 'Pairing code gerado.', 'success');
-        } else {
-          setStatus(el.dashboardStatus, 'Pairing code não retornado.', 'error');
-        }
+        if (!response.ok) { setResult(el.dashboardStatus, data.error || 'Falha.', 'error'); return; }
+        el.dashboardPairingCode.textContent = data.pairingCode || '-';
+        show(el.dashboardPairingBox, true);
+        show(el.dashboardQrBox, false);
+        setResult(el.dashboardStatus, `Pairing code gerado para ${phone}.`, 'success');
       } else {
-        const { response, data } = await api('/v1/instances', {
-          method: 'POST',
-          body: JSON.stringify({ instance }),
-        });
-        if (!response.ok || !data.ok) {
-          setStatus(el.dashboardStatus, data.error || 'Erro ao gerar QR.', 'error');
-          return;
-        }
-
+        const { response, data } = await api('/v1/instances', { method: 'POST', body: JSON.stringify({ instance }) });
         if (data.qr) {
-          el.dashQrImage.src = data.qr;
-          show(el.dashQrBox, true);
-          setStatus(el.dashboardStatus, 'QR atualizado.', 'success');
+          el.dashboardQrImage.src = data.qr;
+          show(el.dashboardQrBox, true);
+          setResult(el.dashboardStatus, 'Escaneie o QR.', '');
+        } else if (data.status === 'connected') {
+          setResult(el.dashboardStatus, 'Conectado.', 'success');
         } else {
-          setStatus(el.dashboardStatus, `Status: ${data.status || 'connecting'}`);
+          setResult(el.dashboardStatus, 'Aguardando QR...', '');
         }
       }
-
-      await loadDashboard();
-    } catch (error) {
-      setStatus(el.dashboardStatus, error.message || 'Erro de rede ao conectar.', 'error');
-    } finally {
-      connectButton.disabled = false;
-    }
+      loadDashboard();
+    } catch (err) { setResult(el.dashboardStatus, err.message || 'Erro.', 'error'); }
   }
 
   async function dashboardAction(action) {
-    const button = action === 'restart'
-      ? document.getElementById('btnDashboardRestart')
-      : document.getElementById('btnDashboardDisconnect');
-    button.disabled = true;
+    setResult(el.dashboardStatus, action + '...', '');
     try {
-      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/${action}`, {
-        method: 'POST',
-      });
-      if (!response.ok || !data.ok) {
-        setStatus(el.dashboardStatus, data.error || `Falha em ${action}.`, 'error');
-        return;
-      }
-      setStatus(el.dashboardStatus, `Ação ${action} executada.`, 'success');
-      await loadDashboard();
-    } catch (error) {
-      setStatus(el.dashboardStatus, error.message || `Erro de rede em ${action}.`, 'error');
-    } finally {
-      button.disabled = false;
-    }
+      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/${action}`, { method: 'POST' });
+      if (!response.ok) { setResult(el.dashboardStatus, data.error || 'Falha.', 'error'); return; }
+      setResult(el.dashboardStatus, action + ' executado.', 'success');
+      setTimeout(loadDashboard, 800);
+    } catch (err) { setResult(el.dashboardStatus, err.message || 'Erro.', 'error'); }
   }
 
-  function formatMessageTimestamp(rawValue) {
-    const raw = Number(rawValue || 0);
-    const timestamp = raw > 1000000000000 ? raw : raw * 1000;
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return '-';
-    return new Date(timestamp).toLocaleString('pt-BR', {
-      day: '2-digit',
-      month: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
+  el.btnDashboardConnect.addEventListener('click', connectFromDashboard);
+  el.btnDashboardRestart.addEventListener('click', () => dashboardAction('restart'));
+  el.btnDashboardDisconnect.addEventListener('click', () => dashboardAction('disconnect'));
+
+  // ============ Chat (diff-render) ============
+  function chatItemSig(c) {
+    return JSON.stringify({
+      j: c.jid, t: c.title, l: c.lastMessage, ts: c.lastTimestamp,
+      m: c.messageCount, u: c.unreadCount,
     });
   }
 
-  function inferMimeType(media) {
-    if (!media || typeof media !== 'object') return 'application/octet-stream';
-    if (typeof media.mimeType === 'string' && /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(media.mimeType)) {
-      return media.mimeType;
+  function formatTimestamp(ts) {
+    if (!ts) return '';
+    const d = new Date(Number(ts));
+    if (isNaN(d.getTime())) return '';
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     }
-    switch (media.kind) {
-      case 'audio':
-        return 'audio/ogg';
-      case 'image':
-        return 'image/jpeg';
-      case 'sticker':
-        return 'image/webp';
-      case 'video':
-        return 'video/mp4';
-      case 'document':
-        return 'application/octet-stream';
-      default:
-        return 'application/octet-stream';
-    }
+    return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' +
+      d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
   }
 
-  function buildMediaDataUrl(media) {
-    if (!media || typeof media !== 'object') return null;
-    if (typeof media.base64 !== 'string' || media.base64.length === 0) return null;
-    const mimeType = inferMimeType(media);
-    return `data:${mimeType};base64,${media.base64}`;
-  }
-
-  function renderMessageMedia(media) {
-    if (!media || typeof media !== 'object') return null;
-
-    if (media.kind === 'audio') {
-      const audio = document.createElement('audio');
-      audio.className = 'chat-media-audio';
-      audio.controls = true;
-      audio.preload = 'none';
-      void attachMediaSource(audio, media);
-      return audio;
-    }
-
-    if (media.kind === 'video') {
-      const video = document.createElement('video');
-      video.className = 'chat-media-video';
-      video.controls = true;
-      video.preload = 'metadata';
-      void attachMediaSource(video, media);
-      return video;
-    }
-
-    if (media.kind === 'image' || media.kind === 'sticker') {
-      const image = document.createElement('img');
-      image.className = media.kind === 'sticker' ? 'chat-media-sticker' : 'chat-media-image';
-      image.loading = 'lazy';
-      image.alt = media.kind === 'sticker' ? 'Figurinha recebida' : 'Imagem recebida';
-      void attachMediaSource(image, media);
-      return image;
-    }
-
-    if (media.kind === 'document') {
-      const link = document.createElement('a');
-      link.className = 'chat-media-document';
-      link.href = '#';
-      link.download = String(media.fileName || 'arquivo');
-      link.textContent = `Baixar ${String(media.fileName || 'documento')}`;
-      link.addEventListener('click', async (event) => {
-        event.preventDefault();
-        const source = await resolveMediaSource(media);
-        if (!source) return;
-        const tmp = document.createElement('a');
-        tmp.href = source;
-        tmp.download = String(media.fileName || 'arquivo');
-        tmp.rel = 'noopener noreferrer';
-        tmp.click();
-      });
-      return link;
-    }
-
-    return null;
-  }
-
-  function formatSenderLabel(message) {
-    if (message.fromMe) return 'Você';
-    const name = String(message.senderName || '').trim();
-    const number = String(message.senderNumber || '').trim();
-    if (name && number) return `${name} (${number})`;
-    if (name) return name;
-    if (number) return number;
-    return 'Contato';
-  }
-
-  function getSelectedChat() {
-    return state.chatItems.find((chat) => chat.jid === state.selectedChatJid) || null;
-  }
-
-  function setChatHeaderDefaults() {
-    if (el.chatHeaderTitle) el.chatHeaderTitle.textContent = 'Selecione um chat';
-    if (el.chatHeaderMeta) el.chatHeaderMeta.textContent = 'Nenhuma conversa ativa.';
-    if (el.chatHeaderActions) el.chatHeaderActions.classList.add('hidden');
-  }
-
-  function updateSendButtonState() {
-    const hasText = String(el.chatComposerInput?.value || '').trim().length > 0;
-    const chatReady = Boolean(state.selectedChatJid);
-    el.btnSendChatMessage.disabled = !chatReady || !hasText;
-    if (el.btnSyncChatHistory && !state.inFlight.has('chat-history-sync')) {
-      el.btnSyncChatHistory.disabled = !chatReady;
-    }
-  }
-
-  function setChatFilter(nextFilter) {
-    state.chatFilter = nextFilter;
-    document.querySelectorAll('[data-chat-filter]').forEach((btn) => {
-      btn.classList.toggle('active', btn.getAttribute('data-chat-filter') === nextFilter);
-    });
-    renderChatList();
-  }
-
-  async function loadHeaderStatus() {
-    if (!beginLoad('header-status')) return;
-    try {
-      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/details`);
-      if (!response.ok || !data.ok) {
-        updateHeaderStatus('disconnected');
-        return;
-      }
-      updateHeaderStatus(data.status || 'disconnected');
-    } catch {
-      updateHeaderStatus('disconnected');
-    } finally {
-      endLoad('header-status');
-    }
-  }
-
-  function autoResizeComposer() {
-    if (!el.chatComposerInput) return;
-    el.chatComposerInput.style.height = 'auto';
-    const nextHeight = Math.min(Math.max(el.chatComposerInput.scrollHeight, 44), 170);
-    el.chatComposerInput.style.height = `${nextHeight}px`;
-  }
-
-  function renderChatListPlaceholder(text) {
-    clearNode(el.chatList);
-    const p = document.createElement('p');
-    p.className = 'subtitle';
-    p.textContent = text;
-    el.chatList.appendChild(p);
-  }
-
-  function renderChatList() {
-    const query = String(el.chatSearchInput?.value || '').trim().toLowerCase();
-    const filteredByType = state.chatItems.filter((chat) => {
-      if (state.chatFilter === 'unread') {
-        return Number(chat.unreadCount || 0) > 0;
-      }
-      if (state.chatFilter === 'groups') {
-        return String(chat.jid || '').endsWith('@g.us');
+  function applyChatFilter(chats) {
+    const q = state.chatSearch.toLowerCase();
+    return chats.filter((c) => {
+      if (state.chatFilter === 'unread' && !(Number(c.unreadCount) > 0)) return false;
+      if (state.chatFilter === 'groups' && !c.jid?.endsWith('@g.us')) return false;
+      if (q) {
+        const txt = ((c.title || '') + ' ' + (c.jid || '') + ' ' + (c.lastMessage || '')).toLowerCase();
+        if (!txt.includes(q)) return false;
       }
       return true;
     });
+  }
 
-    const filtered = !query
-      ? filteredByType
-      : filteredByType.filter((chat) => {
-        const label = [chat.title, chat.jid, chat.lastMessage].join(' ').toLowerCase();
-        return label.includes(query);
-      });
+  function renderChatList() {
+    const filtered = applyChatFilter(state.chatItems);
+    const container = el.chatList;
 
-    if (!filtered.length) {
-      renderChatListPlaceholder(query ? 'Nenhum chat encontrado para a busca.' : 'Sem conversas em cache.');
+    if (filtered.length === 0) {
+      const msg = state.chatSearch ? 'Nenhum chat para a busca.'
+        : state.chatItems.length === 0 ? 'Sem conversas em cache. Envie/receba mensagens para popular.'
+        : 'Nenhum chat para o filtro.';
+      container.innerHTML = `<div class="chat-empty-list">${escapeHtml(msg)}</div>`;
+      state.chatItemsBySig.clear();
+      state.activeChatNode = null;
       return;
     }
 
-    clearNode(el.chatList);
-    filtered.forEach((chat) => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = `chat-item ${state.selectedChatJid === chat.jid ? 'active' : ''}`;
+    // Diff render: keep DOM elements when sig unchanged
+    const newSigs = new Map();
+    const fragment = document.createDocumentFragment();
 
-      const avatar = document.createElement('span');
-      avatar.className = 'chat-avatar';
-      avatar.textContent = String(chat.title || chat.jid || '?').trim().charAt(0).toUpperCase() || '?';
-
-      const body = document.createElement('span');
-      body.className = 'chat-item-body';
-
-      const top = document.createElement('span');
-      top.className = 'chat-item-top';
-
-      const title = document.createElement('strong');
-      title.textContent = chat.title || chat.jid;
-
-      const time = document.createElement('small');
-      time.textContent = formatMessageTimestamp(chat.lastTimestamp);
-
-      top.appendChild(title);
-      top.appendChild(time);
-
-      const bottom = document.createElement('span');
-      bottom.className = 'chat-item-bottom';
-
-      const subtitle = document.createElement('span');
-      subtitle.className = 'chat-preview';
-      subtitle.textContent = chat.lastMessage || '-';
-      bottom.appendChild(subtitle);
-
-      const jid = document.createElement('span');
-      jid.className = 'chat-jid';
-      jid.textContent = chat.jid || '-';
-      bottom.appendChild(jid);
-
-      const total = Number(chat.messageCount || 0);
-      if (total > 0) {
-        const count = document.createElement('em');
-        count.className = 'chat-message-count';
-        count.textContent = `${total}`;
-        bottom.appendChild(count);
+    filtered.forEach((c) => {
+      const sig = chatItemSig(c) + (c.jid === state.selectedChatJid ? ':sel' : '');
+      let node = state.chatItemsBySig.get(sig);
+      if (!node) {
+        node = createChatItemNode(c);
+        if (c.jid === state.selectedChatJid) node.classList.add('active');
       }
-
-      if (Number(chat.unreadCount || 0) > 0) {
-        const badge = document.createElement('em');
-        badge.className = 'chat-unread-badge';
-        badge.textContent = String(chat.unreadCount);
-        bottom.appendChild(badge);
-      }
-
-      body.appendChild(top);
-      body.appendChild(bottom);
-      btn.appendChild(avatar);
-      btn.appendChild(body);
-
-      btn.addEventListener('click', async () => {
-        state.selectedChatJid = chat.jid;
-        renderChatList();
-        await loadChatMessages();
-      });
-
-      el.chatList.appendChild(btn);
+      newSigs.set(sig, node);
+      fragment.appendChild(node);
     });
+
+    // Replace children using fragment (browser keeps existing nodes that are reused)
+    container.replaceChildren(fragment);
+    state.chatItemsBySig = newSigs;
+    state.activeChatNode = container.querySelector('.chat-item.active');
   }
 
-  async function loadChats() {
-    if (!beginLoad('chat-list')) return;
-    try {
-      renderChatListPlaceholder('Carregando conversas...');
-      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
-      if (!response.ok || !data.ok) {
-        const msg = data.error === 'instance_not_found'
-          ? 'Instância offline. Conecte para carregar conversas.'
-          : data.error || 'Não foi possível carregar chats.';
-        state.chatItems = [];
-        renderChatListPlaceholder(msg);
-        state.selectedChatJid = '';
-        setChatHeaderDefaults();
-        revokeMediaObjectUrls();
-        clearNode(el.chatMessages);
-        const p = document.createElement('p');
-        p.className = 'subtitle';
-        p.textContent = 'Nenhuma conversa selecionada.';
-        el.chatMessages.appendChild(p);
-        el.chatComposerInput.value = '';
-        autoResizeComposer();
-        el.chatComposerInput.disabled = true;
-        updateSendButtonState();
-        return;
+  function createChatItemNode(c) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chat-item';
+    btn.dataset.jid = c.jid;
+    const initial = (c.title || c.jid || '?')[0].toUpperCase();
+    const unread = Number(c.unreadCount) || 0;
+    const msgCount = Number(c.messageCount) || 0;
+    btn.innerHTML = `
+      <div class="chat-item-avatar">${escapeHtml(initial)}</div>
+      <div class="chat-item-body">
+        <div class="chat-item-top">
+          <span class="chat-item-name">${escapeHtml(c.title || c.jid || '')}</span>
+          <span class="chat-item-time">${escapeHtml(formatTimestamp(c.lastTimestamp))}</span>
+        </div>
+        <div class="chat-item-bottom">
+          <span class="chat-item-preview">${escapeHtml(c.lastMessage || '—')}</span>
+          <span class="chat-item-badges">
+            ${msgCount > 0 ? `<span class="chat-item-badge">${msgCount}</span>` : ''}
+            ${unread > 0 ? `<span class="chat-item-badge unread">${unread}</span>` : ''}
+          </span>
+        </div>
+      </div>`;
+    btn.addEventListener('click', () => {
+      const previousJid = state.selectedChatJid;
+      state.selectedChatJid = c.jid;
+      if (previousJid !== c.jid) revokeMediaUrls();
+      if (state.activeChatNode && state.activeChatNode !== btn) {
+        state.activeChatNode.classList.remove('active');
       }
+      btn.classList.add('active');
+      state.activeChatNode = btn;
+      // reset unread locally
+      const target = state.chatItems.find((x) => x.jid === c.jid);
+      if (target) target.unreadCount = 0;
+      loadChatMessages();
+    });
+    return btn;
+  }
 
-      const chats = Array.isArray(data.chats) ? data.chats : [];
-      state.chatItems = chats;
-      if (!chats.length) {
-        state.selectedChatJid = '';
-        renderChatListPlaceholder('Sem conversas em cache. Envie/receba mensagens para popular.');
-        setChatHeaderDefaults();
-        revokeMediaObjectUrls();
-        clearNode(el.chatMessages);
-        const p = document.createElement('p');
-        p.className = 'subtitle';
-        p.textContent = 'Sem mensagens em cache para exibir.';
-        el.chatMessages.appendChild(p);
-        el.chatComposerInput.value = '';
-        autoResizeComposer();
-        el.chatComposerInput.disabled = true;
-        updateSendButtonState();
-        return;
-      }
-
-      if (!state.selectedChatJid || !chats.some((chat) => chat.jid === state.selectedChatJid)) {
-        state.selectedChatJid = chats[0].jid;
-      }
-
-      el.chatComposerInput.disabled = false;
-      updateSendButtonState();
+  document.querySelectorAll('.pill-tab[data-chat-filter]').forEach((b) => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('.pill-tab[data-chat-filter]').forEach((x) => x.classList.toggle('active', x === b));
+      state.chatFilter = b.dataset.chatFilter;
       renderChatList();
+    });
+  });
+  el.chatSearchInput.addEventListener('input', () => {
+    state.chatSearch = el.chatSearchInput.value.trim();
+    renderChatList();
+  });
 
-      markSynced();
-    } catch (error) {
-      state.chatItems = [];
-      renderChatListPlaceholder(error.message || 'Erro de rede no chat.');
-      state.selectedChatJid = '';
-      setChatHeaderDefaults();
-      revokeMediaObjectUrls();
-      clearNode(el.chatMessages);
-      const p = document.createElement('p');
-      p.className = 'subtitle';
-      p.textContent = 'Erro ao carregar chats.';
-      el.chatMessages.appendChild(p);
-      el.chatComposerInput.value = '';
-      autoResizeComposer();
-      el.chatComposerInput.disabled = true;
-      updateSendButtonState();
-    } finally {
-      endLoad('chat-list');
+  function chatListMeta(chats) {
+    return chats.map((c) => [
+      c.jid || '',
+      c.title || '',
+      c.lastMessage || '',
+      Number(c.lastTimestamp) || 0,
+      Number(c.messageCount) || 0,
+      Number(c.unreadCount) || 0,
+    ]);
+  }
+  function sameTupleList(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      const left = a[i];
+      const right = b[i];
+      if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+      for (let j = 0; j < left.length; j += 1) {
+        if (left[j] !== right[j]) return false;
+      }
     }
+    return true;
+  }
+  async function loadChats() {
+    if (!beginLoad('chats')) return;
+    try {
+      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
+      if (!response.ok) {
+        if (state.chatItems.length === 0) {
+          el.chatList.innerHTML = `<div class="chat-empty-list">${escapeHtml(data.error || 'Erro ao carregar.')}</div>`;
+        }
+        return;
+      }
+      const chats = Array.isArray(data.chats) ? data.chats : [];
+      const meta = chatListMeta(chats);
+      if (sameTupleList(meta, state.lastChatListMeta)) return;
+      state.lastChatListMeta = meta;
+      state.chatItems = chats;
+      renderChatList();
+      markSynced();
+    } catch (err) {
+      if (state.chatItems.length === 0) {
+        el.chatList.innerHTML = `<div class="chat-empty-list">${escapeHtml(err.message || 'Erro de rede.')}</div>`;
+      }
+    } finally { endLoad('chats'); }
+  }
+
+  // ============ Chat messages (sem flicker) ============
+  function getSelectedChat() {
+    return state.chatItems.find((c) => c.jid === state.selectedChatJid);
+  }
+
+  function setChatHeader() {
+    const c = getSelectedChat();
+    if (!c) {
+      setText(el.chatHeaderTitle, 'Selecione um chat');
+      setText(el.chatHeaderMeta, 'Nenhuma conversa ativa');
+      setText(el.chatHeaderAvatar, '?');
+      show(el.chatHeaderActions, false);
+      el.chatComposerInput.disabled = true;
+      el.btnSendChatMessage.disabled = true;
+      return;
+    }
+    setText(el.chatHeaderTitle, c.title || c.jid);
+    setText(el.chatHeaderMeta, `${c.jid} • ${c.messageCount || 0} msg`);
+    setText(el.chatHeaderAvatar, ((c.title || c.jid || '?')[0] || '?').toUpperCase());
+    show(el.chatHeaderActions, true);
+    el.chatComposerInput.disabled = false;
+    updateSendButtonState();
+  }
+
+  function inferMime(kind) {
+    return ({ audio: 'audio/ogg', image: 'image/jpeg', sticker: 'image/webp', video: 'video/mp4', document: 'application/octet-stream' })[kind] || 'application/octet-stream';
+  }
+
+  function buildMediaDataUrl(media) {
+    if (!media?.base64) return '';
+    const mime = media.mimeType || inferMime(media.kind);
+    return `data:${mime};base64,${media.base64}`;
+  }
+
+  async function resolveMediaSource(media) {
+    if (!media) return '';
+    if (media.url) {
+      const cached = state.mediaBlobCache.get(media.url);
+      if (cached) return cached;
+      const pending = state.mediaResolveInFlight.get(media.url);
+      if (pending) return pending;
+      const request = (async () => {
+        try {
+          const blob = await apiBinary(media.url);
+          const url = URL.createObjectURL(blob);
+          state.mediaObjectUrls.add(url);
+          state.mediaBlobCache.set(media.url, url);
+          return url;
+        } catch {
+          return '';
+        } finally {
+          state.mediaResolveInFlight.delete(media.url);
+        }
+      })();
+      state.mediaResolveInFlight.set(media.url, request);
+      try {
+        return await request;
+      } catch { return ''; }
+    }
+    return buildMediaDataUrl(media);
+  }
+
+  function revokeMediaUrls() {
+    state.mediaObjectUrls.forEach((u) => { try { URL.revokeObjectURL(u); } catch {} });
+    state.mediaObjectUrls.clear();
+    state.mediaBlobCache.clear();
+    state.mediaResolveInFlight.clear();
+  }
+
+  function messageMeta(msg) {
+    return {
+      id: msg.id || '',
+      ts: Number(msg.timestamp) || 0,
+      fromMe: !!msg.fromMe,
+      text: msg.text || '',
+      kind: msg.media?.kind || '',
+      omittedReason: msg.media?.omittedReason || '',
+    };
+  }
+
+  function canAppendMessages(msgs) {
+    if (state.renderedChatJid !== state.selectedChatJid) return false;
+    if (!Array.isArray(state.renderedMessagesMeta) || state.renderedMessagesMeta.length === 0) return false;
+    if (msgs.length <= state.renderedMessagesMeta.length) return false;
+    for (let i = 0; i < state.renderedMessagesMeta.length; i += 1) {
+      const prev = state.renderedMessagesMeta[i];
+      const next = messageMeta(msgs[i]);
+      if (prev.id !== next.id || prev.ts !== next.ts || prev.fromMe !== next.fromMe || prev.text !== next.text || prev.kind !== next.kind || prev.omittedReason !== next.omittedReason) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function messagesMeta(msgs) {
+    return msgs.map((m) => [
+      m.id || '',
+      Number(m.timestamp) || 0,
+      m.text || '',
+      m.fromMe ? 1 : 0,
+      m.media?.kind || '',
+      m.media?.omittedReason || '',
+    ]);
+  }
+
+  function formatBubbleAuthor(m) {
+    if (m.fromMe) return 'Você';
+    if (m.senderName && m.senderNumber) return `${m.senderName} (${m.senderNumber})`;
+    return m.senderName || m.senderNumber || 'Contato';
+  }
+
+  function formatMessageTime(ts) {
+    if (!ts) return '';
+    const d = new Date(Number(ts));
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  async function renderChatMessages(msgs) {
+    if (!msgs || msgs.length === 0) {
+      if (state.renderedChatJid !== state.selectedChatJid) revokeMediaUrls();
+      state.renderedChatJid = state.selectedChatJid;
+      state.renderedMessagesMeta = [];
+      state.loadedChatJid = state.selectedChatJid;
+      state.loadedMessagesMeta = [];
+      el.chatMessages.innerHTML = '';
+      el.chatMessages.innerHTML = `<div class="chat-empty-thread">Sem mensagens. Use Histórico para sincronizar.</div>`;
+      return;
+    }
+
+    const shouldAppend = canAppendMessages(msgs);
+    const wasNearBottom = (el.chatMessages.scrollHeight - el.chatMessages.scrollTop - el.chatMessages.clientHeight) < 72;
+
+    if (!shouldAppend) {
+      if (state.renderedChatJid !== state.selectedChatJid) revokeMediaUrls();
+      el.chatMessages.innerHTML = '';
+    }
+
+    let lastDay = '';
+    if (shouldAppend && state.renderedMessagesMeta.length > 0) {
+      const prev = state.renderedMessagesMeta[state.renderedMessagesMeta.length - 1];
+      lastDay = new Date(prev.ts).toLocaleDateString('pt-BR');
+    }
+    const fragment = document.createDocumentFragment();
+    const mediaTasks = [];
+
+    msgs.slice(shouldAppend ? state.renderedMessagesMeta.length : 0).forEach((m) => {
+      const d = new Date(Number(m.timestamp));
+      const day = d.toLocaleDateString('pt-BR');
+      if (day !== lastDay && !isNaN(d.getTime())) {
+        const div = document.createElement('div');
+        div.className = 'chat-day-divider';
+        div.textContent = day;
+        fragment.appendChild(div);
+        lastDay = day;
+      }
+
+      const bubble = document.createElement('article');
+      bubble.className = 'chat-bubble' + (m.fromMe ? ' me' : '');
+
+      const author = document.createElement('strong');
+      author.className = 'chat-bubble-author';
+      author.textContent = formatBubbleAuthor(m);
+      bubble.appendChild(author);
+
+      // Media
+      const media = m.media;
+      let textToShow = m.text || '';
+      if (media && /^\[[a-z]+\]$/i.test((textToShow || '').trim())) textToShow = media.caption || '';
+
+      if (media && media.kind && media.kind !== 'text') {
+        const mediaEl = document.createElement('div');
+        mediaEl.className = 'chat-media-wrap';
+        if (media.kind === 'image' || media.kind === 'sticker') {
+          const img = document.createElement('img');
+          img.className = media.kind === 'sticker' ? 'chat-media-sticker' : 'chat-media-image';
+          img.alt = 'Mídia recebida';
+          img.loading = 'lazy';
+          mediaTasks.push(resolveMediaSource(media).then((src) => { if (src) img.src = src; }));
+          mediaEl.appendChild(img);
+        } else if (media.kind === 'audio') {
+          const audio = document.createElement('audio');
+          audio.className = 'chat-media-audio';
+          audio.controls = true;
+          audio.preload = 'none';
+          mediaTasks.push(resolveMediaSource(media).then((src) => { if (src) audio.src = src; }));
+          mediaEl.appendChild(audio);
+        } else if (media.kind === 'video') {
+          const video = document.createElement('video');
+          video.className = 'chat-media-video';
+          video.controls = true;
+          video.preload = 'metadata';
+          mediaTasks.push(resolveMediaSource(media).then((src) => { if (src) video.src = src; }));
+          mediaEl.appendChild(video);
+        } else if (media.kind === 'document') {
+          const a = document.createElement('a');
+          a.className = 'chat-media-document';
+          a.textContent = 'Baixar ' + (media.fileName || 'documento');
+          mediaTasks.push(resolveMediaSource(media).then((src) => { if (src) a.href = src; }));
+          if (media.fileName) a.download = media.fileName;
+          mediaEl.appendChild(a);
+        }
+        bubble.appendChild(mediaEl);
+
+        if (media.omittedReason) {
+          const w = document.createElement('p');
+          w.className = 'chat-media-warning';
+          w.textContent = media.omittedReason === 'too_large'
+            ? 'Mídia não carregada: arquivo acima do limite.' : 'Mídia não carregada: falha no download.';
+          bubble.appendChild(w);
+        }
+      }
+
+      if (textToShow) {
+        const p = document.createElement('div');
+        p.className = 'chat-bubble-text';
+        p.textContent = textToShow;
+        bubble.appendChild(p);
+      }
+
+      const t = document.createElement('span');
+      t.className = 'chat-bubble-time';
+      t.textContent = formatMessageTime(m.timestamp);
+      bubble.appendChild(t);
+
+      fragment.appendChild(bubble);
+    });
+
+    el.chatMessages.appendChild(fragment);
+    if (wasNearBottom || !shouldAppend) el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
+    state.renderedChatJid = state.selectedChatJid;
+    state.renderedMessagesMeta = msgs.map(messageMeta);
+    // Resolve media in parallel
+    Promise.all(mediaTasks).catch(() => {});
   }
 
   async function loadChatMessages() {
-    if (!state.selectedChatJid) {
-      setChatHeaderDefaults();
-      revokeMediaObjectUrls();
-      clearNode(el.chatMessages);
-      const p = document.createElement('p');
-      p.className = 'subtitle';
-      p.textContent = 'Nenhuma conversa selecionada.';
-      el.chatMessages.appendChild(p);
-      el.chatComposerInput.disabled = true;
-      updateSendButtonState();
-      return;
-    }
-
-    if (!beginLoad('chat-messages')) return;
+    if (!state.selectedChatJid) { setChatHeader(); return; }
+    if (!beginLoad('messages')) return;
+    setChatHeader();
     try {
-      revokeMediaObjectUrls();
-      clearNode(el.chatMessages);
-      const loading = document.createElement('p');
-      loading.className = 'subtitle';
-      loading.textContent = 'Carregando mensagens...';
-      el.chatMessages.appendChild(loading);
-      const { response, data } = await api(
-        `/v1/instances/${encodeURIComponent(instance)}/chats/${encodeURIComponent(state.selectedChatJid)}/messages`
-      );
-      if (!response.ok || !data.ok) {
-        clearNode(el.chatMessages);
-        const p = document.createElement('p');
-        p.className = 'subtitle';
-        p.textContent = data.error || 'Falha ao carregar mensagens.';
-        el.chatMessages.appendChild(p);
-        return;
+      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/chats/${encodeURIComponent(state.selectedChatJid)}/messages`);
+      if (!response.ok) return;
+      const msgs = Array.isArray(data.messages) ? data.messages : [];
+      const meta = messagesMeta(msgs);
+      if (state.loadedChatJid !== state.selectedChatJid || !sameTupleList(meta, state.loadedMessagesMeta)) {
+        state.loadedChatJid = state.selectedChatJid;
+        state.loadedMessagesMeta = meta;
+        await renderChatMessages(msgs);
       }
-
-      const selected = getSelectedChat();
-      if (selected) {
-        selected.unreadCount = 0;
-      }
-      if (el.chatHeaderTitle) {
-        el.chatHeaderTitle.textContent = selected?.title || state.selectedChatJid;
-      }
-      if (el.chatHeaderMeta) {
-        const totalMessages = Number(selected?.messageCount || 0);
-        el.chatHeaderMeta.textContent = `${selected?.jid || state.selectedChatJid} • ${totalMessages} msg salvas`;
-      }
-      // Mostra botão de sync no header quando há chat selecionado
-      if (el.chatHeaderActions) {
-        el.chatHeaderActions.classList.remove('hidden');
-      }
-
-      el.chatComposerInput.disabled = false;
-      updateSendButtonState();
-      renderChatList();
-
-      const distanceFromBottom = el.chatMessages.scrollHeight - el.chatMessages.scrollTop - el.chatMessages.clientHeight;
-      const keepPinnedBottom = distanceFromBottom < 70;
-      revokeMediaObjectUrls();
-      clearNode(el.chatMessages);
-
-      const messages = Array.isArray(data.messages) ? data.messages : [];
-      if (!messages.length) {
-        const p = document.createElement('p');
-        p.className = 'subtitle';
-        p.textContent = 'Sem mensagens em cache para este chat.';
-        el.chatMessages.appendChild(p);
-        if (!state.autoSyncedChats.has(state.selectedChatJid)) {
-          state.autoSyncedChats.add(state.selectedChatJid);
-          void syncSelectedChatHistory();
-        }
-        return;
-      }
-
-      let previousDay = '';
-      messages.forEach((message) => {
-        const raw = Number(message.timestamp || 0);
-        const timestamp = raw > 1000000000000 ? raw : raw * 1000;
-        const dayLabel = Number.isFinite(timestamp) && timestamp > 0
-          ? new Date(timestamp).toLocaleDateString('pt-BR')
-          : '';
-
-        if (dayLabel && dayLabel !== previousDay) {
-          previousDay = dayLabel;
-          const divider = document.createElement('p');
-          divider.className = 'chat-day-divider';
-          divider.textContent = dayLabel;
-          el.chatMessages.appendChild(divider);
-        }
-
-        const bubble = document.createElement('article');
-        bubble.className = `chat-bubble ${message.fromMe ? 'me' : 'other'}`;
-
-        const label = document.createElement('strong');
-        label.className = 'chat-bubble-author';
-        label.textContent = formatSenderLabel(message);
-        bubble.appendChild(label);
-
-        const mediaNode = renderMessageMedia(message.media);
-        if (mediaNode) {
-          bubble.appendChild(mediaNode);
-        }
-
-        const messageText = String(message.text || '').trim();
-        const isMediaPlaceholder = /^\[[a-z]+\]$/i.test(messageText);
-        const captionText = typeof message.media?.caption === 'string' ? message.media.caption.trim() : '';
-        const textToRender = captionText || (!isMediaPlaceholder ? messageText : '');
-
-        if (textToRender) {
-          const text = document.createElement('p');
-          text.textContent = textToRender;
-          bubble.appendChild(text);
-        }
-
-        if (message.media && !message.media.base64 && message.media.omittedReason) {
-          const notice = document.createElement('p');
-          notice.className = 'chat-media-warning';
-          notice.textContent = message.media.omittedReason === 'too_large'
-            ? 'Mídia não carregada: arquivo acima do limite configurado.'
-            : 'Mídia não carregada: falha no download.';
-          bubble.appendChild(notice);
-        }
-
-        const footer = document.createElement('small');
-        footer.textContent = formatMessageTimestamp(message.timestamp);
-
-        bubble.appendChild(footer);
-        el.chatMessages.appendChild(bubble);
-      });
-
-      if (keepPinnedBottom) {
-        el.chatMessages.scrollTop = el.chatMessages.scrollHeight;
-      } else {
-        el.chatMessages.scrollTop = Math.max(
-          0,
-          el.chatMessages.scrollHeight - el.chatMessages.clientHeight - distanceFromBottom
-        );
-      }
-
-      if (messages.length < 120 && !state.autoSyncedChats.has(state.selectedChatJid)) {
+      // Auto-sync if no messages yet
+      const fewMessages = msgs.length < 120;
+      if (fewMessages && !state.autoSyncedChats.has(state.selectedChatJid)) {
         state.autoSyncedChats.add(state.selectedChatJid);
-        void syncSelectedChatHistory();
+        syncSelectedHistory();
       }
-    } catch (error) {
-      revokeMediaObjectUrls();
-      clearNode(el.chatMessages);
-      const p = document.createElement('p');
-      p.className = 'subtitle';
-      p.textContent = error.message || 'Erro de rede ao carregar mensagens.';
-      el.chatMessages.appendChild(p);
-    } finally {
-      endLoad('chat-messages');
-    }
+    } catch {} finally { endLoad('messages'); }
   }
 
-  async function sendChatMessage() {
-    if (!state.selectedChatJid) return;
-    const text = String(el.chatComposerInput.value || '').trim();
-    if (!text) return;
+  function updateSendButtonState() {
+    const hasText = !!el.chatComposerInput.value.trim();
+    el.btnSendChatMessage.disabled = !state.selectedChatJid || !hasText;
+  }
 
-    const priorLabel = el.btnSendChatMessage.textContent;
-    el.btnSendChatMessage.textContent = 'Enviando...';
+  function autoResizeComposer() {
+    el.chatComposerInput.style.height = 'auto';
+    const h = Math.max(36, Math.min(160, el.chatComposerInput.scrollHeight));
+    el.chatComposerInput.style.height = h + 'px';
+  }
+
+  el.chatComposerInput.addEventListener('input', () => { autoResizeComposer(); updateSendButtonState(); });
+  el.chatComposerInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+  });
+
+  async function sendChatMessage() {
+    const text = el.chatComposerInput.value.trim();
+    if (!text || !state.selectedChatJid) return;
     el.btnSendChatMessage.disabled = true;
+    const orig = el.btnSendChatMessage.textContent;
+    el.btnSendChatMessage.textContent = 'Enviando...';
     try {
       const { response, data } = await api(
         `/v1/instances/${encodeURIComponent(instance)}/chats/${encodeURIComponent(state.selectedChatJid)}/messages`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ text }),
-        }
+        { method: 'POST', body: JSON.stringify({ text }) }
       );
-      if (!response.ok || !data.ok) {
-        if (el.chatHeaderMeta) {
-          el.chatHeaderMeta.textContent = data.error || 'Falha ao enviar mensagem.';
-        }
+      if (!response.ok) {
+        setText(el.chatHeaderMeta, data.error || 'Falha ao enviar.');
         return;
       }
-
       el.chatComposerInput.value = '';
-      await loadChats();
-      await loadChatMessages();
       autoResizeComposer();
-      updateSendButtonState();
-      markSynced();
-    } catch (error) {
-      if (el.chatHeaderMeta) {
-        el.chatHeaderMeta.textContent = error.message || 'Erro de rede ao enviar mensagem.';
-      }
-    } finally {
-      el.btnSendChatMessage.textContent = priorLabel;
-      updateSendButtonState();
+      state.loadedChatJid = '';
+      state.loadedMessagesMeta = [];
+      await loadChatMessages();
+      await loadChats();
       el.chatComposerInput.focus();
+    } catch (err) {
+      setText(el.chatHeaderMeta, err.message || 'Erro de rede.');
+    } finally {
+      el.btnSendChatMessage.textContent = orig || 'Enviar';
+      updateSendButtonState();
     }
   }
+  el.btnSendChatMessage.addEventListener('click', sendChatMessage);
 
-  async function syncSelectedChatHistory() {
-    if (!state.selectedChatJid) {
-      if (el.chatHeaderMeta) {
-        el.chatHeaderMeta.textContent = 'Selecione um chat para sincronizar histórico.';
-      }
-      return;
-    }
-
-    state.inFlight.add('chat-history-sync');
-
-    // Atualiza ambos os botões de sync (toolbar + header do chat)
-    const syncBtns = [el.btnSyncChatHistory, el.btnSyncSelectedHistory].filter(Boolean);
-    const priorLabels = syncBtns.map((b) => b.textContent);
-    syncBtns.forEach((b) => {
-      b.textContent = 'Sincronizando...';
-      b.disabled = true;
-    });
-
-    if (el.chatHeaderMeta) {
-      el.chatHeaderMeta.textContent = 'Buscando historico de mensagens...';
-    }
-
+  async function syncSelectedHistory() {
+    if (!state.selectedChatJid) return;
+    setText(el.chatHeaderMeta, 'Buscando histórico...');
+    [el.btnSyncChatHistory, el.btnSyncSelectedHistory].forEach((b) => { if (b) b.disabled = true; });
     try {
       const { response, data } = await api(
         `/v1/instances/${encodeURIComponent(instance)}/chats/${encodeURIComponent(state.selectedChatJid)}/sync-history`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ maxBatches: 30, fetchCount: 200 }),
-        }
+        { method: 'POST', body: JSON.stringify({ maxBatches: 30, fetchCount: 200 }) }
       );
-
-      if (!response.ok || !data.ok) {
-        const errMsg = data.error === 'instance_not_connected'
-          ? 'Instancia desconectada. Conecte para buscar historico.'
-          : data.error === 'history_fetch_not_supported'
-          ? 'WhatsApp nao suporta busca de historico nesta versao.'
-          : data.error || 'Falha ao sincronizar historico.';
-        if (el.chatHeaderMeta) el.chatHeaderMeta.textContent = errMsg;
+      if (!response.ok) {
+        const errMap = {
+          instance_not_connected: 'Instância desconectada.',
+          history_fetch_not_supported: 'Versão do WhatsApp não suporta isso.',
+        };
+        setText(el.chatHeaderMeta, errMap[data.error] || data.error || 'Falha.');
         return;
       }
-
-      await loadChats();
+      const imp = Number(data.imported) || 0;
+      const batches = Number(data.batches) || 0;
+      if (imp > 0) {
+        setText(el.chatHeaderMeta, `Histórico: +${imp} mensagens (${batches} lotes)`);
+      } else {
+        setText(el.chatHeaderMeta, `Sem novas mensagens. (${batches} lotes verificados)`);
+      }
+      state.loadedChatJid = '';
+      state.loadedMessagesMeta = [];
       await loadChatMessages();
-      if (el.chatHeaderMeta) {
-        const doneLabel = data.done ? 'completo' : 'parcial';
-        const imported = Number(data.imported || 0);
-        const batches = Number(data.batches || 0);
-        el.chatHeaderMeta.textContent = imported > 0
-          ? `Hist. ${doneLabel}: +${imported} mensagens (${batches} lotes) — salvas no banco local.`
-          : `Sem novas mensagens para importar. (${batches} lotes verificados)`;
-      }
-      markSynced();
-    } catch (error) {
-      if (el.chatHeaderMeta) {
-        el.chatHeaderMeta.textContent = error.message || 'Erro de rede ao sincronizar historico.';
-      }
-    } finally {
-      state.inFlight.delete('chat-history-sync');
-      syncBtns.forEach((b, i) => {
-        b.textContent = priorLabels[i] ?? b.textContent;
-        b.disabled = false;
-      });
-      updateSendButtonState();
-    }
+      await loadChats();
+    } catch (err) { setText(el.chatHeaderMeta, err.message || 'Erro de rede.'); }
+    finally { [el.btnSyncChatHistory, el.btnSyncSelectedHistory].forEach((b) => { if (b) b.disabled = false; }); }
   }
+  el.btnRefreshChats.addEventListener('click', () => { state.lastChatListMeta = []; loadChats(); });
+  el.btnSyncChatHistory.addEventListener('click', syncSelectedHistory);
+  el.btnSyncSelectedHistory.addEventListener('click', syncSelectedHistory);
 
+  // ============ Settings ============
   async function loadSettings() {
     if (!beginLoad('settings')) return;
     try {
-      setResult(el.settingsResult, 'Carregando configuracoes...', '');
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/settings`);
-      if (!response.ok || !data.ok) {
-        setResult(el.settingsResult, data.error || 'Falha ao carregar configurações.', 'error');
-        return;
-      }
-
-      const proxy = data.proxy || {};
-      const general = data.general || {};
-      document.getElementById('proxyEnabled').checked = Boolean(proxy.enabled);
-      document.getElementById('proxyProtocol').value = proxy.protocol || 'http';
-      document.getElementById('proxyHost').value = proxy.host || '';
-      document.getElementById('proxyPort').value = proxy.port || '';
-      document.getElementById('proxyUsername').value = proxy.username || '';
-      document.getElementById('proxyPassword').value = proxy.password || '';
-
-      document.getElementById('settingRejectCalls').checked = Boolean(general.rejectCalls);
-      document.getElementById('settingIgnoreGroups').checked = Boolean(general.ignoreGroups);
-      document.getElementById('settingAlwaysOnline').checked = Boolean(general.alwaysOnline);
-      document.getElementById('settingAutoReadMessages').checked = Boolean(general.autoReadMessages);
-      document.getElementById('settingSyncFullHistory').checked = Boolean(general.syncFullHistory);
-      document.getElementById('settingReadStatus').checked = Boolean(general.readStatus);
-      markSynced();
-    } catch (error) {
-      setResult(el.settingsResult, error.message || 'Erro de rede ao carregar configurações.', 'error');
-    } finally {
-      endLoad('settings');
-    }
+      if (!response.ok) return;
+      const g = data.general || {};
+      el.settings.rejectCalls.checked = !!g.rejectCalls;
+      el.settings.ignoreGroups.checked = !!g.ignoreGroups;
+      el.settings.alwaysOnline.checked = !!g.alwaysOnline;
+      el.settings.autoReadMessages.checked = !!g.autoReadMessages;
+      el.settings.syncFullHistory.checked = !!g.syncFullHistory;
+      el.settings.readStatus.checked = !!g.readStatus;
+      const p = data.proxy || {};
+      el.proxy.enabled.checked = !!p.enabled;
+      el.proxy.protocol.value = p.protocol || '';
+      el.proxy.host.value = p.host || '';
+      el.proxy.port.value = p.port || '';
+      el.proxy.username.value = p.username || '';
+      el.proxy.password.value = p.password || '';
+    } catch {} finally { endLoad('settings'); }
   }
 
   async function saveGeneral() {
-    const body = {
-      rejectCalls: document.getElementById('settingRejectCalls').checked,
-      ignoreGroups: document.getElementById('settingIgnoreGroups').checked,
-      alwaysOnline: document.getElementById('settingAlwaysOnline').checked,
-      autoReadMessages: document.getElementById('settingAutoReadMessages').checked,
-      syncFullHistory: document.getElementById('settingSyncFullHistory').checked,
-      readStatus: document.getElementById('settingReadStatus').checked,
-    };
     try {
+      const body = {
+        rejectCalls: el.settings.rejectCalls.checked,
+        ignoreGroups: el.settings.ignoreGroups.checked,
+        alwaysOnline: el.settings.alwaysOnline.checked,
+        autoReadMessages: el.settings.autoReadMessages.checked,
+        syncFullHistory: el.settings.syncFullHistory.checked,
+        readStatus: el.settings.readStatus.checked,
+      };
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/settings/general`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
+        method: 'PATCH', body: JSON.stringify(body)
       });
-      if (!response.ok || !data.ok) {
-        setResult(el.settingsResult, data.error || 'Falha ao salvar configurações gerais.', 'error');
-        return;
-      }
-      const reconnectHint = Array.isArray(data.requiresReconnect) && data.requiresReconnect.length > 0
-        ? ` Reinicie para aplicar: ${data.requiresReconnect.join(', ')}.`
-        : '';
-      const runtimeHint = data.runtimeApplied
-        ? ' Aplicado em runtime quando possível.'
-        : ' Instância offline: efeitos aplicam ao conectar.';
-      const readSyncHint = Number(data.readSyncCount || 0) > 0
-        ? ` ${data.readSyncCount} mensagens/status marcados como lidos.`
-        : '';
-      const syncRestartHint = data.syncRestartTriggered
-        ? (data.syncRestartOk
-          ? ' Reinício automático disparado para aplicar syncFullHistory.'
-          : ` Falha no reinício automático (${data.syncRestartError || 'erro_desconhecido'}).`)
-        : '';
-      const syncContinuousHint = body.syncFullHistory
-        ? ' Sincronização contínua de histórico ativada.'
-        : ' Sincronização contínua de histórico desativada.';
-
-      setResult(
-        el.settingsResult,
-        `Configurações gerais salvas.${runtimeHint}${readSyncHint}${syncRestartHint}${syncContinuousHint}${reconnectHint}`,
-        'success'
-      );
-      if (data.syncRestartTriggered) {
-        setTimeout(() => {
-          void loadDashboard();
-        }, 1000);
-      }
-      markSynced();
-    } catch (error) {
-      setResult(el.settingsResult, error.message || 'Erro de rede ao salvar configurações gerais.', 'error');
-    }
+      if (!response.ok) { setResult(el.settingsResult, data.error || 'Falha.', 'error'); return; }
+      let msg = 'Configurações salvas.';
+      if (data.requiresReconnect?.length) msg += ` Reinicie para aplicar: ${data.requiresReconnect.join(', ')}.`;
+      setResultAuto(el.settingsResult, msg, 'success');
+      if (data.syncRestartTriggered) setTimeout(loadDashboard, 1000);
+    } catch (err) { setResult(el.settingsResult, err.message || 'Erro.', 'error'); }
   }
 
   async function saveProxy() {
-    const body = {
-      enabled: document.getElementById('proxyEnabled').checked,
-      protocol: document.getElementById('proxyProtocol').value.trim(),
-      host: document.getElementById('proxyHost').value.trim(),
-      port: document.getElementById('proxyPort').value.trim(),
-      username: document.getElementById('proxyUsername').value.trim(),
-      password: document.getElementById('proxyPassword').value.trim(),
-    };
     try {
+      const body = {
+        enabled: el.proxy.enabled.checked,
+        protocol: el.proxy.protocol.value.trim(),
+        host: el.proxy.host.value.trim(),
+        port: el.proxy.port.value.trim(),
+        username: el.proxy.username.value.trim(),
+        password: el.proxy.password.value.trim(),
+      };
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/settings/proxy`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
+        method: 'PATCH', body: JSON.stringify(body)
       });
-      if (!response.ok || !data.ok) {
-        setResult(el.settingsResult, data.error || 'Falha ao salvar proxy.', 'error');
-        return;
-      }
-      const reconnectHint = data.requiresReconnect ? ' Reinicie a conexão para aplicar o proxy.' : '';
-      setResult(el.settingsResult, `Proxy salvo.${reconnectHint}`, 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.settingsResult, error.message || 'Erro de rede ao salvar proxy.', 'error');
-    }
+      if (!response.ok) { setResult(el.settingsResult, data.error || 'Falha.', 'error'); return; }
+      let msg = 'Proxy salvo.';
+      if (data.requiresReconnect) msg += ' Reinicie a conexão para aplicar.';
+      setResultAuto(el.settingsResult, msg, 'success');
+    } catch (err) { setResult(el.settingsResult, err.message || 'Erro.', 'error'); }
   }
+  el.btnSaveGeneral.addEventListener('click', saveGeneral);
+  el.btnSaveProxy.addEventListener('click', saveProxy);
 
+  // ============ Events ============
   function renderEventsList(toggles) {
-    const box = document.getElementById('eventsToggles');
-    clearNode(box);
-
-    state.availableEvents.forEach((eventName) => {
-      const label = document.createElement('label');
-      label.className = 'switch-row';
-
-      const text = document.createElement('span');
-      text.textContent = eventName;
-
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.dataset.eventToggle = eventName;
-      input.checked = Boolean(toggles[eventName]);
-
-      label.appendChild(text);
-      label.appendChild(input);
-      box.appendChild(label);
-    });
+    const all = Array.from(new Set([...REQUIRED_EVENTS, ...state.availableEvents])).sort();
+    el.eventsToggles.innerHTML = all.map((ev) => {
+      const checked = toggles?.[ev] === true ? 'checked' : '';
+      return `<label class="switch-row">
+        <div class="switch-row-info"><span class="switch-row-label">${escapeHtml(ev)}</span></div>
+        <label class="switch"><input type="checkbox" data-event-toggle="${escapeHtml(ev)}" ${checked}></label>
+      </label>`;
+    }).join('');
   }
 
   async function loadEvents() {
     if (!beginLoad('events')) return;
     try {
-      setResult(el.eventsResult, 'Carregando eventos...', '');
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/events`);
-      if (!response.ok || !data.ok) {
-        setResult(el.eventsResult, data.error || 'Falha ao carregar eventos.', 'error');
-        return;
-      }
-      state.availableEvents = Array.isArray(data.availableEvents) ? data.availableEvents : [];
-      state.availableEvents = Array.from(new Set([...REQUIRED_EVENTS, ...state.availableEvents]));
-      document.getElementById('eventsWebhookUrl').value = data.webhookUrl || '';
+      if (!response.ok) return;
+      el.eventsWebhookUrl.value = data.webhookUrl || '';
+      state.availableEvents = data.availableEvents || [];
       renderEventsList(data.toggles || {});
-      setResult(el.eventsResult, 'Eventos carregados.', 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.eventsResult, error.message || 'Erro de rede ao carregar eventos.', 'error');
-    } finally {
-      endLoad('events');
-    }
+    } catch {} finally { endLoad('events'); }
   }
 
   function collectEventToggles() {
-    const toggles = {};
-    document.querySelectorAll('[data-event-toggle]').forEach((input) => {
-      const key = input.getAttribute('data-event-toggle');
-      if (key) toggles[key] = input.checked;
+    const out = {};
+    document.querySelectorAll('[data-event-toggle]').forEach((cb) => {
+      out[cb.dataset.eventToggle] = !!cb.checked;
     });
-    return toggles;
+    return out;
   }
 
-  function setAllEventToggles(value) {
-    document.querySelectorAll('[data-event-toggle]').forEach((input) => {
-      input.checked = value;
-    });
+  function setAllEventToggles(v) {
+    document.querySelectorAll('[data-event-toggle]').forEach((cb) => { cb.checked = v; });
   }
 
   async function saveEvents() {
     try {
+      const body = { webhookUrl: el.eventsWebhookUrl.value.trim(), toggles: collectEventToggles() };
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/events`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          webhookUrl: document.getElementById('eventsWebhookUrl').value.trim(),
-          toggles: collectEventToggles(),
-        }),
+        method: 'PATCH', body: JSON.stringify(body)
       });
-      if (!response.ok || !data.ok) {
-        setResult(el.eventsResult, data.error || 'Falha ao salvar eventos.', 'error');
-        return;
-      }
-      renderEventsList((data.events && data.events.toggles) || collectEventToggles());
-      setResult(el.eventsResult, 'Eventos salvos.', 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.eventsResult, error.message || 'Erro de rede ao salvar eventos.', 'error');
-    }
+      if (!response.ok) { setResult(el.eventsResult, data.error || 'Falha.', 'error'); return; }
+      setResultAuto(el.eventsResult, 'Eventos salvos.', 'success');
+    } catch (err) { setResult(el.eventsResult, err.message || 'Erro.', 'error'); }
   }
 
   async function testEvent() {
     try {
       const toggles = collectEventToggles();
-      const enabledEvent = Object.entries(toggles).find(([, value]) => Boolean(value))?.[0];
-      const eventToTest = enabledEvent || 'APPLICATION_STARTUP';
+      const event = Object.keys(toggles).find((k) => toggles[k]) || 'APPLICATION_STARTUP';
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/events/test`, {
-        method: 'POST',
-        body: JSON.stringify({ event: eventToTest }),
+        method: 'POST', body: JSON.stringify({ event })
       });
-      if (!response.ok || !data.ok) {
-        const detail = data.skipped ? ` (${data.error || 'evento desabilitado'})` : ` (${data.error || 'falha de entrega'})`;
-        setResult(el.eventsResult, `Falha no teste do evento${detail}.`, 'error');
+      if (!response.ok) {
+        const tag = data.skipped ? '(evento desabilitado)' : '(falha)';
+        setResult(el.eventsResult, `Falha ${tag}: ${data.error || ''}`, 'error');
         return;
       }
-      setResult(el.eventsResult, `Evento ${data.event} entregue (status ${data.status || 200}).`, 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.eventsResult, error.message || 'Erro de rede no teste de evento.', 'error');
-    }
+      setResultAuto(el.eventsResult, `Evento ${data.event} entregue (status ${data.status || 200}).`, 'success');
+    } catch (err) { setResult(el.eventsResult, err.message || 'Erro.', 'error'); }
+  }
+  el.btnSaveEvents.addEventListener('click', saveEvents);
+  el.btnTestEvent.addEventListener('click', testEvent);
+  el.btnMarkAllEvents.addEventListener('click', () => setAllEventToggles(true));
+  el.btnUnmarkAllEvents.addEventListener('click', () => setAllEventToggles(false));
+
+  // ============ Integrations ============
+  function fillIntegrations(integ) {
+    const cw = integ?.chatwoot || {};
+    el.intChatwoot.enabled.checked = !!cw.enabled;
+    el.intChatwoot.baseUrl.value = cw.baseUrl || '';
+    el.intChatwoot.accountId.value = cw.accountId || '';
+    el.intChatwoot.inboxId.value = cw.inboxId || '';
+    el.intChatwoot.token.value = cw.apiAccessToken || '';
+    el.intChatwoot.signMessages.checked = !!cw.signMessages;
+    el.intChatwoot.signDelimiter.value = cw.signDelimiter || '';
+    el.intChatwoot.nameInbox.value = cw.nameInbox || '';
+    el.intChatwoot.webhookSlug.value = cw.webhookSlug || '';
+    el.intChatwoot.organization.value = cw.organization || '';
+    el.intChatwoot.logoUrl.value = cw.logoUrl || '';
+    el.intChatwoot.conversationPending.checked = !!cw.conversationPending;
+    el.intChatwoot.reopenConversation.checked = cw.reopenConversation !== false;
+    el.intChatwoot.importContacts.checked = !!cw.importContacts;
+    el.intChatwoot.importMessages.checked = cw.importMessages !== false;
+    el.intChatwoot.daysLimit.value = cw.daysLimitImportMessages || 7;
+    el.intChatwoot.ignoreJids.value = Array.isArray(cw.ignoreJids) ? cw.ignoreJids.join('\n') : '';
+    el.intChatwoot.autoCreate.checked = !!cw.autoCreate;
+
+    const slug = (cw.webhookSlug || instance).trim();
+    el.intChatwoot.webhookUrl.textContent = `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+    show(el.intChatwoot.webhookInfo, true);
+
+    const n8 = integ?.n8n || {};
+    el.intN8n.enabled.checked = !!n8.enabled;
+    el.intN8n.webhookUrl.value = n8.webhookUrl || '';
+    el.intN8n.headerName.value = n8.authHeaderName || '';
+    el.intN8n.headerValue.value = n8.authHeaderValue || '';
   }
 
   async function loadIntegrations() {
     if (!beginLoad('integrations')) return;
     try {
-      setResult(el.integrationsResult, 'Carregando integracoes...', '');
       const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}`);
-      if (!response.ok || !data.ok) {
-        setResult(el.integrationsResult, data.error || 'Falha ao carregar integrações.', 'error');
-        return;
-      }
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      fillIntegrations(data.integration);
+      pollSyncOnce();
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
+    finally { endLoad('integrations'); }
+  }
 
-      const integration = data.integration || {};
-      const chatwoot = integration.chatwoot || {};
-      const n8n = integration.n8n || {};
-
-      document.getElementById('intChatwootEnabled').checked = Boolean(chatwoot.enabled);
-      document.getElementById('intChatwootBaseUrl').value = chatwoot.baseUrl || '';
-      document.getElementById('intChatwootAccountId').value = chatwoot.accountId || '';
-      document.getElementById('intChatwootInboxId').value = chatwoot.inboxId || '';
-      document.getElementById('intChatwootToken').value = chatwoot.apiAccessToken || '';
-      document.getElementById('intChatwootSignMessages').checked = Boolean(chatwoot.signMessages);
-      document.getElementById('intChatwootSignDelimiter').value = chatwoot.signDelimiter ?? '\\n';
-      document.getElementById('intChatwootNameInbox').value = chatwoot.nameInbox || 'WhatsApp';
-      document.getElementById('intChatwootOrganization').value = chatwoot.organization || '';
-      document.getElementById('intChatwootLogoUrl').value = chatwoot.logoUrl || '';
-      document.getElementById('intChatwootConversationPending').checked = Boolean(chatwoot.conversationPending);
-      document.getElementById('intChatwootReopenConversation').checked = chatwoot.reopenConversation !== false;
-      document.getElementById('intChatwootImportContacts').checked = Boolean(chatwoot.importContacts);
-      document.getElementById('intChatwootImportMessages').checked = chatwoot.importMessages !== false;
-      document.getElementById('intChatwootDaysLimit').value = chatwoot.daysLimitImportMessages ?? 7;
-      document.getElementById('intChatwootIgnoreJids').value = Array.isArray(chatwoot.ignoreJids) ? chatwoot.ignoreJids.join('\n') : '';
-      document.getElementById('intChatwootAutoCreate').checked = Boolean(chatwoot.autoCreate);
-
-      // Show webhook URL for this instance
-      const webhookInfo = document.getElementById('intChatwootWebhookInfo');
-      const webhookUrlEl = document.getElementById('intChatwootWebhookUrl');
-      if (webhookInfo && webhookUrlEl) {
-        const origin = window.location.origin;
-        webhookUrlEl.textContent = `${origin}/v1/integrations/${encodeURIComponent(instance)}/chatwoot/webhook`;
-        webhookInfo.style.display = '';
-      }
-
-      document.getElementById('intN8nEnabled').checked = Boolean(n8n.enabled);
-      document.getElementById('intN8nWebhookUrl').value = n8n.webhookUrl || '';
-      document.getElementById('intN8nHeaderName').value = n8n.authHeaderName || 'x-api-key';
-      document.getElementById('intN8nHeaderValue').value = n8n.authHeaderValue || '';
-
-      setResult(el.integrationsResult, 'Integrações carregadas.', 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.integrationsResult, error.message || 'Erro de rede ao carregar integrações.', 'error');
-    } finally {
-      endLoad('integrations');
-    }
+  function buildIntChatwootBody() {
+    const ignoreJids = (el.intChatwoot.ignoreJids.value || '').split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+    return {
+      enabled: el.intChatwoot.enabled.checked,
+      baseUrl: el.intChatwoot.baseUrl.value.trim(),
+      accountId: el.intChatwoot.accountId.value.trim(),
+      inboxId: el.intChatwoot.inboxId.value.trim(),
+      apiAccessToken: el.intChatwoot.token.value.trim(),
+      signMessages: el.intChatwoot.signMessages.checked,
+      signDelimiter: el.intChatwoot.signDelimiter.value,
+      nameInbox: el.intChatwoot.nameInbox.value.trim(),
+      webhookSlug: el.intChatwoot.webhookSlug.value.trim(),
+      organization: el.intChatwoot.organization.value.trim(),
+      logoUrl: el.intChatwoot.logoUrl.value.trim(),
+      conversationPending: el.intChatwoot.conversationPending.checked,
+      reopenConversation: el.intChatwoot.reopenConversation.checked,
+      importContacts: el.intChatwoot.importContacts.checked,
+      importMessages: el.intChatwoot.importMessages.checked,
+      daysLimitImportMessages: Number(el.intChatwoot.daysLimit.value) || 7,
+      ignoreJids,
+      autoCreate: el.intChatwoot.autoCreate.checked,
+    };
   }
 
   async function saveIntegrationChatwoot() {
-    const rawJids = document.getElementById('intChatwootIgnoreJids').value;
-    const ignoreJids = rawJids
-      .split(/[\n,;]+/)
-      .map((j) => j.trim())
-      .filter(Boolean);
-    const body = {
-      enabled: document.getElementById('intChatwootEnabled').checked,
-      baseUrl: document.getElementById('intChatwootBaseUrl').value.trim(),
-      accountId: document.getElementById('intChatwootAccountId').value.trim(),
-      inboxId: document.getElementById('intChatwootInboxId').value.trim(),
-      apiAccessToken: document.getElementById('intChatwootToken').value.trim(),
-      signMessages: document.getElementById('intChatwootSignMessages').checked,
-      signDelimiter: document.getElementById('intChatwootSignDelimiter').value,
-      nameInbox: document.getElementById('intChatwootNameInbox').value.trim(),
-      organization: document.getElementById('intChatwootOrganization').value.trim(),
-      logoUrl: document.getElementById('intChatwootLogoUrl').value.trim(),
-      conversationPending: document.getElementById('intChatwootConversationPending').checked,
-      reopenConversation: document.getElementById('intChatwootReopenConversation').checked,
-      importContacts: document.getElementById('intChatwootImportContacts').checked,
-      importMessages: document.getElementById('intChatwootImportMessages').checked,
-      daysLimitImportMessages: Number(document.getElementById('intChatwootDaysLimit').value) || 7,
-      ignoreJids,
-      autoCreate: document.getElementById('intChatwootAutoCreate').checked,
-    };
     try {
       const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
+        method: 'PATCH', body: JSON.stringify(buildIntChatwootBody())
       });
-      if (!response.ok || !data.ok) {
-        setResult(el.integrationsResult, data.error || 'Falha ao salvar Chatwoot.', 'error');
-        return;
-      }
-      setResult(el.integrationsResult, 'Chatwoot salvo com sucesso.', 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.integrationsResult, error.message || 'Erro de rede ao salvar Chatwoot.', 'error');
-    }
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      fillIntegrations(data.integration);
+      setResultAuto(el.integrationsResult, 'Configuração Chatwoot salva.', 'success');
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
   }
 
   async function testIntegrationChatwoot() {
     try {
-      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/test`, {
-        method: 'POST',
-      });
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/test`, { method: 'POST' });
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      setResultAuto(el.integrationsResult, `Chatwoot OK (status ${data.status || 200}).`, 'success');
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
+  }
+
+  async function autoCreateIntegrationChatwoot() {
+    setResult(el.intAutoCreateResult, 'Criando inbox...', '');
+    try {
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/autocreate`, { method: 'POST' });
+      if (!response.ok || !data.ok) { setResult(el.intAutoCreateResult, data.error || 'Falha.', 'error'); return; }
+      const r = data.result || {};
+      setResultAuto(el.intAutoCreateResult, `Inbox "${r.inboxName || ''}" (id=${r.inboxId || '?'}) criado/atualizado.`, 'success');
+      await loadIntegrations();
+    } catch (err) { setResult(el.intAutoCreateResult, err.message || 'Erro.', 'error'); }
+  }
+
+  async function syncContactNamesIntegrationChatwoot() {
+    setResult(el.integrationsResult, 'Sincronizando nomes de contatos...', '');
+    try {
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-contact-names`, { method: 'POST' });
       if (!response.ok || !data.ok) {
-        setResult(el.integrationsResult, data.error || 'Teste Chatwoot falhou.', 'error');
+        setResult(el.integrationsResult, data.error || 'Falha ao sincronizar nomes.', 'error');
         return;
       }
-      setResult(el.integrationsResult, `Chatwoot OK (status ${data.status || 200}).`, 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.integrationsResult, error.message || 'Erro de rede no teste Chatwoot.', 'error');
+      const r = data.result || {};
+      setResultAuto(el.integrationsResult, `Sync de nomes concluído: ${r.updated || 0} atualizados, ${r.skipped || 0} ignorados, ${r.errors || 0} erros.`, 'success');
+    } catch (err) {
+      setResult(el.integrationsResult, err.message || 'Erro.', 'error');
     }
   }
 
-  async function saveIntegrationN8n() {
-    const body = {
-      enabled: document.getElementById('intN8nEnabled').checked,
-      webhookUrl: document.getElementById('intN8nWebhookUrl').value.trim(),
-      authHeaderName: document.getElementById('intN8nHeaderName').value.trim(),
-      authHeaderValue: document.getElementById('intN8nHeaderValue').value.trim(),
-    };
+  async function startSyncHistory() {
     try {
-      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-history`, {
+        method: 'POST', body: JSON.stringify({})
       });
-      if (!response.ok || !data.ok) {
-        setResult(el.integrationsResult, data.error || 'Falha ao salvar n8n.', 'error');
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      setResultAuto(el.integrationsResult, 'Sincronização iniciada.', 'success');
+      startSyncPolling();
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
+  }
+
+  async function cancelSync() {
+    try {
+      await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-cancel`, { method: 'POST' });
+    } catch {}
+  }
+
+  function renderSyncProgress(p) {
+    if (!p || p.status === 'idle') { show(el.intSyncProgress, false); return; }
+    show(el.intSyncProgress, true);
+    const map = {
+      running: { txt: 'rodando', cls: 'info' },
+      cancelling: { txt: 'cancelando', cls: 'warning' },
+      completed: { txt: 'concluído', cls: 'success' },
+      cancelled: { txt: 'cancelado', cls: 'warning' },
+      failed: { txt: 'falhou', cls: 'danger' },
+    };
+    const s = map[p.status] || { txt: p.status, cls: '' };
+    el.intSyncBadge.textContent = s.txt;
+    el.intSyncBadge.className = 'badge ' + s.cls;
+    show(el.btnCancelSyncInt, p.status === 'running');
+
+    el.intSyncChats.textContent = `${p.processedChats || 0}/${p.totalChats || 0}`;
+    el.intSyncSent.textContent = String(p.syncedMessages || 0);
+    el.intSyncSkipped.textContent = String(p.skippedMessages || 0);
+    el.intSyncErrors.textContent = String(p.errorCount || 0);
+
+    const trigger = p.trigger ? ` • disparo: ${p.trigger}` : '';
+    el.intSyncCurrent.textContent = (p.currentChatTitle || (p.lastError ? 'erro: ' + p.lastError : (p.status === 'running' ? 'preparando...' : ''))) + trigger;
+
+    el.intSyncFill.classList.remove('indeterminate');
+    if (p.status === 'running') {
+      if (p.totalChats > 0) {
+        const pct = Math.min(100, Math.round((p.processedChats / p.totalChats) * 100));
+        el.intSyncFill.style.width = pct + '%';
+      } else {
+        el.intSyncFill.classList.add('indeterminate');
+        el.intSyncFill.style.width = '';
+      }
+    } else if (p.status === 'completed') {
+      el.intSyncFill.style.width = '100%';
+    }
+  }
+
+  async function pollSyncOnce() {
+    try {
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/chatwoot/sync-status`);
+      if (response.ok) {
+        renderSyncProgress(data.progress);
+        return data.progress;
+      }
+    } catch {}
+    return null;
+  }
+
+  function stopSyncPolling() {
+    if (state.syncPollHandle) { clearTimeout(state.syncPollHandle); state.syncPollHandle = null; }
+    state.syncPollBusy = false;
+  }
+
+  function startSyncPolling() {
+    stopSyncPolling();
+    const run = async () => {
+      if (state.syncPollBusy) return;
+      state.syncPollBusy = true;
+      const p = await pollSyncOnce();
+      state.syncPollBusy = false;
+      if (p && p.status !== 'running' && p.status !== 'cancelling') {
+        stopSyncPolling();
         return;
       }
-      setResult(el.integrationsResult, 'n8n salvo com sucesso.', 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.integrationsResult, error.message || 'Erro de rede ao salvar n8n.', 'error');
-    }
+      state.syncPollHandle = setTimeout(run, 1000);
+    };
+    run();
+  }
+
+  function startUiPolling() {
+    if (state.uiPollHandle) clearTimeout(state.uiPollHandle);
+    const run = async () => {
+      if (!document.hidden && !state.uiPollBusy) {
+        state.uiPollBusy = true;
+        try {
+          if (state.activeSection === 'dashboard') {
+            await loadDashboard();
+          } else {
+            await loadHeaderStatus();
+            if (state.activeSection === 'chat') {
+              await loadChats();
+              if (state.selectedChatJid) await loadChatMessages();
+            }
+          }
+        } finally {
+          state.uiPollBusy = false;
+        }
+      }
+      state.uiPollHandle = setTimeout(run, 4000);
+    };
+    run();
+  }
+
+  async function saveIntegrationN8n() {
+    try {
+      const body = {
+        enabled: el.intN8n.enabled.checked,
+        webhookUrl: el.intN8n.webhookUrl.value.trim(),
+        authHeaderName: el.intN8n.headerName.value.trim(),
+        authHeaderValue: el.intN8n.headerValue.value.trim(),
+      };
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
+        method: 'PATCH', body: JSON.stringify(body)
+      });
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      setResultAuto(el.integrationsResult, 'Configuração n8n salva.', 'success');
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
   }
 
   async function testIntegrationN8n() {
     try {
-      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/n8n/test`, {
-        method: 'POST',
-      });
-      if (!response.ok || !data.ok) {
-        setResult(el.integrationsResult, data.error || 'Teste n8n falhou.', 'error');
-        return;
-      }
-      setResult(el.integrationsResult, `n8n OK (status ${data.status || 200}).`, 'success');
-      markSynced();
-    } catch (error) {
-      setResult(el.integrationsResult, error.message || 'Erro de rede no teste n8n.', 'error');
-    }
+      const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}/n8n/test`, { method: 'POST' });
+      if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
+      setResultAuto(el.integrationsResult, `n8n OK (status ${data.status || 200}).`, 'success');
+    } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
   }
 
-  async function loadSection(section) {
-    if (section !== 'dashboard') {
-      await loadHeaderStatus();
-    }
-    if (section === 'dashboard') await loadDashboard();
-    if (section === 'chat') {
-      await loadChats();
-      if (state.selectedChatJid) await loadChatMessages();
-    }
-    if (section === 'settings') await loadSettings();
-    if (section === 'events') await loadEvents();
-    if (section === 'integrations') await loadIntegrations();
-  }
+  el.btnSaveIntChatwoot.addEventListener('click', saveIntegrationChatwoot);
+  el.btnTestIntChatwoot.addEventListener('click', testIntegrationChatwoot);
+  el.btnAutoCreateIntChatwoot.addEventListener('click', autoCreateIntegrationChatwoot);
+  el.btnSyncContactNamesIntChatwoot.addEventListener('click', syncContactNamesIntegrationChatwoot);
+  el.btnSyncHistoryIntChatwoot.addEventListener('click', startSyncHistory);
+  el.btnCancelSyncInt.addEventListener('click', cancelSync);
+  el.btnSaveIntN8n.addEventListener('click', saveIntegrationN8n);
+  el.btnTestIntN8n.addEventListener('click', testIntegrationN8n);
 
-  function switchSection(nextSection) {
-    state.activeSection = nextSection;
-    document.querySelectorAll('.instance-nav-btn').forEach((btn) => {
-      const active = btn.getAttribute('data-section') === nextSection;
-      btn.classList.toggle('active', active);
-      btn.setAttribute('aria-selected', active ? 'true' : 'false');
-    });
-    document.querySelectorAll('.instance-section').forEach((section) => {
-      section.classList.toggle('active', section.id === `section-${nextSection}`);
-    });
+  // ============ Boot ============
+  setText(el.sidebarInstanceName, `Instância: ${instance}`);
+  setText(el.instanceTitle, `Conexão: ${instance}`);
+  setText(el.instanceSubtitle, `Painel operacional`);
 
-    if (window.location.hash !== `#${nextSection}`) {
-      window.history.replaceState(null, '', `#${nextSection}`);
-    }
-
-    void loadSection(nextSection);
-  }
-
-  document.querySelectorAll('.instance-nav-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const section = btn.getAttribute('data-section');
-      if (!section || section === state.activeSection) return;
-      switchSection(section);
-    });
-  });
-
-  document.getElementById('dashboardConnectMode').addEventListener('change', () => {
-    const isPairing = document.getElementById('dashboardConnectMode').value === 'pairing';
-    show(document.getElementById('dashboardPhoneRow'), isPairing);
-  });
-
-  document.getElementById('btnDashboardConnect').addEventListener('click', connectFromDashboard);
-  document.getElementById('btnDashboardRestart').addEventListener('click', () => dashboardAction('restart'));
-  document.getElementById('btnDashboardDisconnect').addEventListener('click', () => dashboardAction('disconnect'));
-  document.getElementById('btnRefreshChats').addEventListener('click', async () => {
-    await loadChats();
-    await loadChatMessages();
-  });
-  document.querySelectorAll('[data-chat-filter]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const filter = btn.getAttribute('data-chat-filter');
-      if (!filter || filter === state.chatFilter) return;
-      setChatFilter(filter);
-    });
-  });
-  el.btnSyncChatHistory?.addEventListener('click', () => {
-    void syncSelectedChatHistory();
-  });
-  el.btnSyncSelectedHistory?.addEventListener('click', () => {
-    void syncSelectedChatHistory();
-  });
-  el.chatSearchInput.addEventListener('input', () => {
-    renderChatList();
-  });
-  el.chatComposerInput.addEventListener('input', () => {
-    autoResizeComposer();
-    updateSendButtonState();
-  });
-  el.btnSendChatMessage.addEventListener('click', () => {
-    void sendChatMessage();
-  });
-  el.chatComposerInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault();
-      void sendChatMessage();
-    }
-  });
-  document.getElementById('btnSaveGeneral').addEventListener('click', saveGeneral);
-  document.getElementById('btnSaveProxy').addEventListener('click', saveProxy);
-  document.getElementById('btnMarkAllEvents').addEventListener('click', () => setAllEventToggles(true));
-  document.getElementById('btnUnmarkAllEvents').addEventListener('click', () => setAllEventToggles(false));
-  document.getElementById('btnSaveEvents').addEventListener('click', saveEvents);
-  document.getElementById('btnTestEvent').addEventListener('click', testEvent);
-  document.getElementById('btnSaveIntChatwoot').addEventListener('click', saveIntegrationChatwoot);
-  document.getElementById('btnTestIntChatwoot').addEventListener('click', testIntegrationChatwoot);
-  document.getElementById('btnSaveIntN8n').addEventListener('click', saveIntegrationN8n);
-  document.getElementById('btnTestIntN8n').addEventListener('click', testIntegrationN8n);
-  el.btnForceRefresh.addEventListener('click', () => {
-    void loadSection(state.activeSection);
-  });
+  el.btnForceRefresh.addEventListener('click', () => loadSection(state.activeSection));
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) return;
-    void loadSection(state.activeSection);
+    if (!document.hidden) loadSection(state.activeSection);
   });
 
-  window.addEventListener('hashchange', () => {
-    const next = sectionFromHash();
-    if (next !== state.activeSection) {
-      switchSection(next);
-    }
-  });
+  switchSection(sectionFromHash());
 
-  setInterval(() => {
-    if (document.hidden) return;
-    void loadHeaderStatus();
-    if (state.activeSection === 'dashboard') {
-      void loadDashboard();
-      return;
-    }
-    if (state.activeSection === 'chat') {
-      void loadChats();
-      if (state.selectedChatJid) void loadChatMessages();
-    }
-  }, 4000);
-
-  el.title.textContent = `Conexão: ${instance}`;
-  el.subtitle.textContent = `Painel operacional da instância ${instance}`;
-  if (el.sidebarInstanceName) {
-    el.sidebarInstanceName.textContent = `Instância: ${instance}`;
-  }
-  show(document.getElementById('dashboardPhoneRow'), false);
-  autoResizeComposer();
-  updateSendButtonState();
-  setLastSync('Carregando dados da instância...');
-
-  const initialSection = sectionFromHash();
-  if (initialSection !== 'dashboard') {
-    switchSection(initialSection);
-  } else {
-    void loadSection('dashboard');
-  }
+  // Polling — only when visible, without overlapping async requests
+  startUiPolling();
 })();

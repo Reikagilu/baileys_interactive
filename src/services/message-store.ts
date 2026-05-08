@@ -24,6 +24,7 @@ export interface StoredMessage {
   timestamp: number;
   senderName?: string;
   senderNumber?: string;
+  participant?: string;
   media?: Record<string, unknown>;
   contact?: Record<string, unknown>;
 }
@@ -59,6 +60,7 @@ function getDb(): DatabaseSync {
       last_message TEXT NOT NULL DEFAULT '',
       last_ts      INTEGER NOT NULL DEFAULT 0,
       unread_count INTEGER NOT NULL DEFAULT 0,
+      message_count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (instance, jid)
     )
   `);
@@ -72,14 +74,40 @@ function getDb(): DatabaseSync {
       ts            INTEGER NOT NULL DEFAULT 0,
       sender_name   TEXT,
       sender_number TEXT,
+      participant   TEXT,
       media_json    TEXT,
       contact_json  TEXT,
       PRIMARY KEY (instance, jid, msg_id)
     )
   `);
+  try {
+    db.exec('ALTER TABLE messages ADD COLUMN participant TEXT');
+  } catch {
+    // column already exists
+  }
+  try {
+    db.exec('ALTER TABLE chat_meta ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // column already exists
+  }
+  db.exec(`
+    UPDATE chat_meta
+    SET message_count = (
+      SELECT COUNT(*)
+      FROM messages m
+      WHERE m.instance = chat_meta.instance
+        AND m.jid = chat_meta.jid
+        AND NOT (m.text = '[message]' AND m.media_json IS NULL AND m.contact_json IS NULL)
+    )
+    WHERE message_count = 0
+  `);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_instance_jid_ts
       ON messages (instance, jid, ts)
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chat_meta_instance_last_ts
+      ON chat_meta (instance, last_ts)
   `);
   _db = db;
   return db;
@@ -98,10 +126,13 @@ function parseJson<T>(raw: unknown): T | undefined {
  */
 export function upsertMessage(instance: string, jid: string, msg: StoredMessage): boolean {
   const db = getDb();
+  db.prepare(`
+    INSERT OR IGNORE INTO chat_meta (instance, jid) VALUES (?, ?)
+  `).run(instance, jid);
   const result = db.prepare(`
     INSERT OR IGNORE INTO messages
-      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, media_json, contact_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     instance,
     jid,
@@ -111,10 +142,19 @@ export function upsertMessage(instance: string, jid: string, msg: StoredMessage)
     msg.timestamp ?? 0,
     msg.senderName ?? null,
     msg.senderNumber ?? null,
+    msg.participant ?? null,
     msg.media ? JSON.stringify(msg.media) : null,
     msg.contact ? JSON.stringify(msg.contact) : null,
   );
-  return (result.changes ?? 0) > 0;
+  const inserted = (result.changes ?? 0) > 0;
+  if (inserted) {
+    const isJunkPlaceholder = (msg.text ?? '') === '[message]' && !msg.media && !msg.contact;
+    if (!isJunkPlaceholder) {
+      db.prepare('UPDATE chat_meta SET message_count = message_count + 1 WHERE instance = ? AND jid = ?')
+        .run(instance, jid);
+    }
+  }
+  return inserted;
 }
 
 /**
@@ -166,6 +206,17 @@ export function resetUnread(instance: string, jid: string): void {
 // ─── Leitura ─────────────────────────────────────────────────────────────────
 
 /**
+ * Retorna o título salvo do chat (vindo de pushName ou subject de grupo). Null se vazio.
+ */
+export function getChatTitle(instance: string, jid: string): string | null {
+  const db = getDb();
+  const row = db.prepare('SELECT title FROM chat_meta WHERE instance = ? AND jid = ?').get(instance, jid) as { title?: string } | undefined;
+  if (!row) return null;
+  const title = (row.title || '').trim();
+  return title || null;
+}
+
+/**
  * Retorna todos os chats da instância, ordenados por last_ts DESC.
  */
 export function listChats(instance: string): StoredChatMeta[] {
@@ -177,11 +228,9 @@ export function listChats(instance: string): StoredChatMeta[] {
       c.last_message,
       c.last_ts,
       c.unread_count,
-      COUNT(m.msg_id) AS message_count
+      c.message_count
     FROM chat_meta c
-    LEFT JOIN messages m ON m.instance = c.instance AND m.jid = c.jid
     WHERE c.instance = ?
-    GROUP BY c.jid
     ORDER BY c.last_ts DESC
   `).all(instance) as Array<{
     jid: string;
@@ -205,22 +254,24 @@ export function listChats(instance: string): StoredChatMeta[] {
 /**
  * Retorna as mensagens de um chat, ordenadas por ts ASC.
  * limit padrão: 500 mensagens mais recentes.
+ * afterTs: se fornecido, retorna apenas mensagens com ts >= afterTs.
  */
-export function listMessages(instance: string, jid: string, limit = 500): StoredMessage[] {
+export function listMessages(instance: string, jid: string, limit = 500, afterTs?: number): StoredMessage[] {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT msg_id, from_me, text, ts, sender_name, sender_number, media_json, contact_json
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json
     FROM messages
-    WHERE instance = ? AND jid = ?
+    WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
     ORDER BY ts ASC
     LIMIT ?
-  `).all(instance, jid, limit) as Array<{
+  `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit) as Array<{
     msg_id: string;
     from_me: number;
     text: string;
     ts: number;
     sender_name: string | null;
     sender_number: string | null;
+    participant: string | null;
     media_json: string | null;
     contact_json: string | null;
   }>;
@@ -232,6 +283,47 @@ export function listMessages(instance: string, jid: string, limit = 500): Stored
     timestamp: r.ts,
     senderName: r.sender_name ?? undefined,
     senderNumber: r.sender_number ?? undefined,
+    participant: r.participant ?? undefined,
+    media: parseJson<Record<string, unknown>>(r.media_json),
+    contact: parseJson<Record<string, unknown>>(r.contact_json),
+  }));
+}
+
+/**
+ * Variante otimizada para sync histórico: retorna apenas mensagens com conteúdo
+ * útil para envio ao Chatwoot (texto não-vazio ou mídia presente).
+ */
+export function listSyncMessages(instance: string, jid: string, limit = 500, afterTs?: number): StoredMessage[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json
+    FROM messages
+    WHERE instance = ?
+      AND jid = ?
+      AND (? IS NULL OR ts >= ?)
+      AND (text != '' OR media_json IS NOT NULL)
+    ORDER BY ts ASC
+    LIMIT ?
+  `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit) as Array<{
+    msg_id: string;
+    from_me: number;
+    text: string;
+    ts: number;
+    sender_name: string | null;
+    sender_number: string | null;
+    participant: string | null;
+    media_json: string | null;
+    contact_json: string | null;
+  }>;
+
+  return rows.map((r) => ({
+    id: r.msg_id,
+    fromMe: r.from_me === 1,
+    text: r.text,
+    timestamp: r.ts,
+    senderName: r.sender_name ?? undefined,
+    senderNumber: r.sender_number ?? undefined,
+    participant: r.participant ?? undefined,
     media: parseJson<Record<string, unknown>>(r.media_json),
     contact: parseJson<Record<string, unknown>>(r.contact_json),
   }));
@@ -255,7 +347,7 @@ export function getOldestMessageTs(instance: string, jid: string): number {
 export function countMessages(instance: string, jid: string): number {
   const db = getDb();
   const row = db.prepare(
-    'SELECT COUNT(*) AS cnt FROM messages WHERE instance = ? AND jid = ?'
+    'SELECT message_count AS cnt FROM chat_meta WHERE instance = ? AND jid = ?'
   ).get(instance, jid) as { cnt: number };
   return row.cnt ?? 0;
 }

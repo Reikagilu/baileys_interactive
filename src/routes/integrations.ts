@@ -16,6 +16,7 @@ import {
   parseChatwootWebhook,
   type ChatwootWebhookPayload,
   invalidateConversationCache,
+  syncContactNamesToChatwoot,
 } from '../services/chatwoot-bridge.js';
 import {
   sendInstanceTextMessage,
@@ -116,6 +117,9 @@ router.patch('/:instance/chatwoot', (req: Request, res: Response) => {
     autoCreate: typeof body.autoCreate === 'boolean' ? body.autoCreate : undefined,
   });
 
+  // Note: history sync now happens ONLY on connection=open (see whatsapp.ts) or via manual button.
+  // Removed auto-sync on save to avoid re-syncing every time other flags toggle.
+
   writeAuditEvent(req, res, {
     action: 'integrations.chatwoot.update',
     target: instance,
@@ -201,6 +205,25 @@ router.post('/:instance/chatwoot/test', async (req: Request, res: Response) => {
   return sendOk(res, { tested: true, status: result.status ?? 200 });
 });
 
+router.post('/:instance/chatwoot/sync-contact-names', async (req: Request, res: Response) => {
+  const instance = getInstanceParam(req, res);
+  if (!instance) return;
+
+  const result = await syncContactNamesToChatwoot(instance);
+  writeAuditEvent(req, res, {
+    action: 'integrations.chatwoot.sync_contact_names',
+    target: instance,
+    outcome: result.ok ? 'success' : 'failure',
+    details: result,
+  });
+
+  if (!result.ok) {
+    return sendError(res, 400, result.error || 'chatwoot_sync_contact_names_failed');
+  }
+
+  return sendOk(res, { result });
+});
+
 router.post('/:instance/n8n/test', async (req: Request, res: Response) => {
   const instance = getInstanceParam(req, res);
   if (!instance) return;
@@ -262,7 +285,7 @@ router.post('/:instance/chatwoot/webhook', async (req: Request, res: Response) =
   const action = parseChatwootWebhook(body);
   if (!action) return;
 
-  const { jid, text, mediaUrl, mimeType, fileName } = action;
+  const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
 
   try {
     if (mediaUrl) {
@@ -271,9 +294,16 @@ router.post('/:instance/chatwoot/webhook', async (req: Request, res: Response) =
         mimeType,
         fileName,
         caption: text || undefined,
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
       });
     } else if (text) {
-      await sendInstanceTextMessage(instance, jid, text);
+      await sendInstanceTextMessage(instance, jid, text, {
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
+      });
     }
   } catch (err) {
     console.error(`[chatwoot-webhook][${instance}] dispatch error`, err);

@@ -18,9 +18,10 @@ import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
 import { normalizeInstanceName } from './utils/helpers.js';
 import { verifyMediaUrlToken } from './utils/media-signature.js';
-import { parseChatwootWebhook, type ChatwootWebhookPayload, invalidateConversationCache } from './services/chatwoot-bridge.js';
+import { parseChatwootWebhook, type ChatwootWebhookPayload, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot } from './services/chatwoot-bridge.js';
+import { getSyncProgress, requestSyncCancel } from './services/chatwoot-sync-store.js';
 import { sendInstanceTextMessage, sendInstanceMediaMessage } from './services/whatsapp.js';
-import { getInstanceIntegrations } from './services/integrations.js';
+import { getInstanceIntegrations, findInstanceByWebhookSlug } from './services/integrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const swaggerAssetsDir = swaggerUiDist.getAbsoluteFSPath();
@@ -107,7 +108,8 @@ app.get('/v1/media/:instance/:mediaId', (req, res) => {
     req.query.sig
   );
   if (!verification.ok) {
-    return sendError(res, verification.error === 'expired_token' ? 410 : 401, verification.error);
+    const verErr = (verification as { ok: false; error: string }).error;
+    return sendError(res, verErr === 'expired_token' ? 410 : 401, verErr);
   }
 
   const media = getInstanceChatMediaBinary(instance, mediaId);
@@ -118,6 +120,63 @@ app.get('/v1/media/:instance/:mediaId', (req, res) => {
   res.setHeader('Cache-Control', 'private, max-age=60');
   res.setHeader('Content-Type', media.mimeType);
   return res.status(200).send(media.bytes);
+});
+
+// ─── Chatwoot webhook por slug: compatível com Evolution API (/chatwoot/webhook/:slug) ─
+// URL format: http://host/chatwoot/webhook/ScheerAdv
+app.post('/chatwoot/webhook/:slug', async (req, res) => {
+  const slug = String(req.params.slug ?? '').trim();
+  if (!slug) {
+    return res.status(400).json({ ok: false, error: 'invalid_slug' });
+  }
+
+  // Resolve slug → instance name
+  const instance = findInstanceByWebhookSlug(slug);
+  if (!instance) {
+    // Return 200 anyway to avoid Chatwoot retries for unconfigured slugs
+    return res.status(200).json({ ok: true, note: 'slug_not_mapped' });
+  }
+
+  // Ack immediately
+  res.status(200).json({ ok: true });
+
+  let integrationCfg;
+  try {
+    const integrations = getInstanceIntegrations(instance);
+    integrationCfg = integrations.chatwoot;
+  } catch {
+    return;
+  }
+
+  if (!integrationCfg.enabled) return;
+
+  const body = (req.body ?? {}) as ChatwootWebhookPayload;
+  const action = parseChatwootWebhook(body);
+  if (!action) return;
+
+  const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
+
+  try {
+    if (mediaUrl) {
+      await sendInstanceMediaMessage(instance, jid, {
+        mediaUrl,
+        mimeType,
+        fileName,
+        caption: text || undefined,
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
+      });
+    } else if (text) {
+      await sendInstanceTextMessage(instance, jid, text, {
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
+      });
+    }
+  } catch (err) {
+    console.error(`[chatwoot-webhook-slug][${instance}] dispatch error`, err);
+  }
 });
 
 // ─── Chatwoot webhook: sem API key (Chatwoot não suporta custom headers no webhook) ───
@@ -145,7 +204,7 @@ app.post('/v1/integrations/:instance/chatwoot/webhook', async (req, res) => {
   const action = parseChatwootWebhook(body);
   if (!action) return;
 
-  const { jid, text, mediaUrl, mimeType, fileName } = action;
+  const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
 
   try {
     if (mediaUrl) {
@@ -154,9 +213,16 @@ app.post('/v1/integrations/:instance/chatwoot/webhook', async (req, res) => {
         mimeType,
         fileName,
         caption: text || undefined,
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
       });
     } else if (text) {
-      await sendInstanceTextMessage(instance, jid, text);
+      await sendInstanceTextMessage(instance, jid, text, {
+        replyToId,
+        agentName: integrationCfg.signMessages ? agentName : undefined,
+        signDelimiter: integrationCfg.signDelimiter,
+      });
     }
   } catch (err) {
     console.error(`[chatwoot-webhook][${instance}] dispatch error`, err);
@@ -171,6 +237,57 @@ app.post('/v1/integrations/:instance/chatwoot/invalidate-cache', (req, res) => {
   }
   invalidateConversationCache(instance);
   return res.json({ ok: true, invalidated: true });
+});
+
+// ─── Force Auto Create: cria inbox no Chatwoot manualmente (com API key) ─────
+app.post('/v1/integrations/:instance/chatwoot/autocreate', requireApiKey(['integrations:*']), async (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  if (!instance) {
+    return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
+  }
+  try {
+    const result = await autoCreateChatwootInbox(instance);
+    return res.json({ ok: true, result });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+app.post('/v1/integrations/:instance/chatwoot/sync-history', requireApiKey(['integrations:*']), async (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  if (!instance) {
+    return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
+  }
+  const { jid, limit } = req.body as { jid?: string; limit?: number };
+  const limitPerChat = typeof limit === 'number' && limit > 0 ? Math.min(limit, 2000) : 200;
+  // Run in background and return immediately so UI can poll /sync-status
+  void (async () => {
+    try {
+      await syncHistoryToChatwoot(instance, jid ?? undefined, limitPerChat, 'manual');
+    } catch (err) {
+      console.error(`[chatwoot-bridge][${instance}] manual sync error:`, (err as Error).message);
+    }
+  })();
+  return res.json({ ok: true, started: true, message: 'Sync started in background — poll /sync-status for progress' });
+});
+
+app.get('/v1/integrations/:instance/chatwoot/sync-status', requireApiKey(['integrations:*']), (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  if (!instance) {
+    return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
+  }
+  const progress = getSyncProgress(instance);
+  return res.json({ ok: true, progress });
+});
+
+app.post('/v1/integrations/:instance/chatwoot/sync-cancel', requireApiKey(['integrations:*']), (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  if (!instance) {
+    return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
+  }
+  const cancelled = requestSyncCancel(instance);
+  return res.json({ ok: true, cancelled });
 });
 
 // API key só nas rotas /v1 (a interface em / carrega sem key)
