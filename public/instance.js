@@ -702,7 +702,6 @@
       state.renderedMessagesMeta = [];
       state.loadedChatJid = state.selectedChatJid;
       state.loadedMessagesMeta = [];
-      el.chatMessages.innerHTML = '';
       el.chatMessages.innerHTML = `<div class="chat-empty-thread">Sem mensagens. Use Histórico para sincronizar.</div>`;
       return;
     }
@@ -871,8 +870,7 @@
       autoResizeComposer();
       state.loadedChatJid = '';
       state.loadedMessagesMeta = [];
-      await loadChatMessages();
-      await loadChats();
+      await Promise.all([loadChatMessages(), loadChats()]);
       el.chatComposerInput.focus();
     } catch (err) {
       setText(el.chatHeaderMeta, err.message || 'Erro de rede.');
@@ -909,8 +907,7 @@
       }
       state.loadedChatJid = '';
       state.loadedMessagesMeta = [];
-      await loadChatMessages();
-      await loadChats();
+      await Promise.all([loadChatMessages(), loadChats()]);
     } catch (err) { setText(el.chatHeaderMeta, err.message || 'Erro de rede.'); }
     finally { [el.btnSyncChatHistory, el.btnSyncSelectedHistory].forEach((b) => { if (b) b.disabled = false; }); }
   }
@@ -1260,8 +1257,11 @@
           } else {
             await loadHeaderStatus();
             if (state.activeSection === 'chat') {
-              await loadChats();
-              if (state.selectedChatJid) await loadChatMessages();
+              if (state.selectedChatJid) {
+                await Promise.all([loadChats(), loadChatMessages()]);
+              } else {
+                await loadChats();
+              }
             }
           }
         } finally {

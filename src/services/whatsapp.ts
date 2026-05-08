@@ -119,6 +119,7 @@ interface CachedChat {
 
 const chatCache = new Map<string, Map<string, CachedChat>>();
 const chatMediaBinaryStore = new Map<string, CachedMediaBinary>();
+const chatMediaEnsureInFlight = new Map<string, Promise<void>>();
 
 function buildMediaUrl(instance: string, mediaId: string): string {
   const exp = Math.floor(Date.now() / 1000) + config.media.signedUrlTtlSeconds;
@@ -2127,6 +2128,38 @@ export function getInstanceChatList(name: string): Array<{
   // Chats do SQLite que não estão em memória ainda aparecem na lista
   const memChats = chatCache.get(name);
   const dbChats = (() => { try { return msListChats(name); } catch { return []; } })();
+  const isLastTimestampSortedDesc = (list: Array<{ lastTimestamp: number }>): boolean => {
+    for (let i = 1; i < list.length; i += 1) {
+      if ((list[i - 1]?.lastTimestamp ?? 0) < (list[i]?.lastTimestamp ?? 0)) return false;
+    }
+    return true;
+  };
+
+  // Fast path: sem chats em memória, o SQLite já entrega a lista ordenada.
+  if (!memChats || memChats.size === 0) {
+    return dbChats.map((c) => ({
+      jid: c.jid,
+      title: c.title || c.jid.split('@')[0],
+      unreadCount: c.unreadCount,
+      messageCount: c.messageCount,
+      lastMessage: c.lastMessage,
+      lastTimestamp: c.lastTimestamp,
+    }));
+  }
+
+  if (dbChats.length === 0) {
+    const memOnly = Array.from(memChats.values(), (chat) => ({
+      jid: chat.jid,
+      title: chat.title || chat.jid.split('@')[0],
+      unreadCount: chat.unreadCount,
+      messageCount: chat.messages.length,
+      lastMessage: chat.lastMessage || '',
+      lastTimestamp: chat.lastTimestamp,
+    }));
+    return isLastTimestampSortedDesc(memOnly)
+      ? memOnly
+      : memOnly.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+  }
 
   const result = new Map<string, {
     jid: string; title: string; unreadCount: number;
@@ -2161,7 +2194,10 @@ export function getInstanceChatList(name: string): Array<{
     }
   }
 
-  return [...result.values()].sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+  const merged = [...result.values()];
+  return isLastTimestampSortedDesc(merged)
+    ? merged
+    : merged.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
 }
 
 function toPublicCachedMessage(instance: string, message: CachedMessageInternal): CachedMessage {
@@ -2188,38 +2224,76 @@ function toPublicCachedMessage(instance: string, message: CachedMessageInternal)
 async function ensureCachedMessageMedia(instance: string, message: CachedMessageInternal): Promise<void> {
   if (!message.media || message.media.base64 || message.media.omittedReason || !message.mediaSource) return;
 
-  const downloaded = await downloadMediaBase64(message.mediaSource.node, message.mediaSource.kind, 'chat');
-  if (downloaded?.base64) {
-    const nextMimeType = message.media.mimeType ?? message.mediaSource.node.mimetype;
-    if (!isSafeInlineMime(message.mediaSource.kind, typeof nextMimeType === 'string' ? nextMimeType : undefined)) {
-      message.media = {
-        ...message.media,
-        omittedReason: 'download_failed',
-      };
-      return;
-    }
-
-    message.media = {
-      ...message.media,
-      base64: downloaded.base64,
-      bytes: downloaded.bytes,
-    };
-
-    message.media = storeMediaBinary(instance, message.media);
+  const lockKey = `${instance}:${message.id}`;
+  const existing = chatMediaEnsureInFlight.get(lockKey);
+  if (existing) {
+    await existing;
     return;
   }
 
-  if (downloaded?.omittedReason) {
-    message.media = {
-      ...message.media,
-      omittedReason: downloaded.omittedReason,
-    };
+  const request = (async () => {
+    const downloaded = await downloadMediaBase64(message.mediaSource.node, message.mediaSource.kind, 'chat');
+    if (downloaded?.base64) {
+      const nextMimeType = message.media?.mimeType ?? message.mediaSource.node.mimetype;
+      if (!isSafeInlineMime(message.mediaSource.kind, typeof nextMimeType === 'string' ? nextMimeType : undefined)) {
+        message.media = {
+          ...message.media,
+          omittedReason: 'download_failed',
+        };
+        return;
+      }
+
+      message.media = {
+        ...message.media,
+        base64: downloaded.base64,
+        bytes: downloaded.bytes,
+      };
+
+      message.media = storeMediaBinary(instance, message.media);
+      return;
+    }
+
+    if (downloaded?.omittedReason) {
+      message.media = {
+        ...message.media,
+        omittedReason: downloaded.omittedReason,
+      };
+    }
+  })();
+
+  chatMediaEnsureInFlight.set(lockKey, request);
+  try {
+    await request;
+  } finally {
+    chatMediaEnsureInFlight.delete(lockKey);
   }
 }
 
 function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessageInternal[] {
   const chats = chatCache.get(name);
   const memMessages = chats?.get(jid)?.messages ?? [];
+
+  const isTimestampSorted = (list: CachedMessageInternal[]): boolean => {
+    for (let i = 1; i < list.length; i += 1) {
+      if ((list[i - 1]?.timestamp ?? 0) > (list[i]?.timestamp ?? 0)) return false;
+    }
+    return true;
+  };
+
+  const mergeSortedMessages = (left: CachedMessageInternal[], right: CachedMessageInternal[]): CachedMessageInternal[] => {
+    if (left.length === 0) return right;
+    if (right.length === 0) return left;
+    const merged: CachedMessageInternal[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < left.length && j < right.length) {
+      if ((left[i]?.timestamp ?? 0) <= (right[j]?.timestamp ?? 0)) merged.push(left[i++]);
+      else merged.push(right[j++]);
+    }
+    while (i < left.length) merged.push(left[i++]);
+    while (j < right.length) merged.push(right[j++]);
+    return merged;
+  };
 
   const mapStoredMessage = (m: {
     id: string;
@@ -2248,6 +2322,7 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
     try {
       const stored = msListMessages(name, jid, config.messages.maxPerChat);
       if (stored.length > 0) {
+        const mappedStored = stored.map(mapStoredMessage);
         // Carrega no cache de memória para uso futuro
         const map = ensureInstanceChatMap(name);
         const existing = map.get(jid);
@@ -2258,15 +2333,15 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
             unreadCount: 0,
             lastMessage: stored[stored.length - 1]?.text ?? '',
             lastTimestamp: stored[stored.length - 1]?.timestamp ?? 0,
-            messages: stored.map(mapStoredMessage),
+            messages: mappedStored,
           });
         }
-        return stored.map(mapStoredMessage);
+        return mappedStored;
       }
     } catch {
       // best-effort
     }
-    return memMessages.slice().sort((a, b) => a.timestamp - b.timestamp);
+    return isTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
   }
 
   // Mescla memória + SQLite para garantir mensagens históricas não em memória
@@ -2277,18 +2352,18 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
       const memIds = new Set(memMessages.map((m) => m.id));
       const extra = stored.filter((m) => !memIds.has(m.id));
       if (extra.length > 0) {
-        const allMessages: CachedMessageInternal[] = [
-          ...memMessages,
-          ...extra.map(mapStoredMessage),
-        ];
-        return allMessages.sort((a, b) => a.timestamp - b.timestamp);
+        const mappedExtra = extra.map(mapStoredMessage);
+        const baseMessages = isTimestampSorted(memMessages)
+          ? memMessages
+          : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
+        return mergeSortedMessages(baseMessages, mappedExtra);
       }
     }
   } catch {
     // best-effort
   }
 
-  return [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
+  return isTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
 }
 
 function buildQuotedMessage(name: string, jid: string, replyToId: string): Record<string, unknown> | null {
@@ -2346,9 +2421,7 @@ export async function getInstanceChatMessagesWithMedia(
   const list = onlyIds?.size
     ? source.filter((message) => onlyIds.has(message.id))
     : source;
-  for (const message of list) {
-    await ensureCachedMessageMedia(name, message);
-  }
+  await Promise.all(list.map((message) => ensureCachedMessageMedia(name, message)));
   return list.map((item) => toPublicCachedMessage(name, item));
 }
 

@@ -14,12 +14,11 @@
  */
 
 import { getInstanceIntegrations, updateChatwootConfig } from './integrations.js';
-import { listChats, listSyncMessages, getChatTitle } from './message-store.js';
+import { listChats, listUnsyncedSyncMessages, getChatTitle } from './message-store.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
 import {
   beginMessageSync,
   finishMessageSync,
-  getUnsyncedMessageIds,
   isMessageSynced,
   markMessageSynced,
   startSyncProgress,
@@ -725,7 +724,7 @@ export async function dispatchToChatwoot(
       continue;
     }
     try {
-      const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg);
+      const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
       if (msgId && !result.skipped && result.conversationId) {
         markMessageSynced(instanceName, msgId, result.conversationId);
       }
@@ -783,12 +782,12 @@ async function dispatchSingleMessage(
   cfg: Awaited<ReturnType<typeof getInstanceIntegrations>>['chatwoot'],
   inbox: CwInbox,
   msg: NormalizedMessage,
-  options: { isHistorical?: boolean } = {},
+  options: { isHistorical?: boolean; skipPersistedDedupCheck?: boolean } = {},
 ): Promise<{ skipped: boolean; conversationId?: number }> {
   const { key, pushName, media, sender } = msg;
   if (!key?.remoteJid || !key?.id) return { skipped: true };
 
-  if (isMessageSynced(instanceName, key.id)) return { skipped: true };
+  if (!options.skipPersistedDedupCheck && isMessageSynced(instanceName, key.id)) return { skipped: true };
 
   const remoteJid = key.remoteJid;
 
@@ -1500,7 +1499,7 @@ export async function syncHistoryToChatwoot(
 
       const chat = chats[i];
       // Pass afterTs to filter messages by date
-      const candidateMessages = listSyncMessages(instanceName, chat.jid, limitPerChat, afterTs);
+      const pendingMessages = listUnsyncedSyncMessages(instanceName, chat.jid, limitPerChat, afterTs);
 
       // Update progress with current chat info
       const chatTitle = chat.title || getChatTitle(instanceName, chat.jid);
@@ -1508,27 +1507,13 @@ export async function syncHistoryToChatwoot(
         currentChatJid: chat.jid,
         currentChatTitle: chatTitle,
         processedChats: i,
-        totalMessages: candidateMessages.length,
+        totalMessages: pendingMessages.length,
       });
 
-      if (candidateMessages.length === 0) {
+      if (pendingMessages.length === 0) {
         updateSyncProgress(instanceName, { processedChats: i + 1 });
         continue;
       }
-
-      const unsyncedIds = getUnsyncedMessageIds(instanceName, candidateMessages.map((item) => item.id));
-      if (unsyncedIds.size === 0) {
-        skipped += candidateMessages.length;
-        progressDirty = true;
-        updateSyncProgress(instanceName, {
-          skippedMessages: skipped,
-          processedChats: i + 1,
-        });
-        continue;
-      }
-
-      const candidateIds = new Set(Array.from(unsyncedIds));
-      const pendingMessages = candidateMessages.filter((stored) => candidateIds.has(stored.id));
       const hydrateIds = new Set(
         pendingMessages
           .filter((stored) => {
@@ -1594,7 +1579,10 @@ export async function syncHistoryToChatwoot(
         };
 
         try {
-          const result = await dispatchSingleMessage(instanceName, cwCfg, historyCfg, inbox, normalized, { isHistorical: true });
+          const result = await dispatchSingleMessage(instanceName, cwCfg, historyCfg, inbox, normalized, {
+            isHistorical: true,
+            skipPersistedDedupCheck: true,
+          });
           if (!result.skipped && result.conversationId) {
             // Mark as synced ONLY when actually delivered to Chatwoot
             markMessageSynced(instanceName, stored.id, result.conversationId);

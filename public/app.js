@@ -68,8 +68,10 @@
   const sections = document.querySelectorAll('section.section');
   const topbarTitle = document.getElementById('topbarTitle');
   const TAB_TITLES = { conexoes: 'Instâncias', disparos: 'Disparos', integracoes: 'Integrações' };
+  let activeTabName = 'conexoes';
 
   function activateTab(name) {
+    activeTabName = name;
     navBtns.forEach((b) => {
       const active = b.dataset.tab === name;
       b.classList.toggle('active', active);
@@ -113,11 +115,29 @@
     active: document.getElementById('statActiveCount'),
     connected: document.getElementById('statConnectedCount'),
   };
+  const dispatchInstanceEl = document.getElementById('dispatchInstance');
+  const integrationInstanceEl = document.getElementById('integrationInstance');
+  const syncUi = {
+    panel: document.getElementById('chatwootSyncProgress'),
+    badge: document.getElementById('chatwootSyncBadge'),
+    fill: document.getElementById('chatwootSyncFill'),
+    current: document.getElementById('chatwootSyncCurrent'),
+    chats: document.getElementById('chatwootSyncChats'),
+    sent: document.getElementById('chatwootSyncSent'),
+    skipped: document.getElementById('chatwootSyncSkipped'),
+    errors: document.getElementById('chatwootSyncErrors'),
+    cancel: document.getElementById('btnCancelSyncChatwoot'),
+  };
 
   let lastInstanceListMeta = { saved: [], instances: [] };
+  let lastConnectSelectMeta = [];
+  let lastDispatchSelectMeta = [];
+  let lastIntegrationSelectMeta = [];
   let instancePollHandle = null;
   let instancePollBusy = false;
   let syncPollBusy = false;
+  let instanceListEmpty = true;
+  const instanceNodesByKey = new Map();
 
   function instanceListMeta(saved, instances) {
     return {
@@ -145,6 +165,89 @@
     return true;
   }
 
+  function instanceRowKey(item) {
+    return `${item.name}|${item.status}|${item.saved ? 1 : 0}`;
+  }
+
+  function renderInstanceActions(item) {
+    const frag = document.createDocumentFragment();
+    const appendButton = (label, cls, action, title) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = cls;
+      btn.dataset.action = action;
+      btn.dataset.name = item.name;
+      btn.textContent = label;
+      if (title) btn.title = title;
+      frag.appendChild(btn);
+    };
+
+    if (item.status !== 'saved') {
+      const link = document.createElement('a');
+      link.className = 'btn btn-primary btn-sm';
+      link.href = `/instance.html?instance=${encodeURIComponent(item.name)}`;
+      link.textContent = 'Painel';
+      frag.appendChild(link);
+      if (item.status === 'qr') appendButton('Ver QR', 'btn btn-secondary btn-sm', 'qr');
+      if (item.status === 'connected') appendButton('Disconnect', 'btn btn-secondary btn-sm', 'disconnect');
+      appendButton('Logout', 'btn btn-ghost btn-sm', 'logout', 'Limpa sessão (novo QR)');
+      appendButton('Deletar', 'btn btn-danger btn-sm', 'delete');
+    } else {
+      appendButton('Conectar', 'btn btn-primary btn-sm', 'connect-saved');
+      appendButton('Excluir', 'btn btn-danger btn-sm', 'logout', 'Excluir sessão salva');
+    }
+
+    return frag;
+  }
+
+  function createInstanceRow(item) {
+    const li = document.createElement('li');
+    li.className = 'list-item';
+
+    const info = document.createElement('div');
+    info.className = 'list-item-info';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar-circle';
+    avatar.textContent = (item.name[0] || '?').toUpperCase();
+
+    const copy = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'list-item-name';
+    name.textContent = item.name;
+    const pill = document.createElement('span');
+    pill.className = 'status-pill';
+
+    copy.appendChild(name);
+    copy.appendChild(pill);
+    info.appendChild(avatar);
+    info.appendChild(copy);
+
+    const actions = document.createElement('div');
+    actions.className = 'list-item-actions';
+
+    li.appendChild(info);
+    li.appendChild(actions);
+
+    li.__refs = { name, pill, actions, avatar };
+    return li;
+  }
+
+  function applyInstanceRow(node, item) {
+    const refs = node.__refs;
+    const sCls =
+      item.status === 'connected' ? 'state-connected' :
+      item.status === 'qr' ? 'state-qr' :
+      item.status === 'pairing' ? 'state-pairing' :
+      item.status === 'connecting' ? 'state-connecting' : 'state-disconnected';
+    const statusText = item.status === 'saved' ? 'salva (offline)' : item.status;
+    refs.name.textContent = item.name;
+    refs.avatar.textContent = (item.name[0] || '?').toUpperCase();
+    refs.pill.className = `status-pill ${sCls}`;
+    refs.pill.textContent = statusText;
+    refs.actions.replaceChildren(renderInstanceActions(item));
+  }
+
   function renderUnifiedList(saved, instances) {
     const activeNames = new Set(instances.map((i) => i.instance));
     const items = [];
@@ -153,48 +256,44 @@
     items.sort((a, b) => a.name.localeCompare(b.name));
 
     if (items.length === 0) {
+      instanceNodesByKey.clear();
       instanceListEl.innerHTML = '<li class="list-empty">Nenhuma instância. Crie uma usando o painel à direita.</li>';
+      instanceListEmpty = true;
       return;
     }
 
-    instanceListEl.innerHTML = items.map((it) => {
-      const sCls =
-        it.status === 'connected' ? 'state-connected' :
-        it.status === 'qr' ? 'state-qr' :
-        it.status === 'pairing' ? 'state-pairing' :
-        it.status === 'connecting' ? 'state-connecting' : 'state-disconnected';
-      const actions = [];
-      if (it.status !== 'saved') {
-        actions.push(`<a class="btn btn-primary btn-sm" href="/instance.html?instance=${encodeURIComponent(it.name)}">Painel</a>`);
-        if (it.status === 'qr') actions.push(`<button class="btn btn-secondary btn-sm" data-action="qr" data-name="${escapeHtml(it.name)}">Ver QR</button>`);
-        if (it.status === 'connected') actions.push(`<button class="btn btn-secondary btn-sm" data-action="disconnect" data-name="${escapeHtml(it.name)}">Disconnect</button>`);
-        actions.push(`<button class="btn btn-ghost btn-sm" data-action="logout" data-name="${escapeHtml(it.name)}" title="Limpa sessão (novo QR)">Logout</button>`);
-        actions.push(`<button class="btn btn-danger btn-sm" data-action="delete" data-name="${escapeHtml(it.name)}">Deletar</button>`);
-      } else {
-        actions.push(`<button class="btn btn-primary btn-sm" data-action="connect-saved" data-name="${escapeHtml(it.name)}">Conectar</button>`);
-        actions.push(`<button class="btn btn-danger btn-sm" data-action="logout" data-name="${escapeHtml(it.name)}" title="Excluir sessão salva">Excluir</button>`);
-      }
-      const statusText = it.status === 'saved' ? 'salva (offline)' : it.status;
-      return `<li class="list-item">
-        <div class="list-item-info">
-          <div class="avatar-circle">${escapeHtml((it.name[0] || '?').toUpperCase())}</div>
-          <div>
-            <div class="list-item-name">${escapeHtml(it.name)}</div>
-            <span class="status-pill ${sCls}">${escapeHtml(statusText)}</span>
-          </div>
-        </div>
-        <div class="list-item-actions">${actions.join('')}</div>
-      </li>`;
-    }).join('');
+    instanceListEmpty = false;
+    const fragment = document.createDocumentFragment();
+    const nextNodes = new Map();
+    for (const item of items) {
+      const key = instanceRowKey(item);
+      const node = instanceNodesByKey.get(key) || createInstanceRow(item);
+      applyInstanceRow(node, item);
+      nextNodes.set(key, node);
+      fragment.appendChild(node);
+    }
+    instanceListEl.replaceChildren(fragment);
+    instanceNodesByKey.clear();
+    nextNodes.forEach((node, key) => instanceNodesByKey.set(key, node));
   }
 
   function updateOverview(saved, instances) {
+    let connectedCount = 0;
+    for (const item of instances) {
+      if (item.status === 'connected') connectedCount += 1;
+    }
     if (stat.saved) stat.saved.textContent = saved.length;
     if (stat.active) stat.active.textContent = instances.length;
-    if (stat.connected) stat.connected.textContent = instances.filter((s) => s.status === 'connected').length;
+    if (stat.connected) stat.connected.textContent = connectedCount;
   }
 
   function updateConnectSelect(saved) {
+    const meta = [''].concat(saved);
+    if (sameSimpleList(meta, lastConnectSelectMeta) && (connectInstanceSelectEl.value === '' || saved.includes(connectInstanceSelectEl.value))) {
+      show(connectNewNameRow, !connectInstanceSelectEl.value);
+      return;
+    }
+    lastConnectSelectMeta = meta;
     const cur = connectInstanceSelectEl.value;
     const opts = ['<option value="">— Nova conexão —</option>']
       .concat(saved.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`));
@@ -203,14 +302,18 @@
   }
 
   function updateDispatchSelect(allNames) {
-    const sel = document.getElementById('dispatchInstance');
+    const sel = dispatchInstanceEl;
+    if (sameSimpleList(allNames, lastDispatchSelectMeta) && (!sel.value || allNames.includes(sel.value))) return;
+    lastDispatchSelectMeta = allNames.slice();
     const cur = sel.value;
     const opts = allNames.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`);
     sel.innerHTML = opts.length ? opts.join('') : '<option value="main">main</option>';
   }
 
   function updateIntegrationSelect(allNames) {
-    const sel = document.getElementById('integrationInstance');
+    const sel = integrationInstanceEl;
+    if (sameSimpleList(allNames, lastIntegrationSelectMeta) && (!sel.value || allNames.includes(sel.value))) return;
+    lastIntegrationSelectMeta = allNames.slice();
     const cur = sel.value;
     const opts = allNames.map((n) => `<option value="${escapeHtml(n)}"${cur === n ? ' selected' : ''}>${escapeHtml(n)}</option>`);
     sel.innerHTML = opts.length ? opts.join('') : '<option value="main">main</option>';
@@ -294,7 +397,7 @@
         show(connectNewNameRow, false);
         await doConnect(name);
       }
-      lastInstanceListMeta = { saved: [], instances: [] }; // force render
+      resetInstanceUiMeta(); // force render
       await refreshInstanceList();
     } catch (err) {
       setResult(connectStatusEl, err.message || 'Erro de rede.', 'error');
@@ -304,7 +407,7 @@
   });
 
   document.getElementById('btnRefreshList').addEventListener('click', () => {
-    lastInstanceListMeta = { saved: [], instances: [] };
+    resetInstanceUiMeta();
     refreshInstanceList();
   });
 
@@ -382,7 +485,7 @@
     } catch (err) {
       setResult(connectStatusEl, err.message || 'Erro de rede.', 'error');
     }
-    lastInstanceListMeta = { saved: [], instances: [] };
+    resetInstanceUiMeta();
     refreshInstanceList();
   }
 
@@ -669,46 +772,75 @@
   });
 
   // ============ Integrations (index — Chatwoot + n8n) ============
-  const integrationInstanceEl = document.getElementById('integrationInstance');
   const integrationStatusEl = document.getElementById('integrationStatus');
   const chatwootResultEl = document.getElementById('chatwootResult');
   const n8nResultEl = document.getElementById('n8nResult');
+  const intUi = {
+    chatwoot: {
+      enabled: document.getElementById('chatwootEnabled'),
+      baseUrl: document.getElementById('chatwootBaseUrl'),
+      accountId: document.getElementById('chatwootAccountId'),
+      inboxId: document.getElementById('chatwootInboxId'),
+      token: document.getElementById('chatwootToken'),
+      signMessages: document.getElementById('chatwootSignMessages'),
+      signDelimiter: document.getElementById('chatwootSignDelimiter'),
+      nameInbox: document.getElementById('chatwootNameInbox'),
+      webhookSlug: document.getElementById('chatwootWebhookSlug'),
+      organization: document.getElementById('chatwootOrganization'),
+      logoUrl: document.getElementById('chatwootLogoUrl'),
+      conversationPending: document.getElementById('chatwootConversationPending'),
+      reopenConversation: document.getElementById('chatwootReopenConversation'),
+      importContacts: document.getElementById('chatwootImportContacts'),
+      importMessages: document.getElementById('chatwootImportMessages'),
+      daysLimit: document.getElementById('chatwootDaysLimit'),
+      ignoreJids: document.getElementById('chatwootIgnoreJids'),
+      autoCreate: document.getElementById('chatwootAutoCreate'),
+      webhookUrl: document.getElementById('chatwootWebhookUrl'),
+      webhookInfo: document.getElementById('chatwootWebhookInfo'),
+    },
+    n8n: {
+      enabled: document.getElementById('n8nEnabled'),
+      webhookUrl: document.getElementById('n8nWebhookUrl'),
+      authHeaderName: document.getElementById('n8nAuthHeaderName'),
+      authHeaderValue: document.getElementById('n8nAuthHeaderValue'),
+    },
+  };
 
   // Sync progress polling state
   let syncPollHandle = null;
 
   function fillIntegrationsForm(integration) {
     const cw = integration?.chatwoot || {};
-    document.getElementById('chatwootEnabled').checked = !!cw.enabled;
-    document.getElementById('chatwootBaseUrl').value = cw.baseUrl || '';
-    document.getElementById('chatwootAccountId').value = cw.accountId || '';
-    document.getElementById('chatwootInboxId').value = cw.inboxId || '';
-    document.getElementById('chatwootToken').value = cw.apiAccessToken || '';
-    document.getElementById('chatwootSignMessages').checked = !!cw.signMessages;
-    document.getElementById('chatwootSignDelimiter').value = cw.signDelimiter || '';
-    document.getElementById('chatwootNameInbox').value = cw.nameInbox || '';
-    document.getElementById('chatwootWebhookSlug').value = cw.webhookSlug || '';
-    document.getElementById('chatwootOrganization').value = cw.organization || '';
-    document.getElementById('chatwootLogoUrl').value = cw.logoUrl || '';
-    document.getElementById('chatwootConversationPending').checked = !!cw.conversationPending;
-    document.getElementById('chatwootReopenConversation').checked = cw.reopenConversation !== false;
-    document.getElementById('chatwootImportContacts').checked = !!cw.importContacts;
-    document.getElementById('chatwootImportMessages').checked = cw.importMessages !== false;
-    document.getElementById('chatwootDaysLimit').value = cw.daysLimitImportMessages || 7;
-    document.getElementById('chatwootIgnoreJids').value = Array.isArray(cw.ignoreJids) ? cw.ignoreJids.join('\n') : '';
-    document.getElementById('chatwootAutoCreate').checked = !!cw.autoCreate;
+    intUi.chatwoot.enabled.checked = !!cw.enabled;
+    intUi.chatwoot.baseUrl.value = cw.baseUrl || '';
+    intUi.chatwoot.accountId.value = cw.accountId || '';
+    intUi.chatwoot.inboxId.value = cw.inboxId || '';
+    intUi.chatwoot.token.value = cw.apiAccessToken || '';
+    intUi.chatwoot.signMessages.checked = !!cw.signMessages;
+    intUi.chatwoot.signDelimiter.value = cw.signDelimiter || '';
+    intUi.chatwoot.nameInbox.value = cw.nameInbox || '';
+    intUi.chatwoot.webhookSlug.value = cw.webhookSlug || '';
+    intUi.chatwoot.organization.value = cw.organization || '';
+    intUi.chatwoot.logoUrl.value = cw.logoUrl || '';
+    intUi.chatwoot.conversationPending.checked = !!cw.conversationPending;
+    intUi.chatwoot.reopenConversation.checked = cw.reopenConversation !== false;
+    intUi.chatwoot.importContacts.checked = !!cw.importContacts;
+    intUi.chatwoot.importMessages.checked = cw.importMessages !== false;
+    intUi.chatwoot.daysLimit.value = cw.daysLimitImportMessages || 7;
+    intUi.chatwoot.ignoreJids.value = Array.isArray(cw.ignoreJids) ? cw.ignoreJids.join('\n') : '';
+    intUi.chatwoot.autoCreate.checked = !!cw.autoCreate;
 
     const n8n = integration?.n8n || {};
-    document.getElementById('n8nEnabled').checked = !!n8n.enabled;
-    document.getElementById('n8nWebhookUrl').value = n8n.webhookUrl || '';
-    document.getElementById('n8nAuthHeaderName').value = n8n.authHeaderName || '';
-    document.getElementById('n8nAuthHeaderValue').value = n8n.authHeaderValue || '';
+    intUi.n8n.enabled.checked = !!n8n.enabled;
+    intUi.n8n.webhookUrl.value = n8n.webhookUrl || '';
+    intUi.n8n.authHeaderName.value = n8n.authHeaderName || '';
+    intUi.n8n.authHeaderValue.value = n8n.authHeaderValue || '';
 
     // Webhook URL display
     const slug = (cw.webhookSlug || integrationInstanceEl.value || 'main').trim();
     const url = `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
-    document.getElementById('chatwootWebhookUrl').textContent = url;
-    show(document.getElementById('chatwootWebhookInfo'), true);
+    intUi.chatwoot.webhookUrl.textContent = url;
+    show(intUi.chatwoot.webhookInfo, true);
   }
 
   async function loadIntegrationsForSelected() {
@@ -731,27 +863,27 @@
   }
 
   function buildChatwootBody() {
-    const ignoreJids = (document.getElementById('chatwootIgnoreJids').value || '')
+    const ignoreJids = (intUi.chatwoot.ignoreJids.value || '')
       .split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
     return {
-      enabled: document.getElementById('chatwootEnabled').checked,
-      baseUrl: document.getElementById('chatwootBaseUrl').value.trim(),
-      accountId: document.getElementById('chatwootAccountId').value.trim(),
-      inboxId: document.getElementById('chatwootInboxId').value.trim(),
-      apiAccessToken: document.getElementById('chatwootToken').value.trim(),
-      signMessages: document.getElementById('chatwootSignMessages').checked,
-      signDelimiter: document.getElementById('chatwootSignDelimiter').value,
-      nameInbox: document.getElementById('chatwootNameInbox').value.trim(),
-      webhookSlug: document.getElementById('chatwootWebhookSlug').value.trim(),
-      organization: document.getElementById('chatwootOrganization').value.trim(),
-      logoUrl: document.getElementById('chatwootLogoUrl').value.trim(),
-      conversationPending: document.getElementById('chatwootConversationPending').checked,
-      reopenConversation: document.getElementById('chatwootReopenConversation').checked,
-      importContacts: document.getElementById('chatwootImportContacts').checked,
-      importMessages: document.getElementById('chatwootImportMessages').checked,
-      daysLimitImportMessages: Number(document.getElementById('chatwootDaysLimit').value) || 7,
+      enabled: intUi.chatwoot.enabled.checked,
+      baseUrl: intUi.chatwoot.baseUrl.value.trim(),
+      accountId: intUi.chatwoot.accountId.value.trim(),
+      inboxId: intUi.chatwoot.inboxId.value.trim(),
+      apiAccessToken: intUi.chatwoot.token.value.trim(),
+      signMessages: intUi.chatwoot.signMessages.checked,
+      signDelimiter: intUi.chatwoot.signDelimiter.value,
+      nameInbox: intUi.chatwoot.nameInbox.value.trim(),
+      webhookSlug: intUi.chatwoot.webhookSlug.value.trim(),
+      organization: intUi.chatwoot.organization.value.trim(),
+      logoUrl: intUi.chatwoot.logoUrl.value.trim(),
+      conversationPending: intUi.chatwoot.conversationPending.checked,
+      reopenConversation: intUi.chatwoot.reopenConversation.checked,
+      importContacts: intUi.chatwoot.importContacts.checked,
+      importMessages: intUi.chatwoot.importMessages.checked,
+      daysLimitImportMessages: Number(intUi.chatwoot.daysLimit.value) || 7,
       ignoreJids,
-      autoCreate: document.getElementById('chatwootAutoCreate').checked,
+      autoCreate: intUi.chatwoot.autoCreate.checked,
     };
   }
 
@@ -832,16 +964,16 @@
   }
 
   function renderSyncProgress(p) {
-    const panel = document.getElementById('chatwootSyncProgress');
-    const badge = document.getElementById('chatwootSyncBadge');
-    const fill = document.getElementById('chatwootSyncFill');
-    const cur = document.getElementById('chatwootSyncCurrent');
-    const elChats = document.getElementById('chatwootSyncChats');
-    const elSent = document.getElementById('chatwootSyncSent');
-    const elSkipped = document.getElementById('chatwootSyncSkipped');
-    const elErrors = document.getElementById('chatwootSyncErrors');
-    const btnCancel = document.getElementById('btnCancelSyncChatwoot');
-    if (!panel) return;
+    const panel = syncUi.panel;
+    const badge = syncUi.badge;
+    const fill = syncUi.fill;
+    const cur = syncUi.current;
+    const elChats = syncUi.chats;
+    const elSent = syncUi.sent;
+    const elSkipped = syncUi.skipped;
+    const elErrors = syncUi.errors;
+    const btnCancel = syncUi.cancel;
+    if (!panel || !badge || !fill || !cur || !elChats || !elSent || !elSkipped || !elErrors || !btnCancel) return;
 
     if (!p || p.status === 'idle') {
       show(panel, false);
@@ -918,8 +1050,7 @@
   function startInstancePolling() {
     if (instancePollHandle) clearTimeout(instancePollHandle);
     const run = async () => {
-      const activeTab = document.querySelector('.nav-btn.active')?.dataset.tab;
-      if (activeTab === 'conexoes' && !instancePollBusy) {
+      if (activeTabName === 'conexoes' && !instancePollBusy) {
         instancePollBusy = true;
         try {
           await refreshInstanceList();
@@ -946,10 +1077,10 @@
     if (!instance) return;
     try {
       const body = {
-        enabled: document.getElementById('n8nEnabled').checked,
-        webhookUrl: document.getElementById('n8nWebhookUrl').value.trim(),
-        authHeaderName: document.getElementById('n8nAuthHeaderName').value.trim(),
-        authHeaderValue: document.getElementById('n8nAuthHeaderValue').value.trim(),
+        enabled: intUi.n8n.enabled.checked,
+        webhookUrl: intUi.n8n.webhookUrl.value.trim(),
+        authHeaderName: intUi.n8n.authHeaderName.value.trim(),
+        authHeaderValue: intUi.n8n.authHeaderValue.value.trim(),
       };
       const r = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}/n8n`, {
         method: 'PATCH', headers: headers(), body: JSON.stringify(body),
@@ -978,3 +1109,9 @@
   refreshInstanceList();
   startInstancePolling();
 })();
+  function resetInstanceUiMeta() {
+    lastInstanceListMeta = { saved: [], instances: [] };
+    lastConnectSelectMeta = [];
+    lastDispatchSelectMeta = [];
+    lastIntegrationSelectMeta = [];
+  }
