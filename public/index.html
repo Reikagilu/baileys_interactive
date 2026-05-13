@@ -421,7 +421,20 @@
                 <div class="sync-stat"><div class="sync-stat-label">Chats</div><div class="sync-stat-value" id="chatwootSyncChats">0/0</div></div>
                 <div class="sync-stat"><div class="sync-stat-label">Enviadas</div><div class="sync-stat-value" id="chatwootSyncSent">0</div></div>
                 <div class="sync-stat"><div class="sync-stat-label">Já sincronizadas</div><div class="sync-stat-value" id="chatwootSyncSkipped">0</div></div>
-                <div class="sync-stat"><div class="sync-stat-label">Erros</div><div class="sync-stat-value" id="chatwootSyncErrors">0</div></div>
+                <div class="sync-stat sync-stat-clickable" id="chatwootSyncErrorsStat" role="button" tabindex="0" aria-haspopup="dialog" title="Clique para ver detalhes dos erros"><div class="sync-stat-label">Erros</div><div class="sync-stat-value" id="chatwootSyncErrors">0</div></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Modal: detalhes de erros do sync -->
+          <div id="syncErrorsModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="syncErrorsModalTitle">
+            <div class="modal-dialog">
+              <div class="modal-header">
+                <h3 id="syncErrorsModalTitle" class="modal-title">Erros do sync</h3>
+                <button type="button" class="modal-close" id="syncErrorsModalClose" aria-label="Fechar">&times;</button>
+              </div>
+              <div class="modal-body">
+                <div id="syncErrorsList" class="sync-errors-list">Sem erros registrados.</div>
               </div>
             </div>
           </div>

@@ -30,6 +30,7 @@ function getDb(): DatabaseSync {
   const db = new DatabaseSync(resolved);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chatwoot_synced (
       instance        TEXT NOT NULL,
@@ -43,8 +44,61 @@ function getDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_chatwoot_synced_instance
       ON chatwoot_synced (instance, synced_at)
   `);
+  // Tabela para rastrear mensagens originadas pelo Chatwoot (Chatwoot → WhatsApp).
+  // Usada para deduplicar quando a mensagem chega de volta via messages.upsert.
+  // Não é particionada por instance porque o msgId Baileys já é globalmente único
+  // dentro da nossa frota e o consumo é por id direto.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chatwoot_originated (
+      msg_id     TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chatwoot_originated_created
+      ON chatwoot_originated (created_at)
+  `);
   _db = db;
   return db;
+}
+
+// ─── Tracking persistido de mensagens originadas pelo Chatwoot ──────────────
+
+/** TTL de persistência: ~7 dias. Suficiente para qualquer atraso de entrega. */
+const CHATWOOT_ORIGINATED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let _lastOriginatedPrune = 0;
+
+export function persistChatwootOriginated(msgId: string): void {
+  if (!msgId) return;
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(
+    'INSERT OR REPLACE INTO chatwoot_originated (msg_id, created_at) VALUES (?, ?)'
+  ).run(msgId, now);
+  // Prune amortizado: a cada ~1h, remove entradas expiradas.
+  if (now - _lastOriginatedPrune > 60 * 60 * 1000) {
+    _lastOriginatedPrune = now;
+    try {
+      db.prepare('DELETE FROM chatwoot_originated WHERE created_at < ?')
+        .run(now - CHATWOOT_ORIGINATED_TTL_MS);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+export function isChatwootOriginatedPersisted(msgId: string): boolean {
+  if (!msgId) return false;
+  const db = getDb();
+  const row = db.prepare(
+    'SELECT created_at AS c FROM chatwoot_originated WHERE msg_id = ?'
+  ).get(msgId) as { c: number } | undefined;
+  if (!row) return false;
+  if (Date.now() - row.c > CHATWOOT_ORIGINATED_TTL_MS) {
+    try { db.prepare('DELETE FROM chatwoot_originated WHERE msg_id = ?').run(msgId); } catch { /* ignore */ }
+    return false;
+  }
+  return true;
 }
 
 // ─── Tracking persistido ─────────────────────────────────────────────────────
@@ -130,6 +184,21 @@ export function clearInstanceSyncTracking(instance: string): void {
 
 export type SyncStatus = 'idle' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
+export interface SyncErrorEntry {
+  /** Timestamp em ms quando o erro foi registrado. */
+  at: number;
+  /** JID do chat em que ocorreu (quando aplicável). */
+  jid: string | null;
+  /** Título do chat (cache para exibir na UI sem precisar olhar contatos). */
+  chatTitle: string | null;
+  /** ID da mensagem que falhou (Baileys), quando aplicável. */
+  msgId: string | null;
+  /** Mensagem de erro humana. */
+  error: string;
+  /** Contexto adicional (ex: "dispatch", "media-download", "history"). */
+  scope?: string;
+}
+
 export interface SyncProgress {
   status: SyncStatus;
   startedAt: number | null;
@@ -147,7 +216,11 @@ export interface SyncProgress {
   lastError: string | null;
   lastSyncedAt: number | null;
   lastSyncCount: number | null;
+  /** Últimos N erros detalhados (para popup da UI). Limitado para evitar bloat de memória. */
+  errors: SyncErrorEntry[];
 }
+
+const MAX_TRACKED_ERRORS = 200;
 
 const _progress = new Map<string, SyncProgress>();
 const _cancelFlags = new Map<string, boolean>();
@@ -170,7 +243,34 @@ function defaultProgress(): SyncProgress {
     lastError: null,
     lastSyncedAt: null,
     lastSyncCount: null,
+    errors: [],
   };
+}
+
+/**
+ * Anexa um erro detalhado à lista de erros do progresso atual e incrementa
+ * `errorCount`. Mantém apenas os MAX_TRACKED_ERRORS mais recentes.
+ */
+export function appendSyncError(instance: string, entry: Omit<SyncErrorEntry, 'at'> & { at?: number }): void {
+  if (!instance) return;
+  const cur = _progress.get(instance) ?? defaultProgress();
+  const full: SyncErrorEntry = {
+    at: entry.at ?? Date.now(),
+    jid: entry.jid ?? null,
+    chatTitle: entry.chatTitle ?? null,
+    msgId: entry.msgId ?? null,
+    error: entry.error,
+    scope: entry.scope,
+  };
+  const errors = cur.errors ? [...cur.errors, full] : [full];
+  // Mantém só os mais recentes — trim do início.
+  if (errors.length > MAX_TRACKED_ERRORS) errors.splice(0, errors.length - MAX_TRACKED_ERRORS);
+  _progress.set(instance, {
+    ...cur,
+    errors,
+    errorCount: (cur.errorCount ?? 0) + 1,
+    lastError: full.error,
+  });
 }
 
 export function getSyncProgress(instance: string): SyncProgress {

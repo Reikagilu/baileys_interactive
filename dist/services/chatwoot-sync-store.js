@@ -15,6 +15,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 // ─── DB ──────────────────────────────────────────────────────────────────────
 let _db = null;
+const _messageSyncInFlight = new Set();
 function getDb() {
     if (_db)
         return _db;
@@ -25,6 +26,7 @@ function getDb() {
     const db = new DatabaseSync(resolved);
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
+    db.exec('PRAGMA busy_timeout = 5000');
     db.exec(`
     CREATE TABLE IF NOT EXISTS chatwoot_synced (
       instance        TEXT NOT NULL,
@@ -38,8 +40,60 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_chatwoot_synced_instance
       ON chatwoot_synced (instance, synced_at)
   `);
+    // Tabela para rastrear mensagens originadas pelo Chatwoot (Chatwoot → WhatsApp).
+    // Usada para deduplicar quando a mensagem chega de volta via messages.upsert.
+    // Não é particionada por instance porque o msgId Baileys já é globalmente único
+    // dentro da nossa frota e o consumo é por id direto.
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS chatwoot_originated (
+      msg_id     TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chatwoot_originated_created
+      ON chatwoot_originated (created_at)
+  `);
     _db = db;
     return db;
+}
+// ─── Tracking persistido de mensagens originadas pelo Chatwoot ──────────────
+/** TTL de persistência: ~7 dias. Suficiente para qualquer atraso de entrega. */
+const CHATWOOT_ORIGINATED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let _lastOriginatedPrune = 0;
+export function persistChatwootOriginated(msgId) {
+    if (!msgId)
+        return;
+    const db = getDb();
+    const now = Date.now();
+    db.prepare('INSERT OR REPLACE INTO chatwoot_originated (msg_id, created_at) VALUES (?, ?)').run(msgId, now);
+    // Prune amortizado: a cada ~1h, remove entradas expiradas.
+    if (now - _lastOriginatedPrune > 60 * 60 * 1000) {
+        _lastOriginatedPrune = now;
+        try {
+            db.prepare('DELETE FROM chatwoot_originated WHERE created_at < ?')
+                .run(now - CHATWOOT_ORIGINATED_TTL_MS);
+        }
+        catch {
+            /* ignore */
+        }
+    }
+}
+export function isChatwootOriginatedPersisted(msgId) {
+    if (!msgId)
+        return false;
+    const db = getDb();
+    const row = db.prepare('SELECT created_at AS c FROM chatwoot_originated WHERE msg_id = ?').get(msgId);
+    if (!row)
+        return false;
+    if (Date.now() - row.c > CHATWOOT_ORIGINATED_TTL_MS) {
+        try {
+            db.prepare('DELETE FROM chatwoot_originated WHERE msg_id = ?').run(msgId);
+        }
+        catch { /* ignore */ }
+        return false;
+    }
+    return true;
 }
 // ─── Tracking persistido ─────────────────────────────────────────────────────
 /** Verifica se uma mensagem já foi sincronizada para o Chatwoot. */
@@ -50,6 +104,28 @@ export function isMessageSynced(instance, msgId) {
     const row = db.prepare('SELECT 1 AS x FROM chatwoot_synced WHERE instance = ? AND msg_id = ?').get(instance, msgId);
     return !!row;
 }
+/**
+ * Retorna apenas os msgIds que ainda NAO foram sincronizados.
+ * Faz a verificação em lote para reduzir round-trips SQLite durante syncs grandes.
+ */
+export function getUnsyncedMessageIds(instance, msgIds) {
+    if (!instance || msgIds.length === 0)
+        return new Set();
+    const db = getDb();
+    const pending = new Set(msgIds.filter(Boolean));
+    if (pending.size === 0)
+        return new Set();
+    const values = Array.from(pending);
+    const chunkSize = 400;
+    for (let i = 0; i < values.length; i += chunkSize) {
+        const chunk = values.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => '?').join(', ');
+        const rows = db.prepare(`SELECT msg_id FROM chatwoot_synced WHERE instance = ? AND msg_id IN (${placeholders})`).all(instance, ...chunk);
+        for (const row of rows)
+            pending.delete(row.msg_id);
+    }
+    return pending;
+}
 /** Marca mensagem como sincronizada (idempotente). */
 export function markMessageSynced(instance, msgId, conversationId) {
     if (!instance || !msgId)
@@ -59,6 +135,25 @@ export function markMessageSynced(instance, msgId, conversationId) {
     INSERT OR REPLACE INTO chatwoot_synced (instance, msg_id, conversation_id, synced_at)
     VALUES (?, ?, ?, ?)
   `).run(instance, msgId, conversationId | 0, Date.now());
+}
+function messageSyncKey(instance, msgId) {
+    return `${instance}:${msgId}`;
+}
+export function beginMessageSync(instance, msgId, skipPersistedCheck = false) {
+    if (!instance || !msgId)
+        return false;
+    if (!skipPersistedCheck && isMessageSynced(instance, msgId))
+        return false;
+    const key = messageSyncKey(instance, msgId);
+    if (_messageSyncInFlight.has(key))
+        return false;
+    _messageSyncInFlight.add(key);
+    return true;
+}
+export function finishMessageSync(instance, msgId) {
+    if (!instance || !msgId)
+        return;
+    _messageSyncInFlight.delete(messageSyncKey(instance, msgId));
 }
 /** Conta mensagens sincronizadas para uma instância. */
 export function countSyncedMessages(instance) {
@@ -71,6 +166,7 @@ export function clearInstanceSyncTracking(instance) {
     const db = getDb();
     db.prepare('DELETE FROM chatwoot_synced WHERE instance = ?').run(instance);
 }
+const MAX_TRACKED_ERRORS = 200;
 const _progress = new Map();
 const _cancelFlags = new Map();
 function defaultProgress() {
@@ -91,7 +187,35 @@ function defaultProgress() {
         lastError: null,
         lastSyncedAt: null,
         lastSyncCount: null,
+        errors: [],
     };
+}
+/**
+ * Anexa um erro detalhado à lista de erros do progresso atual e incrementa
+ * `errorCount`. Mantém apenas os MAX_TRACKED_ERRORS mais recentes.
+ */
+export function appendSyncError(instance, entry) {
+    if (!instance)
+        return;
+    const cur = _progress.get(instance) ?? defaultProgress();
+    const full = {
+        at: entry.at ?? Date.now(),
+        jid: entry.jid ?? null,
+        chatTitle: entry.chatTitle ?? null,
+        msgId: entry.msgId ?? null,
+        error: entry.error,
+        scope: entry.scope,
+    };
+    const errors = cur.errors ? [...cur.errors, full] : [full];
+    // Mantém só os mais recentes — trim do início.
+    if (errors.length > MAX_TRACKED_ERRORS)
+        errors.splice(0, errors.length - MAX_TRACKED_ERRORS);
+    _progress.set(instance, {
+        ...cur,
+        errors,
+        errorCount: (cur.errorCount ?? 0) + 1,
+        lastError: full.error,
+    });
 }
 export function getSyncProgress(instance) {
     return _progress.get(instance) ?? defaultProgress();

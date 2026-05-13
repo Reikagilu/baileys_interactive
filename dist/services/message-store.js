@@ -15,6 +15,15 @@ import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 // ─── Internos ────────────────────────────────────────────────────────────────
 let _db = null;
+let _stmts = null;
+function stmt(key, sql) {
+    const db = getDb();
+    if (!_stmts)
+        _stmts = {};
+    if (!_stmts[key])
+        _stmts[key] = db.prepare(sql);
+    return _stmts[key];
+}
 function getDb() {
     if (_db)
         return _db;
@@ -25,6 +34,7 @@ function getDb() {
     const db = new DatabaseSync(resolved);
     db.exec('PRAGMA journal_mode = WAL');
     db.exec('PRAGMA synchronous = NORMAL');
+    db.exec('PRAGMA busy_timeout = 5000');
     db.exec(`
     CREATE TABLE IF NOT EXISTS chat_meta (
       instance     TEXT NOT NULL,
@@ -33,6 +43,7 @@ function getDb() {
       last_message TEXT NOT NULL DEFAULT '',
       last_ts      INTEGER NOT NULL DEFAULT 0,
       unread_count INTEGER NOT NULL DEFAULT 0,
+      message_count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (instance, jid)
     )
   `);
@@ -47,6 +58,7 @@ function getDb() {
       sender_name   TEXT,
       sender_number TEXT,
       participant   TEXT,
+      quoted_msg_id TEXT,
       media_json    TEXT,
       contact_json  TEXT,
       PRIMARY KEY (instance, jid, msg_id)
@@ -55,14 +67,77 @@ function getDb() {
     try {
         db.exec('ALTER TABLE messages ADD COLUMN participant TEXT');
     }
-    catch {
-        // column already exists
+    catch (err) {
+        if (!String(err).includes('duplicate column'))
+            throw err;
     }
+    try {
+        db.exec('ALTER TABLE messages ADD COLUMN quoted_msg_id TEXT');
+    }
+    catch (err) {
+        if (!String(err).includes('duplicate column'))
+            throw err;
+    }
+    try {
+        db.exec('ALTER TABLE chat_meta ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0');
+    }
+    catch (err) {
+        if (!String(err).includes('duplicate column'))
+            throw err;
+    }
+    // Defer the message_count backfill — it's a correlated subquery over all
+    // chat_meta rows with message_count = 0, which can take several seconds on
+    // large databases and would block the event loop at startup if run inline.
+    setImmediate(() => {
+        try {
+            db.exec(`
+        UPDATE chat_meta
+        SET message_count = (
+          SELECT COUNT(*)
+          FROM messages m
+          WHERE m.instance = chat_meta.instance
+            AND m.jid = chat_meta.jid
+            AND NOT (m.text = '[message]' AND m.media_json IS NULL AND m.contact_json IS NULL)
+        )
+        WHERE message_count = 0
+          AND EXISTS (
+            SELECT 1
+            FROM messages m2
+            WHERE m2.instance = chat_meta.instance
+              AND m2.jid = chat_meta.jid
+          )
+      `);
+        }
+        catch (err) {
+            console.warn('[message-store] message_count backfill failed:', err);
+        }
+    });
     db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_instance_jid_ts
       ON messages (instance, jid, ts)
   `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_instance_msg_id
+      ON messages (instance, msg_id)
+  `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_chat_meta_instance_last_ts
+      ON chat_meta (instance, last_ts)
+  `);
+    // Garante que a tabela chatwoot_synced existe antes que listUnsyncedSyncMessages
+    // execute o LEFT JOIN. chatwoot-sync-store.ts usa a mesma conexão e também cria
+    // esta tabela, mas a ordem de inicialização não é garantida.
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS chatwoot_synced (
+      instance        TEXT NOT NULL,
+      msg_id          TEXT NOT NULL,
+      conversation_id INTEGER NOT NULL DEFAULT 0,
+      synced_at       INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (instance, msg_id)
+    )
+  `);
     _db = db;
+    _stmts = null;
     return db;
 }
 function parseJson(raw) {
@@ -81,42 +156,78 @@ function parseJson(raw) {
  * Retorna true se foi inserida, false se já existia.
  */
 export function upsertMessage(instance, jid, msg) {
-    const db = getDb();
-    const result = db.prepare(`
+    stmt('upsertMessage.ensureChatMeta', `
+    INSERT OR IGNORE INTO chat_meta (instance, jid) VALUES (?, ?)
+  `).run(instance, jid);
+    const result = stmt('upsertMessage.insertMessage', `
     INSERT OR IGNORE INTO messages
-      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(instance, jid, msg.id, msg.fromMe ? 1 : 0, msg.text ?? '', msg.timestamp ?? 0, msg.senderName ?? null, msg.senderNumber ?? null, msg.participant ?? null, msg.media ? JSON.stringify(msg.media) : null, msg.contact ? JSON.stringify(msg.contact) : null);
-    return (result.changes ?? 0) > 0;
+      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(instance, jid, msg.id, msg.fromMe ? 1 : 0, msg.text ?? '', msg.timestamp ?? 0, msg.senderName ?? null, msg.senderNumber ?? null, msg.participant ?? null, msg.quotedMessageId ?? null, msg.media ? JSON.stringify(msg.media) : null, msg.contact ? JSON.stringify(msg.contact) : null);
+    const inserted = (result.changes ?? 0) > 0;
+    if (inserted) {
+        const isJunkPlaceholder = (msg.text ?? '') === '[message]' && !msg.media && !msg.contact;
+        if (!isJunkPlaceholder) {
+            stmt('upsertMessage.bumpMessageCount', 'UPDATE chat_meta SET message_count = message_count + 1 WHERE instance = ? AND jid = ?')
+                .run(instance, jid);
+        }
+    }
+    return inserted;
+}
+export function updateMessageFields(instance, jid, msgId, patch) {
+    if (!instance || !jid || !msgId)
+        return;
+    if (patch.senderName !== undefined) {
+        stmt('updateMessageFields.senderName', 'UPDATE messages SET sender_name = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.senderName ?? null, instance, jid, msgId);
+    }
+    if (patch.senderNumber !== undefined) {
+        stmt('updateMessageFields.senderNumber', 'UPDATE messages SET sender_number = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.senderNumber ?? null, instance, jid, msgId);
+    }
+    if (patch.participant !== undefined) {
+        stmt('updateMessageFields.participant', 'UPDATE messages SET participant = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.participant ?? null, instance, jid, msgId);
+    }
+    if (patch.quotedMessageId !== undefined) {
+        stmt('updateMessageFields.quotedMessageId', 'UPDATE messages SET quoted_msg_id = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.quotedMessageId ?? null, instance, jid, msgId);
+    }
+    if (patch.media !== undefined) {
+        stmt('updateMessageFields.media', 'UPDATE messages SET media_json = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.media ? JSON.stringify(patch.media) : null, instance, jid, msgId);
+    }
+    if (patch.contact !== undefined) {
+        stmt('updateMessageFields.contact', 'UPDATE messages SET contact_json = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+            .run(patch.contact ? JSON.stringify(patch.contact) : null, instance, jid, msgId);
+    }
 }
 /**
  * Atualiza metadados do chat.
  */
 export function upsertChatMeta(instance, jid, patch) {
-    const db = getDb();
     // Garante que a linha existe
-    db.prepare(`
+    stmt('upsertChatMeta.ensureChatMeta', `
     INSERT OR IGNORE INTO chat_meta (instance, jid) VALUES (?, ?)
   `).run(instance, jid);
     if (patch.title !== undefined) {
-        db.prepare('UPDATE chat_meta SET title = ? WHERE instance = ? AND jid = ?')
+        stmt('upsertChatMeta.title', 'UPDATE chat_meta SET title = ? WHERE instance = ? AND jid = ?')
             .run(patch.title, instance, jid);
     }
     if (patch.lastMessage !== undefined) {
-        db.prepare('UPDATE chat_meta SET last_message = ? WHERE instance = ? AND jid = ?')
+        stmt('upsertChatMeta.lastMessage', 'UPDATE chat_meta SET last_message = ? WHERE instance = ? AND jid = ?')
             .run(patch.lastMessage, instance, jid);
     }
     if (patch.lastTimestamp !== undefined) {
-        db.prepare('UPDATE chat_meta SET last_ts = MAX(last_ts, ?) WHERE instance = ? AND jid = ?').run(patch.lastTimestamp, instance, jid);
+        stmt('upsertChatMeta.lastTimestamp', 'UPDATE chat_meta SET last_ts = MAX(last_ts, ?) WHERE instance = ? AND jid = ?').run(patch.lastTimestamp, instance, jid);
     }
     if (patch.unreadCount !== undefined) {
-        db.prepare('UPDATE chat_meta SET unread_count = ? WHERE instance = ? AND jid = ?')
+        stmt('upsertChatMeta.unreadCount', 'UPDATE chat_meta SET unread_count = ? WHERE instance = ? AND jid = ?')
             .run(patch.unreadCount, instance, jid);
     }
 }
 export function incrementUnread(instance, jid) {
-    const db = getDb();
-    db.prepare(`
+    stmt('incrementUnread', `
     INSERT INTO chat_meta (instance, jid, unread_count)
     VALUES (?, ?, 1)
     ON CONFLICT (instance, jid) DO UPDATE SET unread_count = unread_count + 1
@@ -130,8 +241,7 @@ export function resetUnread(instance, jid) {
  * Retorna o título salvo do chat (vindo de pushName ou subject de grupo). Null se vazio.
  */
 export function getChatTitle(instance, jid) {
-    const db = getDb();
-    const row = db.prepare('SELECT title FROM chat_meta WHERE instance = ? AND jid = ?').get(instance, jid);
+    const row = stmt('getChatTitle', 'SELECT title FROM chat_meta WHERE instance = ? AND jid = ?').get(instance, jid);
     if (!row)
         return null;
     const title = (row.title || '').trim();
@@ -141,19 +251,16 @@ export function getChatTitle(instance, jid) {
  * Retorna todos os chats da instância, ordenados por last_ts DESC.
  */
 export function listChats(instance) {
-    const db = getDb();
-    const rows = db.prepare(`
+    const rows = stmt('listChats', `
     SELECT
       c.jid,
       c.title,
       c.last_message,
       c.last_ts,
       c.unread_count,
-      COUNT(CASE WHEN NOT (m.text = '[message]' AND m.media_json IS NULL AND m.contact_json IS NULL) THEN 1 END) AS message_count
+      c.message_count
     FROM chat_meta c
-    LEFT JOIN messages m ON m.instance = c.instance AND m.jid = c.jid
     WHERE c.instance = ?
-    GROUP BY c.jid
     ORDER BY c.last_ts DESC
   `).all(instance);
     return rows.map((r) => ({
@@ -169,13 +276,45 @@ export function listChats(instance) {
  * Retorna as mensagens de um chat, ordenadas por ts ASC.
  * limit padrão: 500 mensagens mais recentes.
  * afterTs: se fornecido, retorna apenas mensagens com ts >= afterTs.
+ * Quando afterTs não é fornecido, retorna as N mais recentes (não as N mais antigas).
  */
 export function listMessages(instance, jid, limit = 500, afterTs) {
-    const db = getDb();
-    const rows = db.prepare(`
-    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json
+    const rows = stmt('listMessages', `
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
+    FROM (
+      SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
+      FROM messages
+      WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
+      ORDER BY ts DESC
+      LIMIT ?
+    )
+    ORDER BY ts ASC
+  `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit);
+    return rows.map((r) => ({
+        id: r.msg_id,
+        fromMe: r.from_me === 1,
+        text: r.text,
+        timestamp: r.ts,
+        senderName: r.sender_name ?? undefined,
+        senderNumber: r.sender_number ?? undefined,
+        participant: r.participant ?? undefined,
+        quotedMessageId: r.quoted_msg_id ?? undefined,
+        media: parseJson(r.media_json),
+        contact: parseJson(r.contact_json),
+    }));
+}
+/**
+ * Variante otimizada para sync histórico: retorna apenas mensagens com conteúdo
+ * útil para envio ao Chatwoot (texto não-vazio, mídia presente ou contato presente).
+ */
+export function listSyncMessages(instance, jid, limit = 500, afterTs) {
+    const rows = stmt('listSyncMessages', `
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
     FROM messages
-    WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
+    WHERE instance = ?
+      AND jid = ?
+      AND (? IS NULL OR ts >= ?)
+      AND (text != '' OR media_json IS NOT NULL OR contact_json IS NOT NULL)
     ORDER BY ts ASC
     LIMIT ?
   `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit);
@@ -187,6 +326,39 @@ export function listMessages(instance, jid, limit = 500, afterTs) {
         senderName: r.sender_name ?? undefined,
         senderNumber: r.sender_number ?? undefined,
         participant: r.participant ?? undefined,
+        quotedMessageId: r.quoted_msg_id ?? undefined,
+        media: parseJson(r.media_json),
+        contact: parseJson(r.contact_json),
+    }));
+}
+/**
+ * Variante ainda mais otimizada para sync histórico: já exclui mensagens que
+ * constam em chatwoot_synced, evitando uma segunda consulta por chat.
+ */
+export function listUnsyncedSyncMessages(instance, jid, limit = 500, afterTs) {
+    const rows = stmt('listUnsyncedSyncMessages', `
+    SELECT m.msg_id, m.from_me, m.text, m.ts, m.sender_name, m.sender_number, m.participant, m.quoted_msg_id, m.media_json, m.contact_json
+    FROM messages m
+    LEFT JOIN chatwoot_synced s
+      ON s.instance = m.instance
+     AND s.msg_id = m.msg_id
+    WHERE m.instance = ?
+      AND m.jid = ?
+      AND (? IS NULL OR m.ts >= ?)
+      AND (m.text != '' OR m.media_json IS NOT NULL OR m.contact_json IS NOT NULL)
+      AND s.msg_id IS NULL
+    ORDER BY m.ts ASC
+    LIMIT ?
+  `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit);
+    return rows.map((r) => ({
+        id: r.msg_id,
+        fromMe: r.from_me === 1,
+        text: r.text,
+        timestamp: r.ts,
+        senderName: r.sender_name ?? undefined,
+        senderNumber: r.sender_number ?? undefined,
+        participant: r.participant ?? undefined,
+        quotedMessageId: r.quoted_msg_id ?? undefined,
         media: parseJson(r.media_json),
         contact: parseJson(r.contact_json),
     }));
@@ -196,24 +368,21 @@ export function listMessages(instance, jid, limit = 500, afterTs) {
  * Útil para decidir se é necessário buscar mais histórico.
  */
 export function getOldestMessageTs(instance, jid) {
-    const db = getDb();
-    const row = db.prepare('SELECT MIN(ts) AS min_ts FROM messages WHERE instance = ? AND jid = ?').get(instance, jid);
+    const row = stmt('getOldestMessageTs', 'SELECT MIN(ts) AS min_ts FROM messages WHERE instance = ? AND jid = ?').get(instance, jid);
     return row?.min_ts ?? 0;
 }
 /**
  * Conta mensagens de um chat.
  */
 export function countMessages(instance, jid) {
-    const db = getDb();
-    const row = db.prepare("SELECT COUNT(*) AS cnt FROM messages WHERE instance = ? AND jid = ? AND NOT (text = '[message]' AND media_json IS NULL AND contact_json IS NULL)").get(instance, jid);
-    return row.cnt ?? 0;
+    const row = stmt('countMessages', 'SELECT message_count AS cnt FROM chat_meta WHERE instance = ? AND jid = ?').get(instance, jid);
+    return row?.cnt ?? 0;
 }
 /**
  * Remove todos os dados de uma instância (ao fazer logout/delete).
  */
 export function clearInstance(instance) {
-    const db = getDb();
-    db.prepare('DELETE FROM messages WHERE instance = ?').run(instance);
-    db.prepare('DELETE FROM chat_meta WHERE instance = ?').run(instance);
+    stmt('clearInstance.messages', 'DELETE FROM messages WHERE instance = ?').run(instance);
+    stmt('clearInstance.chatMeta', 'DELETE FROM chat_meta WHERE instance = ?').run(instance);
 }
 //# sourceMappingURL=message-store.js.map

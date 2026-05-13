@@ -103,12 +103,18 @@ db.exec(`
   );
 `);
 
-function parseJson<T>(value: unknown, fallback: T): T {
+function parseJson<T extends object>(value: unknown, fallback: T): T {
   if (typeof value !== 'string') return fallback;
   try {
     const parsed = JSON.parse(value) as unknown;
-    if (!parsed || typeof parsed !== 'object') return fallback;
-    return { ...fallback, ...parsed } as T;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return fallback;
+    // Merge field-by-field: keep fallback value when parsed field is null/undefined
+    // to avoid silently overwriting arrays (e.g. ignoreJids) with null from stored JSON.
+    const result = { ...fallback } as Record<string, unknown>;
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (v !== null && v !== undefined) result[k] = v;
+    }
+    return result as T;
   } catch {
     return fallback;
   }
@@ -144,6 +150,15 @@ export function getInstanceIntegrations(instance: string): InstanceIntegrations 
   return toRow(row);
 }
 
+// Cache for slug→instance lookups. Invalidated on every config update.
+// TTL of 60s as safety net in case invalidation is missed.
+const _slugCache = new Map<string, { instance: string | null; exp: number }>();
+const SLUG_CACHE_TTL_MS = 60_000;
+
+export function invalidateSlugCache(): void {
+  _slugCache.clear();
+}
+
 /**
  * Find the instance name that has a given webhookSlug configured.
  * Returns null if not found.
@@ -151,16 +166,25 @@ export function getInstanceIntegrations(instance: string): InstanceIntegrations 
 export function findInstanceByWebhookSlug(slug: string): string | null {
   const normalized = String(slug || '').trim().toLowerCase();
   if (!normalized) return null;
+
+  const cached = _slugCache.get(normalized);
+  if (cached && cached.exp > Date.now()) return cached.instance;
+
   const rows = db
     .prepare('SELECT instance, chatwoot_json FROM integration_configs')
     .all() as Array<Record<string, unknown>>;
+  let found: string | null = null;
   for (const row of rows) {
+    const instance = String(row.instance ?? '').trim();
     const cfg = parseJson<ChatwootConfig>(row.chatwoot_json, defaultChatwoot());
-    if (cfg.webhookSlug && cfg.webhookSlug.trim().toLowerCase() === normalized) {
-      return String(row.instance);
+    const effectiveSlug = (cfg.webhookSlug?.trim() || instance).toLowerCase();
+    if (effectiveSlug === normalized) {
+      found = instance;
+      break;
     }
   }
-  return null;
+  _slugCache.set(normalized, { instance: found, exp: Date.now() + SLUG_CACHE_TTL_MS });
+  return found;
 }
 
 export function listIntegrationInstances(): InstanceIntegrations[] {
@@ -183,6 +207,10 @@ function saveInstanceIntegrations(next: InstanceIntegrations): InstanceIntegrati
        n8n_json = excluded.n8n_json,
        updated_at = excluded.updated_at`
   ).run(next.instance, JSON.stringify(next.chatwoot), JSON.stringify(next.n8n), createdAt, now);
+
+  // Invalidate slug cache whenever config changes — ensures findInstanceByWebhookSlug
+  // picks up new/changed webhookSlug values immediately.
+  invalidateSlugCache();
 
   return {
     ...next,

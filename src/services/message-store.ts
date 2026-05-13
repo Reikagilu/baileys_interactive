@@ -25,6 +25,7 @@ export interface StoredMessage {
   senderName?: string;
   senderNumber?: string;
   participant?: string;
+  quotedMessageId?: string;
   media?: Record<string, unknown>;
   contact?: Record<string, unknown>;
 }
@@ -60,6 +61,7 @@ function getDb(): DatabaseSync {
   const db = new DatabaseSync(resolved);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chat_meta (
       instance     TEXT NOT NULL,
@@ -83,6 +85,7 @@ function getDb(): DatabaseSync {
       sender_name   TEXT,
       sender_number TEXT,
       participant   TEXT,
+      quoted_msg_id TEXT,
       media_json    TEXT,
       contact_json  TEXT,
       PRIMARY KEY (instance, jid, msg_id)
@@ -90,38 +93,68 @@ function getDb(): DatabaseSync {
   `);
   try {
     db.exec('ALTER TABLE messages ADD COLUMN participant TEXT');
-  } catch {
-    // column already exists
+  } catch (err) {
+    if (!String(err).includes('duplicate column')) throw err;
+  }
+  try {
+    db.exec('ALTER TABLE messages ADD COLUMN quoted_msg_id TEXT');
+  } catch (err) {
+    if (!String(err).includes('duplicate column')) throw err;
   }
   try {
     db.exec('ALTER TABLE chat_meta ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0');
-  } catch {
-    // column already exists
+  } catch (err) {
+    if (!String(err).includes('duplicate column')) throw err;
   }
-  db.exec(`
-    UPDATE chat_meta
-    SET message_count = (
-      SELECT COUNT(*)
-      FROM messages m
-      WHERE m.instance = chat_meta.instance
-        AND m.jid = chat_meta.jid
-        AND NOT (m.text = '[message]' AND m.media_json IS NULL AND m.contact_json IS NULL)
-    )
-    WHERE message_count = 0
-      AND EXISTS (
-        SELECT 1
-        FROM messages m2
-        WHERE m2.instance = chat_meta.instance
-          AND m2.jid = chat_meta.jid
-      )
-  `);
+  // Defer the message_count backfill — it's a correlated subquery over all
+  // chat_meta rows with message_count = 0, which can take several seconds on
+  // large databases and would block the event loop at startup if run inline.
+  setImmediate(() => {
+    try {
+      db.exec(`
+        UPDATE chat_meta
+        SET message_count = (
+          SELECT COUNT(*)
+          FROM messages m
+          WHERE m.instance = chat_meta.instance
+            AND m.jid = chat_meta.jid
+            AND NOT (m.text = '[message]' AND m.media_json IS NULL AND m.contact_json IS NULL)
+        )
+        WHERE message_count = 0
+          AND EXISTS (
+            SELECT 1
+            FROM messages m2
+            WHERE m2.instance = chat_meta.instance
+              AND m2.jid = chat_meta.jid
+          )
+      `);
+    } catch (err) {
+      console.warn('[message-store] message_count backfill failed:', err);
+    }
+  });
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_instance_jid_ts
       ON messages (instance, jid, ts)
   `);
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_instance_msg_id
+      ON messages (instance, msg_id)
+  `);
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_chat_meta_instance_last_ts
       ON chat_meta (instance, last_ts)
+  `);
+  // Garante que a tabela chatwoot_synced existe antes que listUnsyncedSyncMessages
+  // execute o LEFT JOIN. chatwoot-sync-store.ts usa a mesma conexão e também cria
+  // esta tabela, mas a ordem de inicialização não é garantida.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chatwoot_synced (
+      instance        TEXT NOT NULL,
+      msg_id          TEXT NOT NULL,
+      conversation_id INTEGER NOT NULL DEFAULT 0,
+      synced_at       INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (instance, msg_id)
+    )
   `);
   _db = db;
   _stmts = null;
@@ -145,8 +178,8 @@ export function upsertMessage(instance: string, jid: string, msg: StoredMessage)
   `).run(instance, jid);
   const result = stmt('upsertMessage.insertMessage', `
     INSERT OR IGNORE INTO messages
-      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (instance, jid, msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     instance,
     jid,
@@ -157,6 +190,7 @@ export function upsertMessage(instance: string, jid: string, msg: StoredMessage)
     msg.senderName ?? null,
     msg.senderNumber ?? null,
     msg.participant ?? null,
+    msg.quotedMessageId ?? null,
     msg.media ? JSON.stringify(msg.media) : null,
     msg.contact ? JSON.stringify(msg.contact) : null,
   );
@@ -169,6 +203,39 @@ export function upsertMessage(instance: string, jid: string, msg: StoredMessage)
     }
   }
   return inserted;
+}
+
+export function updateMessageFields(
+  instance: string,
+  jid: string,
+  msgId: string,
+  patch: Partial<StoredMessage>,
+): void {
+  if (!instance || !jid || !msgId) return;
+  if (patch.senderName !== undefined) {
+    stmt('updateMessageFields.senderName', 'UPDATE messages SET sender_name = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.senderName ?? null, instance, jid, msgId);
+  }
+  if (patch.senderNumber !== undefined) {
+    stmt('updateMessageFields.senderNumber', 'UPDATE messages SET sender_number = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.senderNumber ?? null, instance, jid, msgId);
+  }
+  if (patch.participant !== undefined) {
+    stmt('updateMessageFields.participant', 'UPDATE messages SET participant = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.participant ?? null, instance, jid, msgId);
+  }
+  if (patch.quotedMessageId !== undefined) {
+    stmt('updateMessageFields.quotedMessageId', 'UPDATE messages SET quoted_msg_id = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.quotedMessageId ?? null, instance, jid, msgId);
+  }
+  if (patch.media !== undefined) {
+    stmt('updateMessageFields.media', 'UPDATE messages SET media_json = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.media ? JSON.stringify(patch.media) : null, instance, jid, msgId);
+  }
+  if (patch.contact !== undefined) {
+    stmt('updateMessageFields.contact', 'UPDATE messages SET contact_json = ? WHERE instance = ? AND jid = ? AND msg_id = ?')
+      .run(patch.contact ? JSON.stringify(patch.contact) : null, instance, jid, msgId);
+  }
 }
 
 /**
@@ -266,14 +333,19 @@ export function listChats(instance: string): StoredChatMeta[] {
  * Retorna as mensagens de um chat, ordenadas por ts ASC.
  * limit padrão: 500 mensagens mais recentes.
  * afterTs: se fornecido, retorna apenas mensagens com ts >= afterTs.
+ * Quando afterTs não é fornecido, retorna as N mais recentes (não as N mais antigas).
  */
 export function listMessages(instance: string, jid: string, limit = 500, afterTs?: number): StoredMessage[] {
   const rows = stmt('listMessages', `
-    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json
-    FROM messages
-    WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
+    FROM (
+      SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
+      FROM messages
+      WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
+      ORDER BY ts DESC
+      LIMIT ?
+    )
     ORDER BY ts ASC
-    LIMIT ?
   `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit) as Array<{
     msg_id: string;
     from_me: number;
@@ -282,6 +354,7 @@ export function listMessages(instance: string, jid: string, limit = 500, afterTs
     sender_name: string | null;
     sender_number: string | null;
     participant: string | null;
+    quoted_msg_id: string | null;
     media_json: string | null;
     contact_json: string | null;
   }>;
@@ -294,6 +367,7 @@ export function listMessages(instance: string, jid: string, limit = 500, afterTs
     senderName: r.sender_name ?? undefined,
     senderNumber: r.sender_number ?? undefined,
     participant: r.participant ?? undefined,
+    quotedMessageId: r.quoted_msg_id ?? undefined,
     media: parseJson<Record<string, unknown>>(r.media_json),
     contact: parseJson<Record<string, unknown>>(r.contact_json),
   }));
@@ -301,16 +375,16 @@ export function listMessages(instance: string, jid: string, limit = 500, afterTs
 
 /**
  * Variante otimizada para sync histórico: retorna apenas mensagens com conteúdo
- * útil para envio ao Chatwoot (texto não-vazio ou mídia presente).
+ * útil para envio ao Chatwoot (texto não-vazio, mídia presente ou contato presente).
  */
 export function listSyncMessages(instance: string, jid: string, limit = 500, afterTs?: number): StoredMessage[] {
   const rows = stmt('listSyncMessages', `
-    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, media_json, contact_json
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
     FROM messages
     WHERE instance = ?
       AND jid = ?
       AND (? IS NULL OR ts >= ?)
-      AND (text != '' OR media_json IS NOT NULL)
+      AND (text != '' OR media_json IS NOT NULL OR contact_json IS NOT NULL)
     ORDER BY ts ASC
     LIMIT ?
   `).all(instance, jid, afterTs ?? null, afterTs ?? null, limit) as Array<{
@@ -321,6 +395,7 @@ export function listSyncMessages(instance: string, jid: string, limit = 500, aft
     sender_name: string | null;
     sender_number: string | null;
     participant: string | null;
+    quoted_msg_id: string | null;
     media_json: string | null;
     contact_json: string | null;
   }>;
@@ -333,6 +408,7 @@ export function listSyncMessages(instance: string, jid: string, limit = 500, aft
     senderName: r.sender_name ?? undefined,
     senderNumber: r.sender_number ?? undefined,
     participant: r.participant ?? undefined,
+    quotedMessageId: r.quoted_msg_id ?? undefined,
     media: parseJson<Record<string, unknown>>(r.media_json),
     contact: parseJson<Record<string, unknown>>(r.contact_json),
   }));
@@ -344,7 +420,7 @@ export function listSyncMessages(instance: string, jid: string, limit = 500, aft
  */
 export function listUnsyncedSyncMessages(instance: string, jid: string, limit = 500, afterTs?: number): StoredMessage[] {
   const rows = stmt('listUnsyncedSyncMessages', `
-    SELECT m.msg_id, m.from_me, m.text, m.ts, m.sender_name, m.sender_number, m.participant, m.media_json, m.contact_json
+    SELECT m.msg_id, m.from_me, m.text, m.ts, m.sender_name, m.sender_number, m.participant, m.quoted_msg_id, m.media_json, m.contact_json
     FROM messages m
     LEFT JOIN chatwoot_synced s
       ON s.instance = m.instance
@@ -352,7 +428,7 @@ export function listUnsyncedSyncMessages(instance: string, jid: string, limit = 
     WHERE m.instance = ?
       AND m.jid = ?
       AND (? IS NULL OR m.ts >= ?)
-      AND (m.text != '' OR m.media_json IS NOT NULL)
+      AND (m.text != '' OR m.media_json IS NOT NULL OR m.contact_json IS NOT NULL)
       AND s.msg_id IS NULL
     ORDER BY m.ts ASC
     LIMIT ?
@@ -364,6 +440,7 @@ export function listUnsyncedSyncMessages(instance: string, jid: string, limit = 
     sender_name: string | null;
     sender_number: string | null;
     participant: string | null;
+    quoted_msg_id: string | null;
     media_json: string | null;
     contact_json: string | null;
   }>;
@@ -376,6 +453,7 @@ export function listUnsyncedSyncMessages(instance: string, jid: string, limit = 
     senderName: r.sender_name ?? undefined,
     senderNumber: r.sender_number ?? undefined,
     participant: r.participant ?? undefined,
+    quotedMessageId: r.quoted_msg_id ?? undefined,
     media: parseJson<Record<string, unknown>>(r.media_json),
     contact: parseJson<Record<string, unknown>>(r.contact_json),
   }));
@@ -400,8 +478,8 @@ export function countMessages(instance: string, jid: string): number {
   const row = stmt(
     'countMessages',
     'SELECT message_count AS cnt FROM chat_meta WHERE instance = ? AND jid = ?'
-  ).get(instance, jid) as { cnt: number };
-  return row.cnt ?? 0;
+  ).get(instance, jid) as { cnt: number } | undefined;
+  return row?.cnt ?? 0;
 }
 
 /**

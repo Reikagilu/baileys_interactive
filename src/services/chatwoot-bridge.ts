@@ -16,6 +16,7 @@
 import { getInstanceIntegrations, updateChatwootConfig } from './integrations.js';
 import { listChats, listUnsyncedSyncMessages, getChatTitle } from './message-store.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
+import { config } from '../config.js';
 import {
   beginMessageSync,
   finishMessageSync,
@@ -26,6 +27,7 @@ import {
   finishSyncProgress,
   isSyncCancelled,
   isSyncRunning,
+  appendSyncError,
 } from './chatwoot-sync-store.js';
 
 /**
@@ -33,6 +35,25 @@ import {
  * phone number like "+55 11 97279 8737".
  * Falls back to "+{digits}" if it doesn't match known patterns.
  */
+/**
+ * Normaliza escapes literais que podem chegar no texto vindo do Chatwoot.
+ * O Chatwoot por vezes envia literalmente "\n" (dois caracteres: barra + n)
+ * no campo `content` — quando isso é repassado direto ao Baileys o WhatsApp
+ * mostra `\n` em vez de quebra de linha. Aqui convertemos as sequências mais
+ * comuns para os caracteres reais.
+ *
+ * Não trocamos `\\\\` (barra dupla) por barra simples para não corromper
+ * conteúdo intencional (ex: caminhos Windows colados na conversa).
+ */
+function decodeChatwootEscapes(value: string): string {
+  if (!value) return value;
+  return value
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\n')
+    .replace(/\\t/g, '\t');
+}
+
 function formatPhoneDisplay(digits: string): string {
   // Brazilian numbers: 55 + 2-digit DDD + 8-9 digit number
   const br = digits.match(/^55(\d{2})(\d{4,5})(\d{4})$/);
@@ -48,6 +69,22 @@ const GROUP_SUBJECT_CACHE_MS = 10 * 60 * 1000; // 10 minutos
 const contactNameCache = new Map<string, { name: string | null; expires: number }>();
 const CONTACT_NAME_CACHE_MS = 2 * 60 * 1000;
 const syncContactNamesInFlight = new Map<string, Promise<{ ok: boolean; scanned: number; updated: number; skipped: number; errors: number; error?: string }>>();
+export const CHATWOOT_WEBHOOK_SLUG_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function normalizeChatwootWebhookSlug(input: unknown): string {
+  const raw = String(input ?? '').trim();
+  if (!raw) return '';
+  return CHATWOOT_WEBHOOK_SLUG_PATTERN.test(raw) ? raw : '';
+}
+
+export function buildChatwootWebhookUrl(slugRaw: string): string {
+  const slug = normalizeChatwootWebhookSlug(slugRaw);
+  const serverOrigin = process.env.SERVER_URL?.replace(/\/$/, '') ?? `http://localhost:${process.env.PORT ?? '8787'}`;
+  const base = `${serverOrigin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+  const secret = config.security.chatwootWebhookSecret.trim();
+  if (!secret) return base;
+  return `${base}?secret=${encodeURIComponent(secret)}`;
+}
 
 async function resolveGroupSubject(instanceName: string, groupJid: string): Promise<string | null> {
   const cacheKey = `${instanceName}:${groupJid}`;
@@ -148,7 +185,26 @@ async function resolveContactName(
   return null;
 }
 
-const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = config.chatwoot.requestTimeoutMs;
+const MESSAGE_SEND_TIMEOUT_MS = Math.max(REQUEST_TIMEOUT_MS, 60_000);
+const MESSAGE_SEND_WITH_ATTACHMENT_TIMEOUT_MS = Math.max(REQUEST_TIMEOUT_MS, 120_000);
+
+function isRetryableChatwootError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message === 'This operation was aborted'
+    || message.includes('AbortError')
+    || message.includes('Chatwoot HTTP 429:')
+    || message.includes('Chatwoot HTTP 500:')
+    || message.includes('Chatwoot HTTP 502:')
+    || message.includes('Chatwoot HTTP 503:')
+    || message.includes('Chatwoot HTTP 504:')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ─── Chatwoot HTTP helpers ──────────────────────────────────────────────────
 
@@ -156,6 +212,7 @@ interface CwConfig {
   baseUrl: string;
   accountId: string;
   apiAccessToken: string;
+  inboxId?: string;
 }
 
 async function cwFetch<T = unknown>(
@@ -166,26 +223,79 @@ async function cwFetch<T = unknown>(
   timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<T> {
   const url = `${cfg.baseUrl}/api/v1/accounts/${cfg.accountId}${path}`;
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        'api_access_token': cfg.apiAccessToken,
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Chatwoot HTTP ${res.status}: ${text}`);
+  const maxAttempts = Math.max(1, config.chatwoot.requestRetries + 1);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'api_access_token': cfg.apiAccessToken,
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Chatwoot HTTP ${res.status}: ${text}`);
+      }
+      return (await res.json()) as T;
+    } catch (err) {
+      if (attempt >= maxAttempts || !isRetryableChatwootError(err)) {
+        throw err;
+      }
+      await sleep(config.chatwoot.requestRetryDelayMs * attempt);
+    } finally {
+      clearTimeout(t);
     }
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(t);
   }
+
+  throw new Error('unreachable_chatwoot_retry_loop');
+}
+
+async function cwFetchMultipart(
+  cfg: CwConfig,
+  method: string,
+  path: string,
+  form: FormData,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<unknown> {
+  const url = `${cfg.baseUrl}/api/v1/accounts/${cfg.accountId}${path}`;
+  const maxAttempts = Math.max(1, config.chatwoot.requestRetries + 1);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          // Do NOT set Content-Type — let fetch set it automatically
+          // so the multipart boundary is included correctly.
+          'api_access_token': cfg.apiAccessToken,
+        },
+        body: form,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Chatwoot HTTP ${res.status}: ${text}`);
+      }
+      return await res.json().catch(() => null);
+    } catch (err) {
+      if (attempt >= maxAttempts || !isRetryableChatwootError(err)) {
+        throw err;
+      }
+      await sleep(config.chatwoot.requestRetryDelayMs * attempt);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  throw new Error('unreachable_chatwoot_retry_loop_multipart');
 }
 
 // ─── Contact helpers ─────────────────────────────────────────────────────────
@@ -236,7 +346,7 @@ function cacheContact(cfg: CwConfig, contact: CwContact | null): void {
  * Uses /contacts/filter for phone, /contacts/search for groups.
  */
 async function findContactByPhone(cfg: CwConfig, phone: string): Promise<CwContact | null> {
-  const digits = phone.replace('+', '');
+  const digits = phone.replace(/\+/g, '');
   const cached = getCachedContact(contactByPhoneCache, contactCacheKey(cfg, digits));
   if (cached) return cached;
   try {
@@ -456,7 +566,12 @@ async function getInbox(instanceName: string, cfg: CwConfig, nameInbox: string):
   const request = (async (): Promise<CwInbox | null> => {
     try {
       const res = await cwFetch<{ payload: CwInbox[] }>(cfg, 'GET', '/inboxes');
-      const inbox = res.payload?.find((i: CwInbox) => i.name === nameInbox) ?? null;
+      const expectedInboxId = Number.parseInt(String((cfg as CwConfig & { inboxId?: string }).inboxId ?? ''), 10);
+      const inbox = Number.isFinite(expectedInboxId) && expectedInboxId > 0
+        ? (res.payload?.find((i: CwInbox) => i.id === expectedInboxId)
+          ?? res.payload?.find((i: CwInbox) => i.name === nameInbox)
+          ?? null)
+        : (res.payload?.find((i: CwInbox) => i.name === nameInbox) ?? null);
       if (inbox) inboxCache.set(key, { inbox, ts: Date.now() });
       return inbox;
     } catch {
@@ -481,12 +596,108 @@ interface CwConversation {
   };
 }
 
+interface CwConversationMessage {
+  id?: number | string;
+  source_id?: string | null;
+}
+
 /** Cache: instanceName:conversationJid → conversationId
  * For groups: key = instanceName:groupJid (one conversation per group)
  * For individuals: key = instanceName:contactJid
  */
 const convCache = new Map<string, { id: number; ts: number }>();
 const convInFlight = new Map<string, Promise<number | null>>();
+const conversationMessageSourceHitCache = new Map<string, number>();
+const conversationMessageSourceInFlight = new Map<string, Promise<boolean>>();
+const CONVERSATION_MESSAGE_SOURCE_CACHE_MS = 10 * 60 * 1000;
+
+// Varredura periódica de entradas expiradas em todos os caches de módulo.
+// Evita crescimento ilimitado em instâncias de longa duração com muitos contatos.
+function purgeExpiredCaches(): void {
+  const now = Date.now();
+  for (const [k, v] of groupSubjectCache) {
+    if (v.expires < now) groupSubjectCache.delete(k);
+  }
+  for (const [k, v] of contactNameCache) {
+    if (v.expires < now) contactNameCache.delete(k);
+  }
+  for (const [k, v] of contactByIdentifierCache) {
+    if (now - v.ts > CONTACT_CACHE_TTL_MS) contactByIdentifierCache.delete(k);
+  }
+  for (const [k, v] of contactByPhoneCache) {
+    if (now - v.ts > CONTACT_CACHE_TTL_MS) contactByPhoneCache.delete(k);
+  }
+  for (const [k, v] of convCache) {
+    if (now - v.ts > 30 * 60 * 1000) convCache.delete(k);
+  }
+  for (const [k, exp] of conversationMessageSourceHitCache) {
+    if (exp < now) conversationMessageSourceHitCache.delete(k);
+  }
+}
+// Roda a cada 15 minutos; unref() para não impedir o processo de encerrar.
+setInterval(purgeExpiredCaches, 15 * 60 * 1000).unref();
+
+function conversationMessageSourceKey(cfg: CwConfig, conversationId: number, sourceId: string): string {
+  return `${cfg.baseUrl}|${cfg.accountId}|${conversationId}|${sourceId}`;
+}
+
+function extractConversationMessages(payload: unknown): CwConversationMessage[] {
+  if (Array.isArray(payload)) return payload as CwConversationMessage[];
+  if (!payload || typeof payload !== 'object') return [];
+  const rec = payload as Record<string, unknown>;
+  if (Array.isArray(rec.payload)) return rec.payload as CwConversationMessage[];
+  if (Array.isArray(rec.data)) return rec.data as CwConversationMessage[];
+  if (Array.isArray(rec.messages)) return rec.messages as CwConversationMessage[];
+  const nested = rec.payload as Record<string, unknown> | undefined;
+  if (nested) {
+    if (Array.isArray(nested.messages)) return nested.messages as CwConversationMessage[];
+    if (Array.isArray(nested.data)) return nested.data as CwConversationMessage[];
+  }
+  return [];
+}
+
+async function conversationAlreadyHasSourceId(
+  cfg: CwConfig,
+  conversationId: number,
+  sourceId: string,
+): Promise<boolean> {
+  if (!sourceId) return false;
+  const key = conversationMessageSourceKey(cfg, conversationId, sourceId);
+  const cachedUntil = conversationMessageSourceHitCache.get(key);
+  if (cachedUntil && cachedUntil > Date.now()) return true;
+
+  const pending = conversationMessageSourceInFlight.get(key);
+  if (pending) return pending;
+
+  const request = (async () => {
+    // Hard deadline: 60 s total across all page fetches to prevent blocking the event loop.
+    const deadline = Date.now() + 60_000;
+    try {
+      for (let page = 1; page <= 100; page++) {
+        if (Date.now() > deadline) {
+          console.warn(`[chatwoot-bridge] conversationAlreadyHasSourceId timeout for conversation ${conversationId}`);
+          break;
+        }
+        const data = await cwFetch<unknown>(cfg, 'GET', `/conversations/${conversationId}/messages?page=${page}`);
+        const messages = extractConversationMessages(data);
+        if (messages.some((message) => String(message?.source_id ?? '').trim() === sourceId)) {
+          conversationMessageSourceHitCache.set(key, Date.now() + CONVERSATION_MESSAGE_SOURCE_CACHE_MS);
+          return true;
+        }
+        // Break when the page is empty — avoids hardcoding the Chatwoot page
+        // size (which may not always be 20) and prevents premature termination
+        // that could cause duplicate message dispatch.
+        if (messages.length === 0) break;
+      }
+      return false;
+    } finally {
+      conversationMessageSourceInFlight.delete(key);
+    }
+  })();
+
+  conversationMessageSourceInFlight.set(key, request);
+  return request;
+}
 
 async function getOrCreateConversation(
   instanceName: string,
@@ -517,7 +728,9 @@ async function getOrCreateConversation(
 
       let conv: CwConversation | undefined;
       if (opts.reopenConversation) {
-        conv = existing[0]; // pick most recent regardless of status
+        // Sort descending by id to ensure we pick the most recent conversation,
+        // since the Chatwoot API does not guarantee a specific order.
+        conv = existing.sort((a, b) => b.id - a.id)[0];
       } else {
         conv = existing.find((c) => c.status !== 'resolved');
       }
@@ -527,7 +740,9 @@ async function getOrCreateConversation(
         if (opts.reopenConversation && conv.status !== 'open') {
           await cwFetch(cfg, 'POST', `/conversations/${conv.id}/toggle_status`, {
             status: opts.conversationPending ? 'pending' : 'open',
-          }).catch(() => {});
+          }).catch((err) => {
+            console.warn(`[chatwoot-bridge] failed to reopen conversation ${conv!.id}`, err?.message ?? err);
+          });
         }
         convCache.set(cacheKey, { id: conv.id, ts: Date.now() });
         return conv.id;
@@ -568,16 +783,42 @@ async function sendMessageToChatwoot(
     messageType: 'incoming' | 'outgoing';
     sourceId?: string;
     isPrivate?: boolean;
+    contentAttributes?: Record<string, unknown>;
     attachments?: Array<{ content: string; encoding: 'base64'; filename: string; mime_type?: string }>;
   },
 ): Promise<void> {
-  await cwFetch(cfg, 'POST', `/conversations/${conversationId}/messages`, {
-    content: params.content || '',
-    message_type: params.messageType,
-    private: params.isPrivate ?? false,
-    source_id: params.sourceId,
-    attachments: params.attachments,
-  });
+  const timeoutMs = params.attachments?.length
+    ? MESSAGE_SEND_WITH_ATTACHMENT_TIMEOUT_MS
+    : MESSAGE_SEND_TIMEOUT_MS;
+
+  if (params.attachments?.length) {
+    // Chatwoot requires multipart/form-data for file attachments.
+    // Sending base64 as JSON results in HTTP 422 because Rails expects
+    // an ActionDispatch::Http::UploadedFile, not a JSON object.
+    const form = new FormData();
+    form.append('content', params.content || '');
+    form.append('message_type', params.messageType);
+    form.append('private', String(params.isPrivate ?? false));
+    if (params.sourceId) form.append('source_id', params.sourceId);
+    if (params.contentAttributes) {
+      form.append('content_attributes', JSON.stringify(params.contentAttributes));
+    }
+    for (const att of params.attachments) {
+      const rawBase64 = att.content.replace(/^data:[^;]+;base64,/, '');
+      const buf = Buffer.from(rawBase64, 'base64');
+      const blob = new Blob([buf], { type: att.mime_type || 'application/octet-stream' });
+      form.append('attachments[]', blob, att.filename);
+    }
+    await cwFetchMultipart(cfg, 'POST', `/conversations/${conversationId}/messages`, form, timeoutMs);
+  } else {
+    await cwFetch(cfg, 'POST', `/conversations/${conversationId}/messages`, {
+      content: params.content || '',
+      message_type: params.messageType,
+      private: params.isPrivate ?? false,
+      source_id: params.sourceId,
+      content_attributes: params.contentAttributes,
+    }, timeoutMs);
+  }
 }
 
 // ─── Main dispatch: WhatsApp message → Chatwoot ───────────────────────────────
@@ -593,6 +834,7 @@ interface NormalizedMessage {
   message_type?: string;
   messageType?: string;
   text?: string;
+  quotedMessageId?: string;
   message?: Record<string, unknown>;
   timestamp?: number;
   media?: {
@@ -604,6 +846,31 @@ interface NormalizedMessage {
     url?: string;
   };
   sender?: { name?: string; number?: string };
+}
+
+function extractInlineMediaFromRaw(msg: NormalizedMessage): NormalizedMessage['media'] | undefined {
+  const raw = msg.message as Record<string, unknown> | undefined;
+  if (!raw) return undefined;
+  const candidates: Array<[string, string]> = [
+    ['imageMessage', 'image'],
+    ['videoMessage', 'video'],
+    ['audioMessage', 'audio'],
+    ['documentMessage', 'document'],
+    ['stickerMessage', 'sticker'],
+  ];
+  for (const [nodeKey, kind] of candidates) {
+    const node = raw[nodeKey];
+    if (!node || typeof node !== 'object') continue;
+    const rec = node as Record<string, unknown>;
+    const base64 = typeof rec.base64 === 'string' ? rec.base64 : undefined;
+    const mimeType = typeof rec.mimetype === 'string' ? rec.mimetype : undefined;
+    const caption = typeof rec.caption === 'string' ? rec.caption : undefined;
+    const fileName = typeof rec.fileName === 'string' ? rec.fileName : undefined;
+    if (base64 || mimeType || caption || fileName) {
+      return { kind, base64, mimeType, caption, fileName };
+    }
+  }
+  return undefined;
 }
 
 async function loadHydratedChatMessages(
@@ -701,7 +968,7 @@ export async function dispatchToChatwoot(
     return;
   }
 
-  if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken || !cfg.inboxId) {
+  if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken) {
     console.log(`[chatwoot-bridge][${instanceName}] dispatch skipped: enabled=${cfg.enabled} baseUrl=${!!cfg.baseUrl} accountId=${!!cfg.accountId} token=${!!cfg.apiAccessToken} inboxId="${cfg.inboxId}" msgs=${messages.length}`);
     return;
   }
@@ -710,6 +977,7 @@ export async function dispatchToChatwoot(
     baseUrl: cfg.baseUrl,
     accountId: cfg.accountId,
     apiAccessToken: cfg.apiAccessToken,
+    inboxId: cfg.inboxId,
   };
 
   const inbox = await getInbox(instanceName, cwCfg, cfg.nameInbox || 'WhatsApp');
@@ -726,7 +994,11 @@ export async function dispatchToChatwoot(
     try {
       const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
       if (msgId && !result.skipped && result.conversationId) {
-        markMessageSynced(instanceName, msgId, result.conversationId);
+        try {
+          markMessageSynced(instanceName, msgId, result.conversationId);
+        } catch (dbErr) {
+          console.error(`[chatwoot-bridge][${instanceName}] markMessageSynced failed for ${msgId}`, dbErr);
+        }
       }
     } catch (err) {
       console.error(`[chatwoot-bridge][${instanceName}] dispatch error for ${msg.key?.id}`, err);
@@ -784,7 +1056,8 @@ async function dispatchSingleMessage(
   msg: NormalizedMessage,
   options: { isHistorical?: boolean; skipPersistedDedupCheck?: boolean } = {},
 ): Promise<{ skipped: boolean; conversationId?: number }> {
-  const { key, pushName, media, sender } = msg;
+  const { key, pushName, sender } = msg;
+  const media = msg.media?.base64 ? msg.media : (extractInlineMediaFromRaw(msg) ?? msg.media);
   if (!key?.remoteJid || !key?.id) return { skipped: true };
 
   if (!options.skipPersistedDedupCheck && isMessageSynced(instanceName, key.id)) return { skipped: true };
@@ -813,10 +1086,14 @@ async function dispatchSingleMessage(
 
   // Skip messages with no meaningful content (unknown type with no text or media)
   const msgType = msg.messageType ?? msg.message_type ?? '';
-  const hasContent = (msg.text && !msg.text.startsWith('[')) || msg.media?.caption || msg.media?.base64;
+  const hasContent = (msg.text && !msg.text.startsWith('[')) || msg.media?.caption || msg.media?.base64 || msg.media?.url;
   const isGroup = remoteJid.endsWith('@g.us');
   const isFromMe = key.fromMe;
-  if (msgType === 'unknown' && !hasContent && !rawMsg) return { skipped: true };
+  // Skip unknown-type messages that carry no displayable content — these include
+  // pollCreationMessage, orderMessage, productMessage, buttonsResponseMessage, etc.
+  // Previously required !rawMsg, but such messages always have msg.message present,
+  // so the check was never true and they would reach Chatwoot causing HTTP 422 loops.
+  if (msgType === 'unknown' && !hasContent) return { skipped: true };
 
   // ── Contact resolution ──
   // For groups: contact is the SENDER (participant), conversation is the GROUP
@@ -852,7 +1129,7 @@ async function dispatchSingleMessage(
       groupSubject = await resolveGroupSubject(instanceName, remoteJid);
     }
     // pushName em mensagens de grupo é o nome do REMETENTE, NÃO do grupo — ignorar para o título.
-    contactName = groupSubject || (useRealNames ? remoteJid.split('@')[0] : remoteJid.split('@')[0]);
+    contactName = groupSubject || remoteJid.split('@')[0];
 
     // Identify the actual sender for message prefix (sempre, mesmo se importContacts=false — é só prefixo)
     {
@@ -969,15 +1246,42 @@ async function dispatchSingleMessage(
 
   const messageType = isFromMe ? 'outgoing' : 'incoming';
 
-  await sendMessageToChatwoot(cwCfg, convId, {
-    content,
-    messageType,
-    sourceId: key.id,
-    // Historical messages are sent as private notes so Chatwoot does NOT
-    // fire outbound webhooks back to WhatsApp (prevents infinite loop)
-    isPrivate: options.isHistorical ?? false,
-    attachments,
-  });
+  // Fallback dedup against the tenant itself: if local tracking does not know
+  // about this msgId yet, ask Chatwoot whether this conversation already has a
+  // message with the same WhatsApp source_id. If yes, mark locally and skip.
+  if (await conversationAlreadyHasSourceId(cwCfg, convId, key.id)) {
+    markMessageSynced(instanceName, key.id, convId);
+    return { skipped: true, conversationId: convId };
+  }
+
+  try {
+    await sendMessageToChatwoot(cwCfg, convId, {
+      content,
+      messageType,
+      sourceId: key.id,
+      contentAttributes: {
+        ...(msg.quotedMessageId ? { in_reply_to_external_id: msg.quotedMessageId, quoted_external_id: msg.quotedMessageId } : {}),
+        bridged_from_whatsapp: true,
+        whatsapp_message_id: key.id,
+        whatsapp_instance: instanceName,
+        whatsapp_remote_jid: key.remoteJid,
+        whatsapp_from_me: Boolean(key.fromMe),
+      },
+      // Historical messages are sent as private notes so Chatwoot does NOT
+      // fire outbound webhooks back to WhatsApp (prevents infinite loop)
+      isPrivate: options.isHistorical ?? false,
+      attachments,
+    });
+  } catch (err) {
+    // If Chatwoot returns 404 the conversation was deleted — evict the cache so
+    // the next message triggers a fresh conversation lookup/creation.
+    if (String(err).includes('Chatwoot HTTP 404')) {
+      const cacheKey = `${instanceName}:${conversationJid}`;
+      convCache.delete(cacheKey);
+      console.warn(`[chatwoot-bridge][${instanceName}] conversation ${convId} not found (404), cache evicted`);
+    }
+    throw err;
+  }
   return { skipped: false, conversationId: convId };
 }
 
@@ -1010,10 +1314,36 @@ export interface ChatwootWebhookPayload {
     full_name?: string;
   };
   attachments?: Array<{
-    file_type: string;
-    data_url: string;
+    file_type?: string;
+    data_url?: string;
+    download_url?: string;
+    external_url?: string;
+    file_url?: string;
+    url?: string;
     file_name?: string;
   }>;
+}
+
+interface ParsedChatwootAttachment {
+  mediaUrl: string;
+  mimeType?: string;
+  fileName?: string;
+}
+
+function pickChatwootAttachmentUrl(attachment: Record<string, unknown>): string | undefined {
+  const candidates = [
+    attachment.data_url,
+    attachment.download_url,
+    attachment.external_url,
+    attachment.file_url,
+    attachment.url,
+  ];
+  for (const value of candidates) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
 }
 
 function normalizeAgentDisplayName(value: unknown): string | undefined {
@@ -1126,15 +1456,62 @@ function buildAgentNameFromPayload(payload: ChatwootWebhookPayload): string | un
 }
 
 /**
+ * Chatwoot's attachment `file_type` field can be a bare category name
+ * ("audio", "video", "image", "document", "sticker") rather than a full
+ * MIME type. This function maps it to a sensible default MIME so downstream
+ * code (sendInstanceMediaMessage) can select the right Baileys message type.
+ * If the value already looks like a MIME type (contains '/') it is returned
+ * as-is.
+ */
+function normalizeChatwootFileType(fileType: string, fileName?: string): string | undefined {
+  const ft = fileType.trim().toLowerCase();
+  if (!ft) return undefined;
+
+  // Already a full MIME type.
+  if (ft.includes('/')) return ft;
+
+  // Try to infer from fileName extension first.
+  if (fileName) {
+    const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+    const extMap: Record<string, string> = {
+      mp3: 'audio/mpeg', ogg: 'audio/ogg; codecs=opus', oga: 'audio/ogg; codecs=opus', opus: 'audio/ogg; codecs=opus',
+      m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', flac: 'audio/flac',
+      mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
+      mkv: 'video/x-matroska', webm: 'video/webm',
+      jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+      webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+      pdf: 'application/pdf', doc: 'application/msword',
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      xls: 'application/vnd.ms-excel',
+      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      ppt: 'application/vnd.ms-powerpoint',
+      pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      zip: 'application/zip', rar: 'application/x-rar-compressed',
+      txt: 'text/plain', csv: 'text/csv',
+    };
+    if (extMap[ext]) return extMap[ext];
+  }
+
+  // Map bare Chatwoot category → default MIME.
+  const categoryMap: Record<string, string> = {
+    audio:    'audio/ogg; codecs=opus',   // WhatsApp voice notes are ogg/opus by default
+    video:    'video/mp4',
+    image:    'image/jpeg',
+    sticker:  'image/webp',
+    document: 'application/octet-stream',
+    file:     'application/octet-stream',
+  };
+  return categoryMap[ft] ?? 'application/octet-stream';
+}
+
+/**
  * Process a Chatwoot webhook event.
  * Returns the JID to send to and the text, or null if not actionable.
  */
 export function parseChatwootWebhook(payload: ChatwootWebhookPayload): {
   jid: string;
   text: string;
-  mediaUrl?: string;
-  mimeType?: string;
-  fileName?: string;
+  attachments?: ParsedChatwootAttachment[];
   replyToId?: string;
   agentName?: string;
 } | null {
@@ -1142,8 +1519,10 @@ export function parseChatwootWebhook(payload: ChatwootWebhookPayload): {
   if (payload.event !== 'message_created') return null;
   if (payload.message_type !== 'outgoing') return null;
   if (payload.private) return null;
+  const attrs = payload.content_attributes ?? {};
+  if (attrs['bridged_from_whatsapp'] === true || attrs['bridge_source'] === 'whatsapp') return null;
   // Skip messages from contact themselves (would cause a loop)
-  if (payload.sender?.type === 'contact') return null;
+  if (payload.sender?.type === 'contact' || payload.sender?.type === 'agent_bot') return null;
 
   const identifier = payload.conversation?.meta?.sender?.identifier;
   const phone = payload.conversation?.meta?.sender?.phone_number;
@@ -1157,8 +1536,10 @@ export function parseChatwootWebhook(payload: ChatwootWebhookPayload): {
 
   if (!jid) return null;
 
-  const attrs = payload.content_attributes ?? {};
-  const text = payload.content ?? '';
+  // Chatwoot pode entregar texto com escapes literais (\n, \r\n) — convertemos
+  // para caracteres reais para que o WhatsApp renderize quebras de linha
+  // corretamente.
+  const text = decodeChatwootEscapes(payload.content ?? '');
   const agentName = buildAgentNameFromPayload(payload);
   const directReplySource = [
     attrs['in_reply_to_external_id'],
@@ -1183,14 +1564,24 @@ export function parseChatwootWebhook(payload: ChatwootWebhookPayload): {
     }
   }
 
-  // Check for attachment
-  const firstAttachment = payload.attachments?.[0];
-  if (firstAttachment?.data_url) {
+  const attachments = (payload.attachments ?? [])
+    .map((attachment) => ({
+      attachment,
+      mediaUrl: pickChatwootAttachmentUrl(attachment as Record<string, unknown>),
+    }))
+    .filter((item) => typeof item.mediaUrl === 'string' && item.mediaUrl.trim())
+    .map(({ attachment, mediaUrl }) => {
+      const fileName = typeof attachment.file_name === 'string' ? attachment.file_name : undefined;
+      const rawType  = typeof attachment.file_type === 'string' ? attachment.file_type : '';
+      const mimeType = normalizeChatwootFileType(rawType, fileName);
+      return { mediaUrl: mediaUrl!, mimeType, fileName };
+    });
+
+  if (attachments.length > 0) {
     return {
       jid,
       text,
-      mediaUrl: firstAttachment.data_url,
-      fileName: firstAttachment.file_name,
+      attachments,
       replyToId,
       agentName,
     };
@@ -1306,6 +1697,7 @@ export async function autoCreateChatwootInbox(
     baseUrl: cfg.baseUrl,
     accountId: cfg.accountId,
     apiAccessToken: cfg.apiAccessToken,
+    inboxId: cfg.inboxId,
   };
 
   const inboxName = cfg.nameInbox || instanceName;
@@ -1338,8 +1730,7 @@ export async function autoCreateChatwootInbox(
     // Patch inbox webhook_url with our endpoint
     // We need the origin from config — use baseUrl of the local server
     // The webhook URL is built from process.env or a default
-    const serverOrigin = process.env.SERVER_URL?.replace(/\/$/, '') ?? `http://localhost:${process.env.PORT ?? '8787'}`;
-    const webhookUrl = `${serverOrigin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+    const webhookUrl = buildChatwootWebhookUrl(slug);
 
     try {
       await cwFetch(cwCfg, 'PATCH', `/inboxes/${inbox.id}`, {
@@ -1372,6 +1763,16 @@ export async function autoCreateChatwootInbox(
 // ─── Conversation cache invalidation ─────────────────────────────────────────
 
 export function invalidateConversationCache(instanceName: string): void {
+  let sourceCachePrefix: string | null = null;
+  try {
+    const integrations = getInstanceIntegrations(instanceName);
+    const cfg = integrations.chatwoot;
+    if (cfg.baseUrl && cfg.accountId) {
+      sourceCachePrefix = `${cfg.baseUrl}|${cfg.accountId}|`;
+    }
+  } catch {
+    sourceCachePrefix = null;
+  }
   for (const key of convCache.keys()) {
     if (key.startsWith(`${instanceName}:`)) {
       convCache.delete(key);
@@ -1392,6 +1793,16 @@ export function invalidateConversationCache(instanceName: string): void {
       inboxInFlight.delete(key);
     }
   }
+  for (const key of conversationMessageSourceHitCache.keys()) {
+    if (sourceCachePrefix && key.startsWith(sourceCachePrefix)) {
+      conversationMessageSourceHitCache.delete(key);
+    }
+  }
+  for (const key of conversationMessageSourceInFlight.keys()) {
+    if (sourceCachePrefix && key.startsWith(sourceCachePrefix)) {
+      conversationMessageSourceInFlight.delete(key);
+    }
+  }
 }
 
 // ─── History sync ─────────────────────────────────────────────────────────────
@@ -1408,6 +1819,9 @@ export async function syncHistoryToChatwoot(
   limitPerChat = 200,
   trigger: 'manual' | 'connect' = 'manual',
 ): Promise<{ ok: boolean; synced: number; errors: number; skipped?: number; cancelled?: boolean; error?: string }> {
+  const { getInstance } = await import('./whatsapp.js');
+  const isInstanceConnected = () => getInstance(instanceName)?.status === 'connected';
+
   // Reject concurrent runs
   if (isSyncRunning(instanceName)) {
     return { ok: false, synced: 0, errors: 0, error: 'A sync is already running for this instance' };
@@ -1421,7 +1835,7 @@ export async function syncHistoryToChatwoot(
     return { ok: false, synced: 0, errors: 0, error: 'Failed to load integrations' };
   }
 
-  if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken || !cfg.inboxId) {
+  if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken) {
     return { ok: false, synced: 0, errors: 0, error: 'Chatwoot not configured or disabled' };
   }
 
@@ -1434,6 +1848,7 @@ export async function syncHistoryToChatwoot(
     baseUrl: cfg.baseUrl,
     accountId: cfg.accountId,
     apiAccessToken: cfg.apiAccessToken,
+    inboxId: cfg.inboxId,
   };
 
   // Calculate afterTs from daysLimitImportMessages (0 = no limit)
@@ -1461,16 +1876,15 @@ export async function syncHistoryToChatwoot(
   startSyncProgress(instanceName, trigger, days);
   updateSyncProgress(instanceName, { totalChats: chats.length });
 
+  if (!isInstanceConnected()) {
+    finishSyncProgress(instanceName, 'cancelled', 'instance_not_connected');
+    return { ok: false, synced: 0, errors: 0, skipped: 0, cancelled: true, error: 'instance_not_connected' };
+  }
+
   if (chats.length === 0) {
     finishSyncProgress(instanceName, 'completed');
     console.log(`[chatwoot-bridge][${instanceName}] sync-history done: synced=0 errors=0 skipped=0 chats=0`);
     return { ok: true, synced: 0, errors: 0, skipped: 0 };
-  }
-
-  const inbox = await getInbox(instanceName, cwCfg, cfg.nameInbox || 'WhatsApp');
-  if (!inbox) {
-    finishSyncProgress(instanceName, 'failed', `Inbox "${cfg.nameInbox}" not found`);
-    return { ok: false, synced: 0, errors: 0, error: `Inbox "${cfg.nameInbox}" not found` };
   }
 
   let synced = 0;
@@ -1490,127 +1904,180 @@ export async function syncHistoryToChatwoot(
   };
 
   try {
+    const inbox = await getInbox(instanceName, cwCfg, cfg.nameInbox || 'WhatsApp');
+    if (!inbox) {
+      finishSyncProgress(instanceName, 'failed', `Inbox "${cfg.nameInbox}" not found`);
+      return { ok: false, synced: 0, errors: 0, error: `Inbox "${cfg.nameInbox}" not found` };
+    }
+
     for (let i = 0; i < chats.length; i++) {
       // Check cancellation between chats
-      if (isSyncCancelled(instanceName)) {
+      if (isSyncCancelled(instanceName) || !isInstanceConnected()) {
         cancelled = true;
         break;
       }
 
       const chat = chats[i];
-      // Pass afterTs to filter messages by date
-      const pendingMessages = listUnsyncedSyncMessages(instanceName, chat.jid, limitPerChat, afterTs);
+      let chatSynced = 0;
+      let chatSkipped = 0;
+      let chatErrors = 0;
+      const attemptedIds = new Set<string>();
 
-      // Update progress with current chat info
       const chatTitle = chat.title || getChatTitle(instanceName, chat.jid);
       updateSyncProgress(instanceName, {
         currentChatJid: chat.jid,
         currentChatTitle: chatTitle,
         processedChats: i,
-        totalMessages: pendingMessages.length,
+        totalMessages: 0,
       });
 
-      if (pendingMessages.length === 0) {
-        updateSyncProgress(instanceName, { processedChats: i + 1 });
-        continue;
-      }
-      const hydrateIds = new Set(
-        pendingMessages
-          .filter((stored) => {
-            if (stored.media) return true;
-            if (chat.jid.endsWith('@g.us')) return true;
-            if (!stored.senderName && !stored.senderNumber) return true;
-            return false;
-          })
-          .map((stored) => stored.id),
-      );
-      const hydratedById = hydrateIds.size > 0
-        ? await loadHydratedChatMessages(instanceName, chat.jid, hydrateIds)
-        : new Map();
-
-      // Already sorted ASC by ts from SQLite, but ensure it
-      pendingMessages.sort((a, b) => a.timestamp - b.timestamp);
-
-      for (const stored of pendingMessages) {
-        // Check cancellation inside inner loop too
-        if (isSyncCancelled(instanceName)) {
-          cancelled = true;
+      while (true) {
+        const fetchLimit = limitPerChat + attemptedIds.size;
+        const candidates = listUnsyncedSyncMessages(instanceName, chat.jid, fetchLimit, afterTs);
+        const batch = candidates
+          .filter((stored) => !attemptedIds.has(stored.id))
+          .slice(0, limitPerChat);
+        if (batch.length === 0) {
+          if (chatSynced === 0 && chatSkipped === 0 && chatErrors === 0) {
+            updateSyncProgress(instanceName, { processedChats: i + 1 });
+          }
           break;
         }
 
-        // Skip messages already synced (deduplication via SQLite tracking)
-        if (!beginMessageSync(instanceName, stored.id, true)) {
-          skipped++;
-          progressDirty = true;
-          if ((synced + skipped + errors) % 10 === 0) flushProgress();
-          continue;
-        }
+        updateSyncProgress(instanceName, {
+          currentChatJid: chat.jid,
+          currentChatTitle: chatTitle,
+          processedChats: i,
+          totalMessages: chatSynced + chatSkipped + chatErrors + batch.length,
+        });
 
-        // Build a minimal NormalizedMessage from stored data
-        const participantJid = chat.jid.endsWith('@g.us') && !stored.fromMe && stored.senderNumber
-          ? `${stored.senderNumber.replace(/[^0-9]/g, '')}@s.whatsapp.net`
-          : undefined;
-        const hydrated = hydratedById.get(stored.id);
-        const hydratedParticipant = hydrated?.participant;
-        const hydratedMedia = hydrated?.media as NormalizedMessage['media'] | undefined;
-        const hydratedSender = hydrated?.sender as NormalizedMessage['sender'] | undefined;
-        const hydratedPushName = typeof hydrated?.pushName === 'string' ? hydrated.pushName : undefined;
+        const hydrateIds = new Set(
+          batch
+            .filter((stored) => {
+              if (stored.media) return true;
+              if (chat.jid.endsWith('@g.us')) return true;
+              if (!stored.senderName && !stored.senderNumber) return true;
+              return false;
+            })
+            .map((stored) => stored.id),
+        );
+        const hydratedById = hydrateIds.size > 0
+          ? await loadHydratedChatMessages(instanceName, chat.jid, hydrateIds)
+          : new Map();
 
-        const normalized: NormalizedMessage = {
-          key: {
-            remoteJid: chat.jid,
-            fromMe: stored.fromMe,
-            id: stored.id,
-            participant: hydratedParticipant || participantJid,
-          },
-          pushName: hydratedPushName || stored.senderName || undefined,
-          text: stored.text || undefined,
-          messageType: typeof hydratedMedia?.kind === 'string'
-            ? hydratedMedia.kind
-            : typeof stored.media?.kind === 'string'
-              ? stored.media.kind
-              : (stored.media ? 'media' : 'text'),
-          sender: hydratedSender || (stored.senderNumber
-            ? { number: stored.senderNumber, name: stored.senderName ?? undefined }
-            : undefined),
-          timestamp: stored.timestamp,
-          media: hydratedMedia || (stored.media as NormalizedMessage['media']),
-          message: undefined,
-        };
+        batch.sort((a, b) => a.timestamp - b.timestamp);
 
-        try {
-          const result = await dispatchSingleMessage(instanceName, cwCfg, historyCfg, inbox, normalized, {
-            isHistorical: true,
-            skipPersistedDedupCheck: true,
-          });
-          if (!result.skipped && result.conversationId) {
-            // Mark as synced ONLY when actually delivered to Chatwoot
-            markMessageSynced(instanceName, stored.id, result.conversationId);
-            synced++;
-            progressDirty = true;
-          } else {
-            // Dispatch returned skipped (filtered by content/system check)
-            skipped++;
-            progressDirty = true;
+        for (const stored of batch) {
+          attemptedIds.add(stored.id);
+        // Check cancellation inside inner loop too
+          if (isSyncCancelled(instanceName) || !isInstanceConnected()) {
+            cancelled = true;
+            break;
           }
-          if ((synced + skipped + errors) % 10 === 0) flushProgress();
-        } catch (err) {
-          errors++;
-          progressDirty = true;
-          updateSyncProgress(instanceName, {
-            syncedMessages: synced,
-            skippedMessages: skipped,
-            errorCount: errors,
-            lastError: (err as Error).message,
-          });
-          progressDirty = false;
-          console.error(`[chatwoot-bridge][${instanceName}] sync-history error for ${stored.id}`, (err as Error).message);
-        } finally {
-          finishMessageSync(instanceName, stored.id);
+
+          if (!beginMessageSync(instanceName, stored.id, true)) {
+            skipped++;
+            chatSkipped++;
+            progressDirty = true;
+            if ((synced + skipped + errors) % 10 === 0) flushProgress();
+            continue;
+          }
+
+          const participantJid = chat.jid.endsWith('@g.us') && !stored.fromMe && stored.senderNumber
+            ? `${stored.senderNumber.replace(/[^0-9]/g, '')}@s.whatsapp.net`
+            : undefined;
+          const hydrated = hydratedById.get(stored.id);
+          const hydratedParticipant = hydrated?.participant;
+          const hydratedMedia = hydrated?.media as NormalizedMessage['media'] | undefined;
+          const hydratedSender = hydrated?.sender as NormalizedMessage['sender'] | undefined;
+          const hydratedPushName = typeof hydrated?.pushName === 'string' ? hydrated.pushName : undefined;
+
+          const normalized: NormalizedMessage = {
+            key: {
+              remoteJid: chat.jid,
+              fromMe: stored.fromMe,
+              id: stored.id,
+              participant: hydratedParticipant || participantJid,
+            },
+            pushName: hydratedPushName || stored.senderName || undefined,
+            text: stored.text || undefined,
+            messageType: typeof hydratedMedia?.kind === 'string'
+              ? hydratedMedia.kind
+              : typeof stored.media?.kind === 'string'
+                ? stored.media.kind
+                : (stored.media ? 'media' : 'text'),
+            sender: hydratedSender || (stored.senderNumber
+              ? { number: stored.senderNumber, name: stored.senderName ?? undefined }
+              : undefined),
+            timestamp: stored.timestamp,
+            quotedMessageId: stored.quotedMessageId,
+            media: hydratedMedia || (stored.media as NormalizedMessage['media']),
+            message: undefined,
+          };
+
+          try {
+            const result = await dispatchSingleMessage(instanceName, cwCfg, historyCfg, inbox, normalized, {
+              isHistorical: true,
+              skipPersistedDedupCheck: true,
+            });
+            if (!result.skipped && result.conversationId) {
+              try {
+                markMessageSynced(instanceName, stored.id, result.conversationId);
+              } catch (dbErr) {
+                console.error(`[chatwoot-bridge][${instanceName}] markMessageSynced failed for ${stored.id} — message was sent but dedup record not saved`, dbErr);
+              }
+              synced++;
+              chatSynced++;
+              progressDirty = true;
+            } else {
+              skipped++;
+              chatSkipped++;
+              progressDirty = true;
+            }
+            if ((synced + skipped + errors) % 10 === 0) flushProgress();
+          } catch (err) {
+            errors++;
+            chatErrors++;
+            progressDirty = true;
+            const errMsg = (err as Error)?.message || String(err);
+            // Registra na lista detalhada (popup da UI lê isso) e atualiza
+            // contadores. `appendSyncError` já incrementa errorCount, então
+            // recompomos a partir de `errors` (fonte da verdade local) para
+            // manter consistência mesmo após restarts/concorrência.
+            appendSyncError(instanceName, {
+              jid: chat.jid,
+              chatTitle,
+              msgId: stored.id,
+              error: errMsg,
+              scope: 'history-dispatch',
+            });
+            updateSyncProgress(instanceName, {
+              syncedMessages: synced,
+              skippedMessages: skipped,
+              errorCount: errors,
+              lastError: errMsg,
+            });
+            progressDirty = false;
+            console.error(`[chatwoot-bridge][${instanceName}] sync-history error for ${stored.id}`, errMsg);
+          } finally {
+            finishMessageSync(instanceName, stored.id);
+          }
+
+          // Throttle adaptativo:
+          //   - delay base entre mensagens (default 250ms) para não saturar
+          //     a API do Chatwoot e o I/O local;
+          //   - pausa maior a cada `syncBatchSize` mensagens processadas
+          //     (default 1s a cada 50) — alivia o event loop e dá espaço para
+          //     o resto da aplicação responder rápido durante o sync.
+          await new Promise((r) => setTimeout(r, config.chatwoot.syncMessageDelayMs));
+          const processed = synced + skipped + errors;
+          if (processed > 0 && processed % config.chatwoot.syncBatchSize === 0) {
+            await new Promise((r) => setTimeout(r, config.chatwoot.syncBatchPauseMs));
+          }
         }
 
-        // Delay to avoid rate-limiting Chatwoot (100ms between messages)
-        await new Promise(r => setTimeout(r, 100));
+        if (cancelled) break;
+        if (candidates.length < fetchLimit && batch.length < limitPerChat) break;
       }
 
       flushProgress(true);

@@ -248,8 +248,15 @@
     intSyncSent: document.getElementById('intSyncSent'),
     intSyncSkipped: document.getElementById('intSyncSkipped'),
     intSyncErrors: document.getElementById('intSyncErrors'),
+    intSyncErrorsStat: document.getElementById('intSyncErrorsStat'),
+    intSyncErrorsModal: document.getElementById('intSyncErrorsModal'),
+    intSyncErrorsModalClose: document.getElementById('intSyncErrorsModalClose'),
+    intSyncErrorsList: document.getElementById('intSyncErrorsList'),
     btnCancelSyncInt: document.getElementById('btnCancelSyncInt'),
   };
+
+  // Último progress recebido (usado pelo modal de erros).
+  let lastSyncProgress = null;
 
   // ============ Status chip ============
   function updateHeaderStatus(status) {
@@ -1048,7 +1055,7 @@
   el.btnUnmarkAllEvents.addEventListener('click', () => setAllEventToggles(false));
 
   // ============ Integrations ============
-  function fillIntegrations(integ) {
+  function fillIntegrations(integ, webhookUrlOverride) {
     const cw = integ?.chatwoot || {};
     el.intChatwoot.enabled.checked = !!cw.enabled;
     el.intChatwoot.baseUrl.value = cw.baseUrl || '';
@@ -1070,7 +1077,7 @@
     el.intChatwoot.autoCreate.checked = !!cw.autoCreate;
 
     const slug = (cw.webhookSlug || instance).trim();
-    el.intChatwoot.webhookUrl.textContent = `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+    el.intChatwoot.webhookUrl.textContent = webhookUrlOverride || `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
     show(el.intChatwoot.webhookInfo, true);
 
     const n8 = integ?.n8n || {};
@@ -1085,7 +1092,7 @@
     try {
       const { response, data } = await api(`/v1/integrations/${encodeURIComponent(instance)}`);
       if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
-      fillIntegrations(data.integration);
+      fillIntegrations(data.integration, data.chatwootWebhookUrl);
       pollSyncOnce();
     } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
     finally { endLoad('integrations'); }
@@ -1121,7 +1128,7 @@
         method: 'PATCH', body: JSON.stringify(buildIntChatwootBody())
       });
       if (!response.ok) { setResult(el.integrationsResult, data.error || 'Falha.', 'error'); return; }
-      fillIntegrations(data.integration);
+      fillIntegrations(data.integration, data.chatwootWebhookUrl);
       setResultAuto(el.integrationsResult, 'Configuração Chatwoot salva.', 'success');
     } catch (err) { setResult(el.integrationsResult, err.message || 'Erro.', 'error'); }
   }
@@ -1192,10 +1199,18 @@
     el.intSyncBadge.className = 'badge ' + s.cls;
     show(el.btnCancelSyncInt, p.status === 'running');
 
+    const sent = p.syncedMessages || 0;
+    const skipped = p.skippedMessages || 0;
+    const errorCount = p.errorCount || 0;
+    const totalAttempted = sent + skipped + errorCount;
+
     el.intSyncChats.textContent = `${p.processedChats || 0}/${p.totalChats || 0}`;
-    el.intSyncSent.textContent = String(p.syncedMessages || 0);
-    el.intSyncSkipped.textContent = String(p.skippedMessages || 0);
-    el.intSyncErrors.textContent = String(p.errorCount || 0);
+    el.intSyncSent.textContent = `${sent}/${totalAttempted}`;
+    el.intSyncSkipped.textContent = String(skipped);
+    el.intSyncErrors.textContent = String(errorCount);
+    if (el.intSyncErrorsStat) el.intSyncErrorsStat.classList.toggle('has-errors', errorCount > 0);
+
+    lastSyncProgress = p;
 
     const trigger = p.trigger ? ` • disparo: ${p.trigger}` : '';
     el.intSyncCurrent.textContent = (p.currentChatTitle || (p.lastError ? 'erro: ' + p.lastError : (p.status === 'running' ? 'preparando...' : ''))) + trigger;
@@ -1212,6 +1227,47 @@
     } else if (p.status === 'completed') {
       el.intSyncFill.style.width = '100%';
     }
+  }
+
+  // ============ Modal de erros do sync ============
+  function renderSyncErrors(p) {
+    const list = el.intSyncErrorsList;
+    if (!list) return;
+    const errors = Array.isArray(p?.errors) ? p.errors : [];
+    if (errors.length === 0) {
+      list.innerHTML = '<div class="sync-error-empty">Sem erros registrados neste sync.</div>';
+      return;
+    }
+    const ordered = [...errors].sort((a, b) => (b?.at || 0) - (a?.at || 0));
+    const fmt = (ts) => {
+      if (!ts) return '';
+      try { return new Date(ts).toLocaleString(); } catch { return ''; }
+    };
+    const escape = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    list.innerHTML = ordered.map((e) => {
+      const meta = [];
+      if (e.at) meta.push(`<span>${escape(fmt(e.at))}</span>`);
+      if (e.chatTitle) meta.push(`<span>chat: ${escape(e.chatTitle)}</span>`);
+      else if (e.jid) meta.push(`<span>jid: ${escape(e.jid)}</span>`);
+      if (e.msgId) meta.push(`<span>msg: ${escape(e.msgId)}</span>`);
+      if (e.scope) meta.push(`<span>scope: ${escape(e.scope)}</span>`);
+      return `<div class="sync-error-item">
+        <div class="sync-error-meta">${meta.join('')}</div>
+        <div class="sync-error-message">${escape(e.error || '(sem mensagem)')}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function openSyncErrorsModal() {
+    if (!el.intSyncErrorsModal) return;
+    renderSyncErrors(lastSyncProgress);
+    el.intSyncErrorsModal.classList.remove('hidden');
+  }
+  function closeSyncErrorsModal() {
+    if (!el.intSyncErrorsModal) return;
+    el.intSyncErrorsModal.classList.add('hidden');
   }
 
   async function pollSyncOnce() {
@@ -1303,6 +1359,31 @@
   el.btnSyncContactNamesIntChatwoot.addEventListener('click', syncContactNamesIntegrationChatwoot);
   el.btnSyncHistoryIntChatwoot.addEventListener('click', startSyncHistory);
   el.btnCancelSyncInt.addEventListener('click', cancelSync);
+
+  // Modal de erros do sync (instance)
+  if (el.intSyncErrorsStat) {
+    el.intSyncErrorsStat.addEventListener('click', openSyncErrorsModal);
+    el.intSyncErrorsStat.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openSyncErrorsModal();
+      }
+    });
+  }
+  if (el.intSyncErrorsModalClose) {
+    el.intSyncErrorsModalClose.addEventListener('click', closeSyncErrorsModal);
+  }
+  if (el.intSyncErrorsModal) {
+    el.intSyncErrorsModal.addEventListener('click', (ev) => {
+      if (ev.target === el.intSyncErrorsModal) closeSyncErrorsModal();
+    });
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && el.intSyncErrorsModal && !el.intSyncErrorsModal.classList.contains('hidden')) {
+      closeSyncErrorsModal();
+    }
+  });
+
   el.btnSaveIntN8n.addEventListener('click', saveIntegrationN8n);
   el.btnTestIntN8n.addEventListener('click', testIntegrationN8n);
 

@@ -5,9 +5,27 @@ import { writeAuditEvent } from '../services/audit-log.js';
 import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
 import { getInstanceIntegrations, listIntegrationInstances, testChatwoot, testN8n, updateChatwootConfig, updateN8nConfig, } from '../services/integrations.js';
-import { parseChatwootWebhook, invalidateConversationCache, } from '../services/chatwoot-bridge.js';
-import { sendInstanceTextMessage, sendInstanceMediaMessage, } from '../services/whatsapp.js';
+import { syncContactNamesToChatwoot, buildChatwootWebhookUrl, normalizeChatwootWebhookSlug, invalidateConversationCache, } from '../services/chatwoot-bridge.js';
 const router = Router();
+const NUMERIC_ID_PATTERN = /^\d{1,20}$/;
+const HEADER_NAME_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
+function isOptionalNumericId(value) {
+    if (value === undefined)
+        return true;
+    return NUMERIC_ID_PATTERN.test(String(value).trim());
+}
+function isOptionalMaxLength(value, max) {
+    if (value === undefined)
+        return true;
+    return String(value).trim().length <= max;
+}
+function buildWebhookPayload(instance, integration = getInstanceIntegrations(instance)) {
+    const slug = integration.chatwoot.webhookSlug?.trim() || instance;
+    return {
+        integration,
+        chatwootWebhookUrl: buildChatwootWebhookUrl(slug),
+    };
+}
 function getInstanceParam(req, res) {
     const instance = normalizeInstanceName(req.params.instance);
     if (!instance) {
@@ -23,7 +41,7 @@ router.get('/:instance', (req, res) => {
     const instance = getInstanceParam(req, res);
     if (!instance)
         return;
-    return sendOk(res, { integration: getInstanceIntegrations(instance) });
+    return sendOk(res, buildWebhookPayload(instance));
 });
 router.patch('/:instance/chatwoot', (req, res) => {
     const instance = getInstanceParam(req, res);
@@ -57,6 +75,40 @@ router.patch('/:instance/chatwoot', (req, res) => {
                 .filter(Boolean);
         }
     }
+    if (body.webhookSlug !== undefined) {
+        const normalizedSlug = normalizeChatwootWebhookSlug(body.webhookSlug);
+        if (!normalizedSlug) {
+            return sendError(res, 400, 'invalid_chatwoot_webhook_slug');
+        }
+    }
+    if (!isOptionalNumericId(body.accountId)) {
+        return sendError(res, 400, 'invalid_chatwoot_account_id');
+    }
+    if (!isOptionalNumericId(body.inboxId)) {
+        return sendError(res, 400, 'invalid_chatwoot_inbox_id');
+    }
+    if (!isOptionalMaxLength(body.apiAccessToken, 2048)) {
+        return sendError(res, 400, 'invalid_chatwoot_token_length');
+    }
+    if (!isOptionalMaxLength(body.nameInbox, 120)) {
+        return sendError(res, 400, 'invalid_chatwoot_name_inbox');
+    }
+    if (!isOptionalMaxLength(body.organization, 160)) {
+        return sendError(res, 400, 'invalid_chatwoot_organization');
+    }
+    if (!isOptionalMaxLength(body.signDelimiter, 16)) {
+        return sendError(res, 400, 'invalid_chatwoot_sign_delimiter');
+    }
+    if (body.daysLimitImportMessages !== undefined) {
+        const days = Number(body.daysLimitImportMessages);
+        // 0 = no limit (sync all history), 1–365 = limit to N days
+        if (!Number.isFinite(days) || days < 0 || days > 365) {
+            return sendError(res, 400, 'invalid_chatwoot_days_limit');
+        }
+    }
+    if (ignoreJids && (ignoreJids.length > 500 || ignoreJids.some((jid) => jid.length > 160))) {
+        return sendError(res, 400, 'invalid_chatwoot_ignore_jids');
+    }
     const integration = updateChatwootConfig(instance, {
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
         baseUrl,
@@ -64,6 +116,7 @@ router.patch('/:instance/chatwoot', (req, res) => {
         inboxId: body.inboxId !== undefined ? String(body.inboxId).trim() : undefined,
         apiAccessToken: body.apiAccessToken !== undefined ? String(body.apiAccessToken).trim() : undefined,
         nameInbox: body.nameInbox !== undefined ? String(body.nameInbox).trim() : undefined,
+        webhookSlug: body.webhookSlug !== undefined ? normalizeChatwootWebhookSlug(body.webhookSlug) : undefined,
         signMessages: typeof body.signMessages === 'boolean' ? body.signMessages : undefined,
         signDelimiter: body.signDelimiter !== undefined ? String(body.signDelimiter) : undefined,
         organization: body.organization !== undefined ? String(body.organization).trim() : undefined,
@@ -76,6 +129,7 @@ router.patch('/:instance/chatwoot', (req, res) => {
         ignoreJids,
         autoCreate: typeof body.autoCreate === 'boolean' ? body.autoCreate : undefined,
     });
+    invalidateConversationCache(instance);
     // Note: history sync now happens ONLY on connection=open (see whatsapp.ts) or via manual button.
     // Removed auto-sync on save to avoid re-syncing every time other flags toggle.
     writeAuditEvent(req, res, {
@@ -86,7 +140,7 @@ router.patch('/:instance/chatwoot', (req, res) => {
             hasToken: Boolean(integration.chatwoot.apiAccessToken),
         },
     });
-    return sendOk(res, { integration });
+    return sendOk(res, buildWebhookPayload(instance, integration));
 });
 router.patch('/:instance/n8n', (req, res) => {
     const instance = getInstanceParam(req, res);
@@ -107,6 +161,15 @@ router.patch('/:instance/n8n', (req, res) => {
         }
         webhookUrl = validation.normalizedUrl;
     }
+    if (body.authHeaderName !== undefined) {
+        const headerName = String(body.authHeaderName).trim();
+        if (headerName && !HEADER_NAME_PATTERN.test(headerName)) {
+            return sendError(res, 400, 'invalid_n8n_auth_header_name');
+        }
+    }
+    if (!isOptionalMaxLength(body.authHeaderValue, 1024)) {
+        return sendError(res, 400, 'invalid_n8n_auth_header_value');
+    }
     const integration = updateN8nConfig(instance, {
         enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
         webhookUrl,
@@ -121,7 +184,7 @@ router.patch('/:instance/n8n', (req, res) => {
             hasAuthHeader: Boolean(integration.n8n.authHeaderName && integration.n8n.authHeaderValue),
         },
     });
-    return sendOk(res, { integration });
+    return sendOk(res, buildWebhookPayload(instance, integration));
 });
 router.post('/:instance/chatwoot/test', async (req, res) => {
     const instance = getInstanceParam(req, res);
@@ -148,6 +211,22 @@ router.post('/:instance/chatwoot/test', async (req, res) => {
     }
     return sendOk(res, { tested: true, status: result.status ?? 200 });
 });
+router.post('/:instance/chatwoot/sync-contact-names', async (req, res) => {
+    const instance = getInstanceParam(req, res);
+    if (!instance)
+        return;
+    const result = await syncContactNamesToChatwoot(instance);
+    writeAuditEvent(req, res, {
+        action: 'integrations.chatwoot.sync_contact_names',
+        target: instance,
+        outcome: result.ok ? 'success' : 'failure',
+        details: result,
+    });
+    if (!result.ok) {
+        return sendError(res, 400, result.error || 'chatwoot_sync_contact_names_failed');
+    }
+    return sendOk(res, { result });
+});
 router.post('/:instance/n8n/test', async (req, res) => {
     const instance = getInstanceParam(req, res);
     if (!instance)
@@ -172,75 +251,6 @@ router.post('/:instance/n8n/test', async (req, res) => {
         return sendError(res, 502, 'n8n_test_failed', result.error);
     }
     return sendOk(res, { tested: true, status: result.status ?? 200 });
-});
-/**
- * POST /v1/integrations/:instance/chatwoot/webhook
- *
- * Receives Chatwoot webhook events and dispatches outgoing agent messages
- * back to WhatsApp. Configure this URL in Chatwoot under Settings → Integrations → Webhooks.
- *
- * This endpoint does NOT require API key authentication so Chatwoot can reach it directly.
- * Security: We validate that the instance has Chatwoot enabled before processing.
- */
-router.post('/:instance/chatwoot/webhook', async (req, res) => {
-    const instance = getInstanceParam(req, res);
-    if (!instance)
-        return;
-    const body = (req.body ?? {});
-    // Quick ack to Chatwoot — must respond fast to avoid retries
-    res.status(200).json({ ok: true });
-    // Validate integration is configured and enabled
-    let integrationCfg;
-    try {
-        const integrations = getInstanceIntegrations(instance);
-        integrationCfg = integrations.chatwoot;
-    }
-    catch {
-        return;
-    }
-    if (!integrationCfg.enabled)
-        return;
-    // Parse the webhook payload
-    const action = parseChatwootWebhook(body);
-    if (!action)
-        return;
-    const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
-    try {
-        if (mediaUrl) {
-            await sendInstanceMediaMessage(instance, jid, {
-                mediaUrl,
-                mimeType,
-                fileName,
-                caption: text || undefined,
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
-        }
-        else if (text) {
-            await sendInstanceTextMessage(instance, jid, text, {
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
-        }
-    }
-    catch (err) {
-        console.error(`[chatwoot-webhook][${instance}] dispatch error`, err);
-    }
-});
-/**
- * POST /v1/integrations/:instance/chatwoot/invalidate-cache
- *
- * Clears the in-memory conversation/inbox cache for this instance.
- * Useful after changing inbox configuration.
- */
-router.post('/:instance/chatwoot/invalidate-cache', (req, res) => {
-    const instance = getInstanceParam(req, res);
-    if (!instance)
-        return;
-    invalidateConversationCache(instance);
-    return sendOk(res, { invalidated: true });
 });
 export default router;
 //# sourceMappingURL=integrations.js.map

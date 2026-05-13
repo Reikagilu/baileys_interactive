@@ -384,7 +384,20 @@
                 <div class="sync-stat"><div class="sync-stat-label">Chats</div><div class="sync-stat-value" id="intSyncChats">0/0</div></div>
                 <div class="sync-stat"><div class="sync-stat-label">Enviadas</div><div class="sync-stat-value" id="intSyncSent">0</div></div>
                 <div class="sync-stat"><div class="sync-stat-label">Já sincronizadas</div><div class="sync-stat-value" id="intSyncSkipped">0</div></div>
-                <div class="sync-stat"><div class="sync-stat-label">Erros</div><div class="sync-stat-value" id="intSyncErrors">0</div></div>
+                <div class="sync-stat sync-stat-clickable" id="intSyncErrorsStat" role="button" tabindex="0" aria-haspopup="dialog" title="Clique para ver detalhes dos erros"><div class="sync-stat-label">Erros</div><div class="sync-stat-value" id="intSyncErrors">0</div></div>
+              </div>
+            </div>
+
+            <!-- Modal: detalhes de erros do sync -->
+            <div id="intSyncErrorsModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="intSyncErrorsModalTitle">
+              <div class="modal-dialog">
+                <div class="modal-header">
+                  <h3 id="intSyncErrorsModalTitle" class="modal-title">Erros do sync</h3>
+                  <button type="button" class="modal-close" id="intSyncErrorsModalClose" aria-label="Fechar">&times;</button>
+                </div>
+                <div class="modal-body">
+                  <div id="intSyncErrorsList" class="sync-errors-list">Sem erros registrados.</div>
+                </div>
               </div>
             </div>
           </div>

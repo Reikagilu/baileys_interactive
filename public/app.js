@@ -126,8 +126,16 @@
     sent: document.getElementById('chatwootSyncSent'),
     skipped: document.getElementById('chatwootSyncSkipped'),
     errors: document.getElementById('chatwootSyncErrors'),
+    errorsStat: document.getElementById('chatwootSyncErrorsStat'),
     cancel: document.getElementById('btnCancelSyncChatwoot'),
   };
+  const syncErrorsModal = {
+    overlay: document.getElementById('syncErrorsModal'),
+    list: document.getElementById('syncErrorsList'),
+    closeBtn: document.getElementById('syncErrorsModalClose'),
+  };
+  /** Última cópia do progresso recebido pelo polling — usada para preencher o modal sob demanda. */
+  let lastSyncProgress = null;
 
   let lastInstanceListMeta = { saved: [], instances: [] };
   let lastConnectSelectMeta = [];
@@ -809,7 +817,7 @@
   // Sync progress polling state
   let syncPollHandle = null;
 
-  function fillIntegrationsForm(integration) {
+  function fillIntegrationsForm(integration, webhookUrlOverride) {
     const cw = integration?.chatwoot || {};
     intUi.chatwoot.enabled.checked = !!cw.enabled;
     intUi.chatwoot.baseUrl.value = cw.baseUrl || '';
@@ -838,7 +846,7 @@
 
     // Webhook URL display
     const slug = (cw.webhookSlug || integrationInstanceEl.value || 'main').trim();
-    const url = `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
+    const url = webhookUrlOverride || `${window.location.origin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
     intUi.chatwoot.webhookUrl.textContent = url;
     show(intUi.chatwoot.webhookInfo, true);
   }
@@ -851,7 +859,7 @@
       const res = await fetch(`${API}/v1/integrations/${encodeURIComponent(instance)}`, { headers: headers() });
       const data = await res.json();
       if (!res.ok) { setResult(integrationStatusEl, data.error || 'Falha ao carregar.', 'error'); return; }
-      fillIntegrationsForm(data.integration);
+      fillIntegrationsForm(data.integration, data.chatwootWebhookUrl);
       setResult(integrationStatusEl, `Configuração carregada para "${instance}".`, 'success');
       const link = document.getElementById('btnOpenIntegrationPanel');
       if (link) link.href = `/instance.html?instance=${encodeURIComponent(instance)}#integrations`;
@@ -896,7 +904,7 @@
       });
       const d = await r.json();
       if (!r.ok) { setResult(chatwootResultEl, d.error || 'Falha ao salvar.', 'error'); return; }
-      fillIntegrationsForm(d.integration);
+      fillIntegrationsForm(d.integration, d.chatwootWebhookUrl);
       setResult(chatwootResultEl, 'Configuração Chatwoot salva.', 'success');
     } catch (err) { setResult(chatwootResultEl, err.message || 'Erro.', 'error'); }
   }
@@ -994,9 +1002,21 @@
     show(btnCancel, p.status === 'running');
 
     elChats.textContent = `${p.processedChats || 0}/${p.totalChats || 0}`;
-    elSent.textContent = String(p.syncedMessages || 0);
+    // Enviadas no formato x/y: x = sucesso, y = total já tentado (sucesso + skipped + erros).
+    // Reflete a fração efetivamente entregue do que o sync já processou.
+    const sent = p.syncedMessages || 0;
+    const totalAttempted = sent + (p.skippedMessages || 0) + (p.errorCount || 0);
+    elSent.textContent = `${sent}/${totalAttempted}`;
     elSkipped.textContent = String(p.skippedMessages || 0);
     elErrors.textContent = String(p.errorCount || 0);
+
+    // Destaca em vermelho e habilita visualmente quando há erros para inspecionar.
+    if (syncUi.errorsStat) {
+      syncUi.errorsStat.classList.toggle('has-errors', (p.errorCount || 0) > 0);
+    }
+
+    // Memoriza para o modal abrir com a lista atual sem precisar refetch.
+    lastSyncProgress = p;
 
     cur.textContent = p.currentChatTitle || (p.lastError ? 'erro: ' + p.lastError : (p.status === 'running' ? 'preparando...' : ''));
 
@@ -1013,6 +1033,72 @@
       fill.style.width = '100%';
     }
   }
+
+  // ============ Modal de erros do sync ============
+  function renderSyncErrors(p) {
+    const list = syncErrorsModal.list;
+    if (!list) return;
+    const errors = Array.isArray(p?.errors) ? p.errors : [];
+    if (errors.length === 0) {
+      list.innerHTML = '<div class="sync-error-empty">Sem erros registrados neste sync.</div>';
+      return;
+    }
+    // Mais recentes no topo.
+    const ordered = [...errors].sort((a, b) => (b?.at || 0) - (a?.at || 0));
+    const fmt = (ts) => {
+      if (!ts) return '';
+      try { return new Date(ts).toLocaleString(); } catch { return ''; }
+    };
+    const escape = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    list.innerHTML = ordered.map((e) => {
+      const meta = [];
+      if (e.at) meta.push(`<span>${escape(fmt(e.at))}</span>`);
+      if (e.chatTitle) meta.push(`<span>chat: ${escape(e.chatTitle)}</span>`);
+      else if (e.jid) meta.push(`<span>jid: ${escape(e.jid)}</span>`);
+      if (e.msgId) meta.push(`<span>msg: ${escape(e.msgId)}</span>`);
+      if (e.scope) meta.push(`<span>scope: ${escape(e.scope)}</span>`);
+      return `<div class="sync-error-item">
+        <div class="sync-error-meta">${meta.join('')}</div>
+        <div class="sync-error-message">${escape(e.error || '(sem mensagem)')}</div>
+      </div>`;
+    }).join('');
+  }
+
+  function openSyncErrorsModal() {
+    if (!syncErrorsModal.overlay) return;
+    renderSyncErrors(lastSyncProgress);
+    syncErrorsModal.overlay.classList.remove('hidden');
+  }
+  function closeSyncErrorsModal() {
+    if (!syncErrorsModal.overlay) return;
+    syncErrorsModal.overlay.classList.add('hidden');
+  }
+
+  // Bind do clique no stat "Erros" e dos modos de fechamento (X / overlay / Esc).
+  if (syncUi.errorsStat) {
+    syncUi.errorsStat.addEventListener('click', openSyncErrorsModal);
+    syncUi.errorsStat.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openSyncErrorsModal();
+      }
+    });
+  }
+  if (syncErrorsModal.closeBtn) {
+    syncErrorsModal.closeBtn.addEventListener('click', closeSyncErrorsModal);
+  }
+  if (syncErrorsModal.overlay) {
+    syncErrorsModal.overlay.addEventListener('click', (ev) => {
+      if (ev.target === syncErrorsModal.overlay) closeSyncErrorsModal();
+    });
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && syncErrorsModal.overlay && !syncErrorsModal.overlay.classList.contains('hidden')) {
+      closeSyncErrorsModal();
+    }
+  });
 
   async function pollSyncOnce(instance) {
     try {

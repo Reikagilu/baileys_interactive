@@ -1,27 +1,93 @@
 import express from 'express';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import swaggerUiDist from 'swagger-ui-dist';
-import instancesRouter from './routes/instances.js';
-import messagesRouter from './routes/messages.js';
-import webhooksRouter from './routes/webhooks.js';
-import chatsRouter from './routes/chats.js';
-import opsRouter from './routes/ops.js';
+// These routers still live as the real implementation under dist/routes.
+// Importing them directly here keeps `tsx src/index.ts` and future builds using
+// the working handlers instead of the stub files that remain in src/routes.
+import instancesRouter from '../dist/routes/instances.js';
+import messagesRouter from '../dist/routes/messages.js';
+import webhooksRouter from '../dist/routes/webhooks.js';
+import chatsRouter from '../dist/routes/chats.js';
+import opsRouter from '../dist/routes/ops.js';
 import integrationsRouter from './routes/integrations.js';
 import { openApiSpec } from './docs/openapi.js';
 import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
 import { requestContext } from './middleware/request-context.js';
 import { sendError } from './utils/api-response.js';
-import { getAllInstances, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
+import { getAllInstances, getInstance, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
 import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
 import { normalizeInstanceName } from './utils/helpers.js';
 import { verifyMediaUrlToken } from './utils/media-signature.js';
-import { parseChatwootWebhook, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot } from './services/chatwoot-bridge.js';
-import { getSyncProgress, requestSyncCancel } from './services/chatwoot-sync-store.js';
-import { sendInstanceTextMessage, sendInstanceMediaMessage } from './services/whatsapp.js';
+import { parseChatwootWebhook, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot, normalizeChatwootWebhookSlug } from './services/chatwoot-bridge.js';
+import { getSyncProgress, requestSyncCancel, isMessageSynced, isSyncRunning } from './services/chatwoot-sync-store.js';
 import { getInstanceIntegrations, findInstanceByWebhookSlug } from './services/integrations.js';
+import { isChatwootOriginated } from './services/chatwoot-tracking.js';
+function extractChatwootSourceIds(payload) {
+    const attrs = payload.content_attributes ?? {};
+    const candidates = new Set();
+    const add = (value) => {
+        if (typeof value !== 'string')
+            return;
+        const trimmed = value.trim();
+        if (trimmed)
+            candidates.add(trimmed);
+    };
+    add(payload.source_id);
+    add(attrs['source_id']);
+    add(attrs['whatsapp_message_id']);
+    if (Array.isArray(payload.conversation?.messages) && payload.id != null) {
+        const current = payload.conversation.messages.find((message) => String(message?.id ?? '') === String(payload.id));
+        add(current?.source_id);
+    }
+    return [...candidates];
+}
+async function dispatchChatwootActionToWhatsApp(instance, integrationCfg, action) {
+    const { jid, text, attachments, replyToId, agentName } = action;
+    const signedAgentName = integrationCfg.signMessages ? agentName : undefined;
+    const resolveMediaUrl = (mediaUrl) => {
+        const trimmed = String(mediaUrl || '').trim();
+        if (!trimmed)
+            return trimmed;
+        if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('data:'))
+            return trimmed;
+        if (trimmed.startsWith('/') && integrationCfg.baseUrl) {
+            return `${String(integrationCfg.baseUrl).replace(/\/$/, '')}${trimmed}`;
+        }
+        return trimmed;
+    };
+    if (attachments && attachments.length > 0) {
+        for (let i = 0; i < attachments.length; i++) {
+            const attachment = attachments[i];
+            const send = await sendInstanceMediaMessage(instance, jid, {
+                mediaUrl: resolveMediaUrl(attachment.mediaUrl),
+                mimeType: attachment.mimeType,
+                fileName: attachment.fileName,
+                caption: i === 0 ? text || undefined : undefined,
+                replyToId,
+                agentName: signedAgentName,
+                signDelimiter: integrationCfg.signDelimiter,
+            });
+            if (!send.ok)
+                return { ok: false, error: send.error || 'failed_to_send_media' };
+        }
+        return { ok: true };
+    }
+    if (text) {
+        const send = await sendInstanceTextMessage(instance, jid, text, {
+            replyToId,
+            agentName: signedAgentName,
+            signDelimiter: integrationCfg.signDelimiter,
+        });
+        if (!send.ok)
+            return { ok: false, error: send.error || 'failed_to_send_text' };
+    }
+    return { ok: true };
+}
+import { sendInstanceTextMessage, sendInstanceMediaMessage } from './services/whatsapp.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const swaggerAssetsDir = swaggerUiDist.getAbsoluteFSPath();
 const hasConfiguredApiKeys = Boolean(config.apiKey.trim() || config.apiKeysJson.trim());
@@ -32,7 +98,100 @@ if (!hasConfiguredApiKeys) {
     console.warn('[security] API auth disabled: configure API_KEY or API_KEYS_JSON.');
 }
 const app = express();
+app.disable('x-powered-by');
 app.set('etag', false);
+app.set('trust proxy', config.security.trustProxy);
+const rateBuckets = new Map();
+function clientIp(req) {
+    if (config.security.trustProxy) {
+        const forwarded = String(req.headers['x-forwarded-for'] ?? '').split(',')[0]?.trim();
+        if (forwarded)
+            return forwarded;
+    }
+    return req.ip || req.socket.remoteAddress || 'unknown';
+}
+function safeEqual(a, b) {
+    const ab = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ab.length !== bb.length)
+        return false;
+    return crypto.timingSafeEqual(ab, bb);
+}
+function isValidChatwootWebhookSecret(req) {
+    const expected = config.security.chatwootWebhookSecret.trim();
+    if (!expected)
+        return true;
+    const headerSecret = String(req.header('x-chatwoot-secret') ?? req.header('x-webhook-secret') ?? '').trim();
+    const querySecret = String(req.query.secret ?? '').trim();
+    const authSecret = String(req.header('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
+    const provided = headerSecret || querySecret || authSecret;
+    return provided ? safeEqual(provided, expected) : false;
+}
+function rateLimit(scope, max, windowMs) {
+    return (req, res, next) => {
+        const key = `${scope}:${clientIp(req)}`;
+        const now = Date.now();
+        if (rateBuckets.size > 5000) {
+            for (const [bucketKey, entry] of rateBuckets) {
+                if (entry.resetAt <= now)
+                    rateBuckets.delete(bucketKey);
+            }
+        }
+        const bucket = rateBuckets.get(key);
+        if (!bucket || bucket.resetAt <= now) {
+            rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+            return next();
+        }
+        if (bucket.count >= max) {
+            res.setHeader('Retry-After', String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+            return sendError(res, 429, 'rate_limited');
+        }
+        bucket.count += 1;
+        return next();
+    };
+}
+const docsAuth = hasConfiguredApiKeys && !config.security.publicDocsEnabled
+    ? requireApiKey(['ops:read'])
+    : (_req, _res, next) => next();
+const metricsAuth = hasConfiguredApiKeys && !config.security.publicMetricsEnabled
+    ? requireApiKey(['ops:read'])
+    : (_req, _res, next) => next();
+const readyAuth = hasConfiguredApiKeys && !config.security.publicReadyEnabled
+    ? requireApiKey(['ops:read'])
+    : (_req, _res, next) => next();
+const webhookLimiter = rateLimit('chatwoot-webhook', config.security.webhookRateLimitMax, config.security.webhookRateLimitWindowMs);
+const apiLimiter = rateLimit('api', config.security.apiRateLimitMax, config.security.apiRateLimitWindowMs);
+app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Origin-Agent-Cluster', '?1');
+    if (config.security.hstsEnabled) {
+        res.setHeader('Strict-Transport-Security', `max-age=${config.security.hstsMaxAgeSeconds}; includeSubDomains`);
+    }
+    next();
+});
+app.use((req, res, next) => {
+    if (req.path === '/docs' || req.path.startsWith('/docs-assets'))
+        return next();
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+        "script-src 'self'",
+        "connect-src 'self'",
+        "img-src 'self' data: blob: https:",
+        "media-src 'self' data: blob: https:",
+        "style-src 'self' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+    ].join('; '));
+    next();
+});
 app.use(requestContext);
 app.use(express.json({ limit: '2mb' }));
 app.use('/v1', (_req, res, next) => {
@@ -44,12 +203,12 @@ app.use('/v1', (_req, res, next) => {
 app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'Beyound', requestId: res.locals?.requestId });
 });
-app.get('/ready', (_req, res) => {
+app.get('/ready', readyAuth, (_req, res) => {
     const instances = getAllInstances();
     const connectedInstances = instances.filter((instance) => instance.status === 'connected').length;
     res.json({ ok: true, service: 'Beyound', requestId: res.locals?.requestId, connectedInstances, totalInstances: instances.length });
 });
-app.get('/metrics', (_req, res) => {
+app.get('/metrics', metricsAuth, (_req, res) => {
     const webhook = getWebhookMetrics();
     const lines = [
         '# HELP webhook_webhooks_total Total number of webhooks',
@@ -71,11 +230,11 @@ app.get('/metrics', (_req, res) => {
     res.setHeader('content-type', 'text/plain; version=0.0.4; charset=utf-8');
     res.send(`${lines.join('\n')}\n`);
 });
-app.get('/openapi.json', (_req, res) => {
+app.get('/openapi.json', docsAuth, (_req, res) => {
     res.json(openApiSpec);
 });
-app.use('/docs-assets', express.static(swaggerAssetsDir));
-app.get('/docs', (_req, res) => {
+app.use('/docs-assets', docsAuth, express.static(swaggerAssetsDir));
+app.get('/docs', docsAuth, (_req, res) => {
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.send(renderSwaggerUiHtml('/openapi.json'));
 });
@@ -100,10 +259,16 @@ app.get('/v1/media/:instance/:mediaId', (req, res) => {
 });
 // ─── Chatwoot webhook por slug: compatível com Evolution API (/chatwoot/webhook/:slug) ─
 // URL format: http://host/chatwoot/webhook/ScheerAdv
-app.post('/chatwoot/webhook/:slug', async (req, res) => {
-    const slug = String(req.params.slug ?? '').trim();
+app.post('/chatwoot/webhook/:slug', webhookLimiter, async (req, res) => {
+    const slug = normalizeChatwootWebhookSlug(req.params.slug);
     if (!slug) {
         return res.status(400).json({ ok: false, error: 'invalid_slug' });
+    }
+    if (!req.is('application/json')) {
+        return res.status(415).json({ ok: false, error: 'invalid_content_type' });
+    }
+    if (!isValidChatwootWebhookSecret(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid_webhook_secret' });
     }
     // Resolve slug → instance name
     const instance = findInstanceByWebhookSlug(slug);
@@ -111,55 +276,52 @@ app.post('/chatwoot/webhook/:slug', async (req, res) => {
         // Return 200 anyway to avoid Chatwoot retries for unconfigured slugs
         return res.status(200).json({ ok: true, note: 'slug_not_mapped' });
     }
-    // Ack immediately
-    res.status(200).json({ ok: true });
     let integrationCfg;
     try {
         const integrations = getInstanceIntegrations(instance);
         integrationCfg = integrations.chatwoot;
     }
     catch {
-        return;
+        return res.status(503).json({ ok: false, error: 'failed_to_load_integration' });
     }
     if (!integrationCfg.enabled)
-        return;
+        return res.status(200).json({ ok: true, ignored: true, reason: 'integration_disabled' });
     const body = (req.body ?? {});
     const action = parseChatwootWebhook(body);
-    if (!action)
-        return;
-    const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
+    if (!action) {
+        return res.status(200).json({ ok: true, ignored: true });
+    }
+    // Se a mensagem tem source_id (WhatsApp message ID), significa que veio do
+    // WhatsApp e foi espelhada por nós no Chatwoot. O Chatwoot dispara o webhook
+    // de volta — mas NÃO devemos reenviar ao WhatsApp (seria duplicação).
+    const sourceIds = extractChatwootSourceIds(body);
+    if (sourceIds.some((sourceId) => isChatwootOriginated(sourceId) || isMessageSynced(instance, sourceId))) {
+        return res.status(200).json({ ok: true, ignored: true, reason: 'whatsapp_originated' });
+    }
     try {
-        if (mediaUrl) {
-            await sendInstanceMediaMessage(instance, jid, {
-                mediaUrl,
-                mimeType,
-                fileName,
-                caption: text || undefined,
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
+        const result = await dispatchChatwootActionToWhatsApp(instance, integrationCfg, action);
+        if (!result.ok) {
+            return res.status(503).json({ ok: false, error: result.error || 'whatsapp_dispatch_failed' });
         }
-        else if (text) {
-            await sendInstanceTextMessage(instance, jid, text, {
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
-        }
+        return res.status(200).json({ ok: true });
     }
     catch (err) {
         console.error(`[chatwoot-webhook-slug][${instance}] dispatch error`, err);
+        return res.status(503).json({ ok: false, error: 'whatsapp_dispatch_failed' });
     }
 });
 // ─── Chatwoot webhook: sem API key (Chatwoot não suporta custom headers no webhook) ───
-app.post('/v1/integrations/:instance/chatwoot/webhook', async (req, res) => {
+app.post('/v1/integrations/:instance/chatwoot/webhook', webhookLimiter, async (req, res) => {
     const instance = normalizeInstanceName(req.params.instance);
     if (!instance) {
         return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
     }
-    // Ack immediately to avoid Chatwoot retries
-    res.status(200).json({ ok: true });
+    if (!req.is('application/json')) {
+        return res.status(415).json({ ok: false, error: 'invalid_content_type' });
+    }
+    if (!isValidChatwootWebhookSecret(req)) {
+        return res.status(401).json({ ok: false, error: 'invalid_webhook_secret' });
+    }
     // Validate integration is enabled for this instance
     let integrationCfg;
     try {
@@ -167,41 +329,36 @@ app.post('/v1/integrations/:instance/chatwoot/webhook', async (req, res) => {
         integrationCfg = integrations.chatwoot;
     }
     catch {
-        return;
+        return res.status(503).json({ ok: false, error: 'failed_to_load_integration' });
     }
     if (!integrationCfg.enabled)
-        return;
+        return res.status(200).json({ ok: true, ignored: true, reason: 'integration_disabled' });
     const body = (req.body ?? {});
     const action = parseChatwootWebhook(body);
-    if (!action)
-        return;
-    const { jid, text, mediaUrl, mimeType, fileName, replyToId, agentName } = action;
+    if (!action) {
+        return res.status(200).json({ ok: true, ignored: true });
+    }
+    // Se a mensagem tem source_id (WhatsApp message ID), significa que veio do
+    // WhatsApp e foi espelhada por nós no Chatwoot. O Chatwoot dispara o webhook
+    // de volta — mas NÃO devemos reenviar ao WhatsApp (seria duplicação).
+    const sourceIds = extractChatwootSourceIds(body);
+    if (sourceIds.some((sourceId) => isChatwootOriginated(sourceId) || isMessageSynced(instance, sourceId))) {
+        return res.status(200).json({ ok: true, ignored: true, reason: 'whatsapp_originated' });
+    }
     try {
-        if (mediaUrl) {
-            await sendInstanceMediaMessage(instance, jid, {
-                mediaUrl,
-                mimeType,
-                fileName,
-                caption: text || undefined,
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
+        const result = await dispatchChatwootActionToWhatsApp(instance, integrationCfg, action);
+        if (!result.ok) {
+            return res.status(503).json({ ok: false, error: result.error || 'whatsapp_dispatch_failed' });
         }
-        else if (text) {
-            await sendInstanceTextMessage(instance, jid, text, {
-                replyToId,
-                agentName: integrationCfg.signMessages ? agentName : undefined,
-                signDelimiter: integrationCfg.signDelimiter,
-            });
-        }
+        return res.status(200).json({ ok: true });
     }
     catch (err) {
         console.error(`[chatwoot-webhook][${instance}] dispatch error`, err);
+        return res.status(503).json({ ok: false, error: 'whatsapp_dispatch_failed' });
     }
 });
-// ─── Chatwoot cache invalidation: sem API key (utilitário interno) ────────────
-app.post('/v1/integrations/:instance/chatwoot/invalidate-cache', (req, res) => {
+// ─── Chatwoot cache invalidation: protegido por API key ───────────────────────
+app.post('/v1/integrations/:instance/chatwoot/invalidate-cache', requireApiKey(['integrations:*']), (req, res) => {
     const instance = normalizeInstanceName(req.params.instance);
     if (!instance) {
         return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
@@ -216,7 +373,7 @@ app.post('/v1/integrations/:instance/chatwoot/autocreate', requireApiKey(['integ
         return res.status(400).json({ ok: false, error: 'invalid_instance_name' });
     }
     try {
-        const result = await autoCreateChatwootInbox(instance);
+        const result = await autoCreateChatwootInbox(instance, undefined, true);
         return res.json({ ok: true, result });
     }
     catch (err) {
@@ -231,6 +388,19 @@ app.post('/v1/integrations/:instance/chatwoot/sync-history', requireApiKey(['int
     }
     const { jid, limit } = req.body;
     const limitPerChat = typeof limit === 'number' && limit > 0 ? Math.min(limit, 2000) : 200;
+    if (isSyncRunning(instance)) {
+        return res.status(409).json({ ok: false, error: 'sync_already_running' });
+    }
+    const integrationCfg = getInstanceIntegrations(instance).chatwoot;
+    if (!integrationCfg.enabled || !integrationCfg.baseUrl || !integrationCfg.accountId || !integrationCfg.apiAccessToken) {
+        return res.status(400).json({ ok: false, error: 'chatwoot_not_configured' });
+    }
+    if (integrationCfg.importMessages === false) {
+        return res.status(400).json({ ok: false, error: 'chatwoot_import_messages_disabled' });
+    }
+    if (getInstance(instance)?.status !== 'connected') {
+        return res.status(409).json({ ok: false, error: 'instance_not_connected' });
+    }
     // Run in background and return immediately so UI can poll /sync-status
     void (async () => {
         try {
@@ -259,15 +429,28 @@ app.post('/v1/integrations/:instance/chatwoot/sync-cancel', requireApiKey(['inte
     return res.json({ ok: true, cancelled });
 });
 // API key só nas rotas /v1 (a interface em / carrega sem key)
-app.use('/v1/instances', requireApiKey(['instances:*']), instancesRouter);
-app.use('/v1/messages', requireApiKey(['messages:send']), messagesRouter);
-app.use('/v1/webhooks', requireApiKey(['webhooks:*']), webhooksRouter);
-app.use('/v1/chats', requireApiKey(['chats:*']), chatsRouter);
-app.use('/v1/ops', requireApiKey(['ops:read']), opsRouter);
-app.use('/v1/integrations', requireApiKey(['integrations:*']), integrationsRouter);
+app.use('/v1/instances', apiLimiter, requireApiKey(['instances:*']), instancesRouter);
+app.use('/v1/messages', apiLimiter, requireApiKey(['messages:send']), messagesRouter);
+app.use('/v1/webhooks', apiLimiter, requireApiKey(['webhooks:*']), webhooksRouter);
+app.use('/v1/chats', apiLimiter, requireApiKey(['chats:*']), chatsRouter);
+app.use('/v1/ops', apiLimiter, requireApiKey(['ops:read']), opsRouter);
+app.use('/v1/integrations', apiLimiter, requireApiKey(['integrations:*']), integrationsRouter);
 const publicDir = path.join(__dirname, '..', 'public');
-app.use(express.static(publicDir));
-app.get('/', (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+app.use(express.static(publicDir, {
+    dotfiles: 'ignore',
+    index: false,
+    setHeaders: (res, filePath) => {
+        if (/\.html?$/i.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-store');
+            return;
+        }
+        res.setHeader('Cache-Control', 'public, max-age=3600, immutable');
+    },
+}));
+app.get('/', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(publicDir, 'index.html'));
+});
 app.use((err, _req, res, _next) => {
     if (err instanceof SyntaxError && 'body' in err) {
         return sendError(res, 400, 'invalid_json');
