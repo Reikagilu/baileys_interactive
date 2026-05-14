@@ -18,6 +18,8 @@ function parseNumber(value: string | undefined, fallback: number, min?: number):
 
 export const config = {
   port: parseInt(process.env.PORT ?? '8787', 10),
+  /** URL pública deste servidor (usada para gerar URLs de webhook e mídia). */
+  serverUrl: (process.env.SERVER_URL ?? '').replace(/\/$/, ''),
   apiKey: process.env.API_KEY ?? '',
   apiKeysJson: process.env.API_KEYS_JSON ?? '',
   authFolder: process.env.AUTH_FOLDER ?? 'auth',
@@ -61,6 +63,12 @@ export const config = {
   messages: {
     dbPath: process.env.MESSAGES_DB_PATH ?? 'data/messages.sqlite',
     maxPerChat: parseNumber(process.env.MESSAGES_MAX_PER_CHAT, 2000, 100),
+    // TTL para mensagens do histórico (padrão: 30 dias). Após este período,
+    // mensagens antigas são automaticamente excluídas para liberar espaço.
+    // Use 0 para desabilitar (nunca expira).
+    historyTtlDays: parseNumber(process.env.MESSAGES_HISTORY_TTL_DAYS, 30, 0),
+    // Intervalo de cleanup (padrão: a cada 6 horas)
+    cleanupIntervalMs: parseNumber(process.env.MESSAGES_CLEANUP_INTERVAL_MS, 6 * 60 * 60 * 1000, 60 * 60 * 1000),
   },
   webhooks: {
     dbPath: process.env.WEBHOOK_DB_PATH ?? 'data/webhooks.sqlite',

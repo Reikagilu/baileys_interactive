@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
+import { log } from '../utils/logger.js';
 // ─── Internos ────────────────────────────────────────────────────────────────
 let _db = null;
 let _stmts = null;
@@ -109,7 +110,7 @@ function getDb() {
       `);
         }
         catch (err) {
-            console.warn('[message-store] message_count backfill failed:', err);
+            log.msgStore.warn('message_count backfill falhou', err);
         }
     });
     db.exec(`
@@ -384,5 +385,66 @@ export function countMessages(instance, jid) {
 export function clearInstance(instance) {
     stmt('clearInstance.messages', 'DELETE FROM messages WHERE instance = ?').run(instance);
     stmt('clearInstance.chatMeta', 'DELETE FROM chat_meta WHERE instance = ?').run(instance);
+}
+// ─── Cleanup de mensagens por TTL ─────────────────────────────────────────────────
+let _cleanupInterval = null;
+/**
+ * Inicia o job периодический de cleanup de mensagens antigas.
+ * Use `stopMessageCleanupJob()` para encerrar.
+ */
+export function startMessageCleanupJob() {
+    if (_cleanupInterval)
+        return;
+    if (config.messages.historyTtlDays === 0) {
+        log.msgStore.info('TTL desabilitado (historyTtlDays=0) — cleanup não iniciado');
+        return;
+    }
+    const ttlMs = config.messages.historyTtlDays * 24 * 60 * 60 * 1000;
+    const intervalMs = config.messages.cleanupIntervalMs;
+    log.msgStore.info(`iniciando cleanup: TTL=${config.messages.historyTtlDays}d  intervalo=${intervalMs / 1000 / 60}min`);
+    // Executa cleanup imediato na inicialização
+    runMessageCleanup();
+    // Agenda execução periódica
+    _cleanupInterval = setInterval(runMessageCleanup, intervalMs);
+}
+/**
+ * Para o job de cleanup.
+ */
+export function stopMessageCleanupJob() {
+    if (_cleanupInterval) {
+        clearInterval(_cleanupInterval);
+        _cleanupInterval = null;
+        log.msgStore.info('cleanup job parado');
+    }
+}
+/**
+ * Executa a limpeza de mídias mais antigas que o TTL.
+ * Não deleta mensagens - apenas remove o base64 para liberar espaço.
+ * A mensagem permanece e pode ter sua mídia re-baixada do WhatsApp quando necessário.
+ */
+function runMessageCleanup() {
+    if (config.messages.historyTtlDays === 0)
+        return;
+    const ttlMs = config.messages.historyTtlDays * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - ttlMs;
+    try {
+        // Limpa apenas o campo media_json (remove base64) de mensagens antigas
+        // Não deleta a mensagem - apenas libera espaço da mídia armazenada localmente
+        const result = stmt('cleanupMedia', 'UPDATE messages SET media_json = NULL WHERE ts < ? AND media_json IS NOT NULL').run(cutoff);
+        const cleanedMedia = result.changes ?? 0;
+        // Limpa chat_meta órfão (sem mensagens) — filtra por instance para não afetar outras instâncias
+        const resultMeta = stmt('cleanupOrphanMeta', `
+      DELETE FROM chat_meta WHERE (instance, jid) NOT IN (
+        SELECT DISTINCT instance, jid FROM messages
+      )
+    `).run();
+        const deletedMeta = resultMeta.changes ?? 0;
+        if (cleanedMedia > 0 || deletedMeta > 0) {
+            log.msgStore.success(`cleanup concluído: ${cleanedMedia} mídias limpas, ${deletedMeta} chats órfãos removidos`);
+        }
+    }
+    catch (err) {
+        log.msgStore.error(`cleanup falhou: ${err instanceof Error ? err.message : String(err)}`);
+    }
 }
 //# sourceMappingURL=message-store.js.map

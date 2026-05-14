@@ -32,6 +32,7 @@ export interface InstanceIntegrations {
     updatedAt: number;
 }
 export declare function getInstanceIntegrations(instance: string): InstanceIntegrations;
+export declare function invalidateSlugCache(): void;
 /**
  * Find the instance name that has a given webhookSlug configured.
  * Returns null if not found.

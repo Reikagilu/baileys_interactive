@@ -16,7 +16,8 @@ import { getInstanceIntegrations } from './integrations.js';
 import { listChats, listUnsyncedSyncMessages, getChatTitle } from './message-store.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
 import { config } from '../config.js';
-import { beginMessageSync, finishMessageSync, isMessageSynced, markMessageSynced, startSyncProgress, updateSyncProgress, finishSyncProgress, isSyncCancelled, isSyncRunning, appendSyncError, } from './chatwoot-sync-store.js';
+import { log } from '../utils/logger.js';
+import { beginMessageSync, finishMessageSync, isMessageSynced, markMessageSynced, startSyncProgress, updateSyncProgress, finishSyncProgress, beginMessageSyncWithPersistence, finishMessageSyncWithPersistence, markMessageSyncedWithPersistence, addPendingMessage, getPendingMessages, removePendingMessage, updatePendingMessageRetry, countPendingMessages, isSyncCancelled, isSyncRunning, appendSyncError, } from './chatwoot-sync-store.js';
 /**
  * Formats a raw digit string (e.g. "5511972798737") into a human-readable
  * phone number like "+55 11 97279 8737".
@@ -66,7 +67,7 @@ export function normalizeChatwootWebhookSlug(input) {
 }
 export function buildChatwootWebhookUrl(slugRaw) {
     const slug = normalizeChatwootWebhookSlug(slugRaw);
-    const serverOrigin = process.env.SERVER_URL?.replace(/\/$/, '') ?? `http://localhost:${process.env.PORT ?? '8787'}`;
+    const serverOrigin = config.serverUrl || `http://localhost:${config.port}`;
     const base = `${serverOrigin}/chatwoot/webhook/${encodeURIComponent(slug)}`;
     const secret = config.security.chatwootWebhookSecret.trim();
     if (!secret)
@@ -566,7 +567,7 @@ async function conversationAlreadyHasSourceId(cfg, conversationId, sourceId) {
         try {
             for (let page = 1; page <= 100; page++) {
                 if (Date.now() > deadline) {
-                    console.warn(`[chatwoot-bridge] conversationAlreadyHasSourceId timeout for conversation ${conversationId}`);
+                    log.chatwoot.warn(`conversationAlreadyHasSourceId timeout  conversationId=${conversationId}`);
                     break;
                 }
                 const data = await cwFetch(cfg, 'GET', `/conversations/${conversationId}/messages?page=${page}`);
@@ -620,7 +621,7 @@ opts) {
                     await cwFetch(cfg, 'POST', `/conversations/${conv.id}/toggle_status`, {
                         status: opts.conversationPending ? 'pending' : 'open',
                     }).catch((err) => {
-                        console.warn(`[chatwoot-bridge] failed to reopen conversation ${conv.id}`, err?.message ?? err);
+                        log.chatwoot.warn(`Falha ao reabrir conversa  id=${conv.id}`, err?.message ?? err);
                     });
                 }
                 convCache.set(cacheKey, { id: conv.id, ts: Date.now() });
@@ -640,7 +641,7 @@ opts) {
             return created.id;
         }
         catch (err) {
-            console.error('[chatwoot-bridge] getOrCreateConversation error', err);
+            log.chatwoot.error('getOrCreateConversation error', err);
             return null;
         }
         finally {
@@ -770,7 +771,7 @@ export async function dispatchToChatwoot(instanceName, messages) {
         return;
     }
     if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken) {
-        console.log(`[chatwoot-bridge][${instanceName}] dispatch skipped: enabled=${cfg.enabled} baseUrl=${!!cfg.baseUrl} accountId=${!!cfg.accountId} token=${!!cfg.apiAccessToken} inboxId="${cfg.inboxId}" msgs=${messages.length}`);
+        log.chatwoot.child(instanceName).debug(`dispatch skipped  enabled=${cfg.enabled}  baseUrl=${!!cfg.baseUrl}  accountId=${!!cfg.accountId}  token=${!!cfg.apiAccessToken}  inboxId="${cfg.inboxId}"  msgs=${messages.length}`);
         return;
     }
     const cwCfg = {
@@ -781,30 +782,36 @@ export async function dispatchToChatwoot(instanceName, messages) {
     };
     const inbox = await getInbox(instanceName, cwCfg, cfg.nameInbox || 'WhatsApp');
     if (!inbox) {
-        console.warn(`[chatwoot-bridge][${instanceName}] inbox "${cfg.nameInbox}" not found`);
+        log.chatwoot.child(instanceName).warn(`Inbox "${cfg.nameInbox}" não encontrada no Chatwoot — verifique a configuração inboxId/nameInbox`);
         return;
     }
     for (const msg of messages) {
         const msgId = msg.key?.id;
-        if (!msgId || !beginMessageSync(instanceName, msgId)) {
+        // Usa versão com persistência para survives crash
+        if (!msgId || !beginMessageSyncWithPersistence(instanceName, msgId)) {
             continue;
         }
         try {
             const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
             if (msgId && !result.skipped && result.conversationId) {
                 try {
-                    markMessageSynced(instanceName, msgId, result.conversationId);
+                    // Usa versão que também remove do in-flight no SQLite
+                    markMessageSyncedWithPersistence(instanceName, msgId, result.conversationId);
                 }
                 catch (dbErr) {
-                    console.error(`[chatwoot-bridge][${instanceName}] markMessageSynced failed for ${msgId}`, dbErr);
+                    log.chatwoot.child(instanceName).error(`markMessageSynced falhou para msgId=${msgId}`, dbErr);
                 }
             }
         }
         catch (err) {
-            console.error(`[chatwoot-bridge][${instanceName}] dispatch error for ${msg.key?.id}`, err);
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            log.chatwoot.child(instanceName).error(`dispatch error para msgId=${msg.key?.id} — adicionando à fila de retry`, err);
+            // Adiciona à fila de retry para processamento posterior
+            addPendingMessage(instanceName, msgId, JSON.stringify(msg), errorMsg);
         }
         finally {
-            finishMessageSync(instanceName, msgId);
+            // Usa versão que também remove do in-flight no SQLite
+            finishMessageSyncWithPersistence(instanceName, msgId);
         }
     }
 }
@@ -964,7 +971,7 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         isGroup,
     });
     if (!contact) {
-        console.warn(`[chatwoot-bridge][${instanceName}] could not get/create contact for ${contactJid}`);
+        log.chatwoot.child(instanceName).warn(`Não foi possível obter/criar contato para jid=${contactJid}`);
         return { skipped: true };
     }
     // Get or create conversation — keyed by conversationJid (group or individual)
@@ -973,16 +980,11 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         reopenConversation: cfg.reopenConversation !== false,
     });
     if (!convId) {
-        console.warn(`[chatwoot-bridge][${instanceName}] could not get/create conversation for ${remoteJid}`);
+        log.chatwoot.child(instanceName).warn(`Não foi possível obter/criar conversa para jid=${remoteJid}`);
         return { skipped: true };
     }
     // Build message content
     let content = extractContent(msg);
-    // Strip placeholder content like "[image]", "[audio]" etc — they should not appear
-    // alongside the actual attachment in Chatwoot (the attachment itself is enough).
-    if (content && /^\[[a-z]+(?:[:\s].*)?\]$/i.test(content.trim())) {
-        content = '';
-    }
     // Build attachments from media base64
     let attachments;
     if (media?.base64 && media.kind !== 'text') {
@@ -996,6 +998,29 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
                 mime_type: media.mimeType,
             },
         ];
+        // Strip placeholder label — o anexo fala por si só
+        if (content && /^\[[a-z]+(?:[:\s].*)?\]$/i.test(content.trim())) {
+            content = '';
+        }
+    }
+    else if (media?.kind && media.kind !== 'text') {
+        // Mídia existe mas não tem base64 (expirou no WhatsApp ou não foi possível baixar).
+        // Substitui o placeholder genérico por aviso legível com a legenda original, se houver.
+        const MEDIA_LABELS = {
+            image: '🖼️ Imagem',
+            video: '🎥 Vídeo',
+            audio: '🎤 Áudio',
+            document: '📄 Documento',
+            sticker: '🪄 Sticker',
+        };
+        const label = MEDIA_LABELS[media.kind] ?? `📎 ${media.kind}`;
+        const caption = media.caption ? `\n${media.caption}` : '';
+        const filename = media.fileName ? ` (${media.fileName})` : '';
+        content = `_${label}${filename} não disponível — mídia expirada ou não foi possível baixar._${caption}`;
+    }
+    else if (content && /^\[[a-z]+(?:[:\s].*)?\]$/i.test(content.trim())) {
+        // Placeholder sem objeto media — limpa para não poluir o Chatwoot
+        content = '';
     }
     // For group messages from others, prefix with sender label on its own line(s)
     // so agents know who said what. Format inspired by the screenshots:
@@ -1023,7 +1048,11 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     // Fallback dedup against the tenant itself: if local tracking does not know
     // about this msgId yet, ask Chatwoot whether this conversation already has a
     // message with the same WhatsApp source_id. If yes, mark locally and skip.
-    if (await conversationAlreadyHasSourceId(cwCfg, convId, key.id)) {
+    // EvolutionAPI usa o formato "WAID:<id>" como source_id.
+    // Manter este prefixo garante compatibilidade com instâncias Chatwoot que migraram
+    // do EvolutionAPI: deduplicação, detecção de loop e filtros de bot continuam funcionando.
+    const sourceId = key.id.startsWith('WAID:') ? key.id : `WAID:${key.id}`;
+    if (await conversationAlreadyHasSourceId(cwCfg, convId, sourceId)) {
         markMessageSynced(instanceName, key.id, convId);
         return { skipped: true, conversationId: convId };
     }
@@ -1031,9 +1060,9 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         await sendMessageToChatwoot(cwCfg, convId, {
             content,
             messageType,
-            sourceId: key.id,
+            sourceId,
             contentAttributes: {
-                ...(msg.quotedMessageId ? { in_reply_to_external_id: msg.quotedMessageId, quoted_external_id: msg.quotedMessageId } : {}),
+                ...(msg.quotedMessageId ? { in_reply_to_external_id: `WAID:${msg.quotedMessageId}`, quoted_external_id: `WAID:${msg.quotedMessageId}` } : {}),
                 bridged_from_whatsapp: true,
                 whatsapp_message_id: key.id,
                 whatsapp_instance: instanceName,
@@ -1052,7 +1081,7 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         if (String(err).includes('Chatwoot HTTP 404')) {
             const cacheKey = `${instanceName}:${conversationJid}`;
             convCache.delete(cacheKey);
-            console.warn(`[chatwoot-bridge][${instanceName}] conversation ${convId} not found (404), cache evicted`);
+            log.chatwoot.child(instanceName).warn(`Conversa ${convId} não encontrada (404) — cache evicted, próxima mensagem tentará recriar`);
         }
         throw err;
     }
@@ -1389,7 +1418,7 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
     if (!force && !cfg.autoCreate)
         return { ok: false, error: 'autocreate_not_enabled' };
     if (!cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken) {
-        console.warn(`[chatwoot-bridge][${instanceName}] autoCreate: missing config`);
+        log.chatwoot.child(instanceName).warn('autoCreate: configuração incompleta — baseUrl, accountId ou apiAccessToken ausentes');
         return { ok: false, error: 'missing_chatwoot_config' };
     }
     const cwCfg = {
@@ -1406,7 +1435,7 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
         let inbox;
         if (existing) {
             inbox = existing;
-            console.log(`[chatwoot-bridge][${instanceName}] autoCreate: inbox "${inboxName}" already exists (id=${inbox.id})`);
+            log.chatwoot.child(instanceName).info(`autoCreate: inbox "${inboxName}" já existe  id=${inbox.id}`);
         }
         else {
             // Create API inbox
@@ -1418,7 +1447,7 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
                 },
             });
             inbox = { id: created.id, name: created.name };
-            console.log(`[chatwoot-bridge][${instanceName}] autoCreate: created inbox "${inboxName}" id=${inbox.id}`);
+            log.chatwoot.child(instanceName).success(`autoCreate: inbox "${inboxName}" criada  id=${inbox.id}`);
         }
         // Determine webhook slug: use existing or default to instanceName
         const slug = cfg.webhookSlug?.trim() || instanceName;
@@ -1430,11 +1459,11 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
             await cwFetch(cwCfg, 'PATCH', `/inboxes/${inbox.id}`, {
                 channel: { webhook_url: webhookUrl },
             });
-            console.log(`[chatwoot-bridge][${instanceName}] autoCreate: set inbox webhook_url = ${webhookUrl}`);
+            log.chatwoot.child(instanceName).info(`autoCreate: webhook_url configurado  url=${webhookUrl}`);
         }
         catch (err) {
             // Non-fatal: log but continue
-            console.warn(`[chatwoot-bridge][${instanceName}] autoCreate: could not patch webhook_url`, err);
+            log.chatwoot.child(instanceName).warn('autoCreate: não foi possível atualizar webhook_url', err);
         }
         // Save inboxId and webhookSlug back to config
         const { updateChatwootConfig } = await import('./integrations.js');
@@ -1447,7 +1476,7 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
         return { ok: true, inboxId: inbox.id, inboxName: inbox.name, webhookUrl };
     }
     catch (err) {
-        console.error(`[chatwoot-bridge][${instanceName}] autoCreate error`, err);
+        log.chatwoot.child(instanceName).error('autoCreate error — falha ao criar/configurar inbox no Chatwoot', err);
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
 }
@@ -1558,7 +1587,7 @@ export async function syncHistoryToChatwoot(instanceName, jid, limitPerChat = 20
     }
     if (chats.length === 0) {
         finishSyncProgress(instanceName, 'completed');
-        console.log(`[chatwoot-bridge][${instanceName}] sync-history done: synced=0 errors=0 skipped=0 chats=0`);
+        log.chatwoot.child(instanceName).info('sync-history concluído  synced=0  errors=0  skipped=0  chats=0');
         return { ok: true, synced: 0, errors: 0, skipped: 0 };
     }
     let synced = 0;
@@ -1688,7 +1717,7 @@ export async function syncHistoryToChatwoot(instanceName, jid, limitPerChat = 20
                                 markMessageSynced(instanceName, stored.id, result.conversationId);
                             }
                             catch (dbErr) {
-                                console.error(`[chatwoot-bridge][${instanceName}] markMessageSynced failed for ${stored.id} — message was sent but dedup record not saved`, dbErr);
+                                log.chatwoot.child(instanceName).error(`markMessageSynced falhou para id=${stored.id} — mensagem enviada mas dedup não salvo`, dbErr);
                             }
                             synced++;
                             chatSynced++;
@@ -1725,7 +1754,7 @@ export async function syncHistoryToChatwoot(instanceName, jid, limitPerChat = 20
                             lastError: errMsg,
                         });
                         progressDirty = false;
-                        console.error(`[chatwoot-bridge][${instanceName}] sync-history error for ${stored.id}`, errMsg);
+                        log.chatwoot.child(instanceName).error(`sync-history error para id=${stored.id}`, errMsg);
                     }
                     finally {
                         finishMessageSync(instanceName, stored.id);
@@ -1755,16 +1784,93 @@ export async function syncHistoryToChatwoot(instanceName, jid, limitPerChat = 20
     }
     catch (err) {
         finishSyncProgress(instanceName, 'failed', err.message);
-        console.error(`[chatwoot-bridge][${instanceName}] sync-history fatal:`, err.message);
+        log.chatwoot.child(instanceName).error('sync-history FATAL — sincronização interrompida por erro crítico', err);
         return { ok: false, synced, errors, skipped, error: err.message };
     }
     if (cancelled) {
         finishSyncProgress(instanceName, 'cancelled');
-        console.log(`[chatwoot-bridge][${instanceName}] sync-history cancelled: synced=${synced} errors=${errors} skipped=${skipped} days=${days}`);
+        log.chatwoot.child(instanceName).warn(`sync-history cancelado  synced=${synced}  errors=${errors}  skipped=${skipped}  days=${days}`);
         return { ok: true, synced, errors, skipped, cancelled: true };
     }
     finishSyncProgress(instanceName, 'completed');
-    console.log(`[chatwoot-bridge][${instanceName}] sync-history done: synced=${synced} errors=${errors} skipped=${skipped} days=${days} trigger=${trigger}`);
+    log.chatwoot.child(instanceName).success(`sync-history concluído  synced=${synced}  errors=${errors}  skipped=${skipped}  days=${days}  trigger=${trigger}`);
     return { ok: true, synced, errors, skipped };
 }
+// ─── Worker de Retry (Zero Perda de Mensagens) ──────────────────────────────
+// Processa a fila de mensagens pendentes que falharam ao enviar.
+// Garante que nenhuma mensagem seja perdida mesmo em falhas temporárias.
+const RETRY_INTERVAL_MS = 10_000; // 10 segundos
+const RETRY_BATCH_SIZE = 20;
+let _retryWorkerRunning = false;
+async function processRetryBatch() {
+    const pending = getPendingMessages(RETRY_BATCH_SIZE);
+    if (pending.length === 0)
+        return;
+    log.chatwoot.info(`Retry batch: ${pending.length} mensagens pendentes`);
+    for (const item of pending) {
+        const { id, instance, msgId, payload, attempt, lastError } = item;
+        const msg = JSON.parse(payload);
+        // Get instance config
+        let cfg;
+        try {
+            const integrations = await getInstanceIntegrations(instance);
+            cfg = integrations.chatwoot;
+        }
+        catch {
+            removePendingMessage(id);
+            continue;
+        }
+        if (!cfg.enabled || !cfg.baseUrl || !cfg.accountId || !cfg.apiAccessToken) {
+            removePendingMessage(id);
+            continue;
+        }
+        const cwCfg = {
+            baseUrl: cfg.baseUrl,
+            accountId: cfg.accountId,
+            apiAccessToken: cfg.apiAccessToken,
+            inboxId: cfg.inboxId,
+        };
+        const inbox = await getInbox(instance, cwCfg, cfg.nameInbox || 'WhatsApp');
+        if (!inbox) {
+            updatePendingMessageRetry(id, attempt, 'inbox não encontrado');
+            continue;
+        }
+        try {
+            const result = await dispatchSingleMessage(instance, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
+            if (!result.skipped && result.conversationId) {
+                markMessageSyncedWithPersistence(instance, msgId, result.conversationId);
+                removePendingMessage(id);
+                log.chatwoot.child(instance).success(`Retry sukses  msgId=${msgId}  attempt=${attempt + 1}`);
+            }
+            else {
+                updatePendingMessageRetry(id, attempt, result.skipped ? 'skipped' : 'no_conversation');
+            }
+        }
+        catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            updatePendingMessageRetry(id, attempt, errorMsg);
+            log.chatwoot.child(instance).warn(`Retry falhou  msgId=${msgId}  attempt=${attempt + 1}  error=${errorMsg}`);
+        }
+    }
+}
+function startRetryWorker() {
+    if (_retryWorkerRunning)
+        return;
+    _retryWorkerRunning = true;
+    log.chatwoot.info(`Worker de retry iniciado (interval=${RETRY_INTERVAL_MS}ms)`);
+    setInterval(async () => {
+        try {
+            const pendingCount = countPendingMessages();
+            if (pendingCount > 0) {
+                log.chatwoot.debug(`Verificando ${pendingCount} mensagens pendentes`);
+                await processRetryBatch();
+            }
+        }
+        catch (err) {
+            log.chatwoot.error('Erro no worker de retry', err);
+        }
+    }, RETRY_INTERVAL_MS).unref();
+}
+// Inicia o worker de retry imediatamente
+startRetryWorker();
 //# sourceMappingURL=chatwoot-bridge.js.map

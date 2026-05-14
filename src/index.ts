@@ -17,15 +17,17 @@ import { openApiSpec } from './docs/openapi.js';
 import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
 import { requestContext } from './middleware/request-context.js';
 import { sendError } from './utils/api-response.js';
-import { getAllInstances, getInstance, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances } from './services/whatsapp.js';
+import { getAllInstances, getInstance, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances, disconnectInstance } from './services/whatsapp.js';
 import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
 import { normalizeInstanceName } from './utils/helpers.js';
 import { verifyMediaUrlToken } from './utils/media-signature.js';
+import { log } from './utils/logger.js';
 import { parseChatwootWebhook, type ChatwootWebhookPayload, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot, normalizeChatwootWebhookSlug } from './services/chatwoot-bridge.js';
 import { getSyncProgress, requestSyncCancel, isMessageSynced, isSyncRunning } from './services/chatwoot-sync-store.js';
 import { getInstanceIntegrations, findInstanceByWebhookSlug } from './services/integrations.js';
 import { isChatwootOriginated } from './services/chatwoot-tracking.js';
+import { startMessageCleanupJob, stopMessageCleanupJob } from './services/message-store.js';
 
 function extractChatwootSourceIds(payload: ChatwootWebhookPayload): string[] {
   const attrs = payload.content_attributes ?? {};
@@ -104,7 +106,13 @@ if (process.env.NODE_ENV === 'production' && !hasConfiguredApiKeys) {
 }
 
 if (!hasConfiguredApiKeys) {
-  console.warn('[security] API auth disabled: configure API_KEY or API_KEYS_JSON.');
+  log.security.warn('API auth DESABILITADA — configure API_KEY ou API_KEYS_JSON para proteger a API.');
+}
+
+if (!config.security.chatwootWebhookSecret.trim()) {
+  log.security.warn(
+    'CHATWOOT_WEBHOOK_SECRET não configurado — endpoint /chatwoot/webhook aceita requests sem autenticação.'
+  );
 }
 
 const app = express();
@@ -346,7 +354,7 @@ app.post('/chatwoot/webhook/:slug', webhookLimiter, async (req, res) => {
     }
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(`[chatwoot-webhook-slug][${instance}] dispatch error`, err);
+    log.chatwoot.child(instance).error('chatwoot-webhook-slug dispatch_error', err);
     return res.status(503).json({ ok: false, error: 'whatsapp_dispatch_failed' });
   }
 });
@@ -396,7 +404,7 @@ app.post('/v1/integrations/:instance/chatwoot/webhook', webhookLimiter, async (r
     }
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(`[chatwoot-webhook][${instance}] dispatch error`, err);
+    log.chatwoot.child(instance).error('chatwoot-webhook dispatch_error', err);
     return res.status(503).json({ ok: false, error: 'whatsapp_dispatch_failed' });
   }
 });
@@ -454,7 +462,7 @@ app.post('/v1/integrations/:instance/chatwoot/sync-history', requireApiKey(['int
     try {
       await syncHistoryToChatwoot(instance, jid ?? undefined, limitPerChat, 'manual');
     } catch (err) {
-      console.error(`[chatwoot-bridge][${instance}] manual sync error:`, (err as Error).message);
+      log.chatwoot.child(instance).error('sync-history manual_sync_error', err);
     }
   })();
   return res.json({ ok: true, started: true, message: 'Sync started in background — poll /sync-status for progress' });
@@ -511,37 +519,86 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   return sendError(res, 500, 'internal_server_error', message);
 });
 
-app.listen(config.port, () => {
-  console.log(`[Beyound] API rodando em http://localhost:${config.port}`);
-  console.log(`[Beyound] Interface: http://localhost:${config.port}`);
-  console.log('[Beyound] API auth ativa. Use header: x-api-key');
+const httpServer = app.listen(config.port, () => {
+  log.app.success(`API pronta  →  http://localhost:${config.port}`);
+  log.app.info(`Interface   →  http://localhost:${config.port}`);
+  if (hasConfiguredApiKeys) {
+    log.app.info('API auth ativa — envie o header: x-api-key');
+  }
 
   if (config.webhooks.embeddedWorkerEnabled) {
     void import('./workers/webhook-delivery-worker.js')
       .then(() => {
-        console.log('[webhook-worker] embedded_worker_enabled=true (running in API process)');
+        log.webhook.success('Worker de webhooks iniciado no processo da API (embedded_worker=true)');
       })
       .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.log(`[webhook-worker] embedded_worker_failed ${message}`);
+        log.webhook.error('Falha ao iniciar worker de webhooks embutido', error);
       });
   }
 
   void reconnectPreviouslyActiveInstances(config.authFolder)
     .then((summary) => {
       if (summary.attempted === 0) {
-        console.log('[whatsapp] startup_autoconnect nenhum para restaurar');
+        log.whatsapp.info('startup_autoconnect — nenhuma instância para restaurar');
         return;
       }
-      console.log(
-        `[whatsapp] startup_autoconnect attempted=${summary.attempted} started=${summary.started} failed=${summary.failed.length}`
+      log.whatsapp.info(
+        `startup_autoconnect  attempted=${summary.attempted}  started=${summary.started}  failed=${summary.failed.length}`
       );
       if (summary.failed.length > 0) {
-        console.log(`[whatsapp] startup_autoconnect_failed ${summary.failed.join(', ')}`);
+        log.whatsapp.error(`Instâncias que falharam no autoconectar: ${summary.failed.join(', ')}`);
       }
     })
     .catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(`[whatsapp] startup_autoconnect_error ${message}`);
+      log.whatsapp.error('Erro crítico no startup_autoconnect', error);
     });
+
+  // Inicia job de cleanup de mensagens antigas (TTL)
+  startMessageCleanupJob();
 });
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown — SIGTERM (docker stop) e SIGINT (Ctrl+C)
+// ---------------------------------------------------------------------------
+async function gracefulShutdown(signal: string): Promise<void> {
+  log.app.info(`${signal} recebido — iniciando graceful shutdown`);
+
+  // 1. Para de aceitar novas conexões HTTP
+  httpServer.close(() => {
+    log.app.info('Servidor HTTP fechado');
+  });
+
+  // 2. Para job de cleanup de mensagens
+  stopMessageCleanupJob();
+
+  // 3. Desconecta instâncias WhatsApp graciosamente (persiste estado)
+  const instances = getAllInstances();
+  if (instances.length > 0) {
+    log.whatsapp.info(`Desconectando ${instances.length} instância(s)...`);
+    for (const ctx of instances) {
+      try {
+        disconnectInstance(ctx.name, { keepAutostart: true });
+      } catch (err) {
+        log.whatsapp.warn(`Erro ao desconectar instância ${ctx.name}: ${err}`);
+      }
+    }
+  }
+
+  // 4. Aguarda um breve período para operações em voo finalizarem
+  await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+  log.app.info('Shutdown concluído');
+  process.exit(0);
+}
+
+let _shuttingDown = false;
+function onSignal(signal: string): void {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  gracefulShutdown(signal).catch((err) => {
+    log.app.error('Erro durante graceful shutdown', err);
+    process.exit(1);
+  });
+}
+
+process.on('SIGTERM', () => onSignal('SIGTERM'));
+process.on('SIGINT', () => onSignal('SIGINT'));

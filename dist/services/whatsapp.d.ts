@@ -45,6 +45,7 @@ interface CachedMessage {
     senderName?: string;
     senderNumber?: string;
     participant?: string;
+    quotedMessageId?: string;
     media?: CachedMedia;
     contact?: CachedContact;
 }
@@ -53,6 +54,19 @@ export declare function applyInstanceRuntimeSettings(name: string): {
     applied: string[];
     requiresReconnect: string[];
 };
+/**
+ * Garante que mensagens com mídia tenham `base64` inline para que o
+ * Chatwoot bridge consiga criar attachments. Diferente de
+ * `enrichIncomingMediaBase64` (que respeita a flag de webhooks externos),
+ * esta função SEMPRE tenta baixar a mídia, com um limite de tamanho
+ * dedicado ao Chatwoot (`config.chatwoot.mediaMaxBytes`).
+ *
+ * Se uma mensagem já tem `base64` (porque o webhook externo já enriqueceu,
+ * ou o usuário abriu o chat e a mídia foi cacheada), reutiliza.
+ *
+ * Não modifica mensagens sem mídia. Retorna sempre o mesmo array de tamanho.
+ */
+export declare function enrichMediaForChatwoot(messages: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>>;
 /**
  * Retorna o contexto da instância pelo nome, ou undefined se não existir.
  */
@@ -110,7 +124,7 @@ export declare function getInstanceChatList(name: string): Array<{
     lastTimestamp: number;
 }>;
 export declare function getInstanceChatMessages(name: string, jid: string): CachedMessage[];
-export declare function getInstanceChatMessagesWithMedia(name: string, jid: string): Promise<CachedMessage[]>;
+export declare function getInstanceChatMessagesWithMedia(name: string, jid: string, onlyIds?: ReadonlySet<string>): Promise<CachedMessage[]>;
 export declare function getInstanceChatMediaBinary(name: string, mediaId: string): {
     ok: boolean;
     mimeType?: string;
@@ -148,6 +162,9 @@ export declare function sendInstanceTextMessage(name: string, jid: string, text:
 /**
  * Send a URL-based media message via an active WhatsApp instance.
  * Used when Chatwoot sends an attachment back to WhatsApp.
+ *
+ * Baixa o arquivo em memória antes de mandar para o Baileys — evita erros
+ * de download silencioso quando a URL exige headers/cookies.
  */
 export declare function sendInstanceMediaMessage(name: string, jid: string, params: {
     mediaUrl: string;

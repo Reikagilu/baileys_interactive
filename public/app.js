@@ -190,18 +190,19 @@
       frag.appendChild(btn);
     };
 
+    const link = document.createElement('a');
+    link.className = 'btn btn-primary btn-sm';
+    link.href = `/instance.html?instance=${encodeURIComponent(item.name)}`;
+    link.textContent = 'Painel';
+    frag.appendChild(link);
+
     if (item.status !== 'saved') {
-      const link = document.createElement('a');
-      link.className = 'btn btn-primary btn-sm';
-      link.href = `/instance.html?instance=${encodeURIComponent(item.name)}`;
-      link.textContent = 'Painel';
-      frag.appendChild(link);
       if (item.status === 'qr') appendButton('Ver QR', 'btn btn-secondary btn-sm', 'qr');
       if (item.status === 'connected') appendButton('Disconnect', 'btn btn-secondary btn-sm', 'disconnect');
       appendButton('Logout', 'btn btn-ghost btn-sm', 'logout', 'Limpa sessão (novo QR)');
       appendButton('Deletar', 'btn btn-danger btn-sm', 'delete');
     } else {
-      appendButton('Conectar', 'btn btn-primary btn-sm', 'connect-saved');
+      appendButton('Conectar', 'btn btn-secondary btn-sm', 'connect-saved');
       appendButton('Excluir', 'btn btn-danger btn-sm', 'logout', 'Excluir sessão salva');
     }
 

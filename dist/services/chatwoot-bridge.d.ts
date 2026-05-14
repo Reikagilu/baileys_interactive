@@ -12,6 +12,9 @@
  *   POST /v1/integrations/:instance/chatwoot/webhook receives Chatwoot events
  *   and dispatches messages to WhatsApp via sendMessage
  */
+export declare const CHATWOOT_WEBHOOK_SLUG_PATTERN: RegExp;
+export declare function normalizeChatwootWebhookSlug(input: unknown): string;
+export declare function buildChatwootWebhookUrl(slugRaw: string): string;
 interface NormalizedMessage {
     key: {
         id: string;
@@ -23,6 +26,7 @@ interface NormalizedMessage {
     message_type?: string;
     messageType?: string;
     text?: string;
+    quotedMessageId?: string;
     message?: Record<string, unknown>;
     timestamp?: number;
     media?: {
@@ -73,10 +77,19 @@ export interface ChatwootWebhookPayload {
         full_name?: string;
     };
     attachments?: Array<{
-        file_type: string;
-        data_url: string;
+        file_type?: string;
+        data_url?: string;
+        download_url?: string;
+        external_url?: string;
+        file_url?: string;
+        url?: string;
         file_name?: string;
     }>;
+}
+interface ParsedChatwootAttachment {
+    mediaUrl: string;
+    mimeType?: string;
+    fileName?: string;
 }
 /**
  * Process a Chatwoot webhook event.
@@ -85,12 +98,18 @@ export interface ChatwootWebhookPayload {
 export declare function parseChatwootWebhook(payload: ChatwootWebhookPayload): {
     jid: string;
     text: string;
-    mediaUrl?: string;
-    mimeType?: string;
-    fileName?: string;
+    attachments?: ParsedChatwootAttachment[];
     replyToId?: string;
     agentName?: string;
 } | null;
+export declare function syncContactNamesToChatwoot(instanceName: string): Promise<{
+    ok: boolean;
+    scanned: number;
+    updated: number;
+    skipped: number;
+    errors: number;
+    error?: string;
+}>;
 /**
  * Called when a WhatsApp instance connects (connection = 'open') and autoCreate = true.
  * Creates an API inbox in Chatwoot with the configured nameInbox, then saves the inboxId back.

@@ -17,6 +17,7 @@ export interface StoredMessage {
     senderName?: string;
     senderNumber?: string;
     participant?: string;
+    quotedMessageId?: string;
     media?: Record<string, unknown>;
     contact?: Record<string, unknown>;
 }
@@ -33,6 +34,7 @@ export interface StoredChatMeta {
  * Retorna true se foi inserida, false se já existia.
  */
 export declare function upsertMessage(instance: string, jid: string, msg: StoredMessage): boolean;
+export declare function updateMessageFields(instance: string, jid: string, msgId: string, patch: Partial<StoredMessage>): void;
 /**
  * Atualiza metadados do chat.
  */
@@ -56,8 +58,19 @@ export declare function listChats(instance: string): StoredChatMeta[];
  * Retorna as mensagens de um chat, ordenadas por ts ASC.
  * limit padrão: 500 mensagens mais recentes.
  * afterTs: se fornecido, retorna apenas mensagens com ts >= afterTs.
+ * Quando afterTs não é fornecido, retorna as N mais recentes (não as N mais antigas).
  */
 export declare function listMessages(instance: string, jid: string, limit?: number, afterTs?: number): StoredMessage[];
+/**
+ * Variante otimizada para sync histórico: retorna apenas mensagens com conteúdo
+ * útil para envio ao Chatwoot (texto não-vazio, mídia presente ou contato presente).
+ */
+export declare function listSyncMessages(instance: string, jid: string, limit?: number, afterTs?: number): StoredMessage[];
+/**
+ * Variante ainda mais otimizada para sync histórico: já exclui mensagens que
+ * constam em chatwoot_synced, evitando uma segunda consulta por chat.
+ */
+export declare function listUnsyncedSyncMessages(instance: string, jid: string, limit?: number, afterTs?: number): StoredMessage[];
 /**
  * Retorna o timestamp da mensagem mais antiga armazenada para um chat.
  * Útil para decidir se é necessário buscar mais histórico.
@@ -71,3 +84,12 @@ export declare function countMessages(instance: string, jid: string): number;
  * Remove todos os dados de uma instância (ao fazer logout/delete).
  */
 export declare function clearInstance(instance: string): void;
+/**
+ * Inicia o job периодический de cleanup de mensagens antigas.
+ * Use `stopMessageCleanupJob()` para encerrar.
+ */
+export declare function startMessageCleanupJob(): void;
+/**
+ * Para o job de cleanup.
+ */
+export declare function stopMessageCleanupJob(): void;

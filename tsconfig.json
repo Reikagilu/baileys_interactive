@@ -8,11 +8,29 @@
     "strict": false,
     "noImplicitAny": false,
     "skipLibCheck": true,
-    "declaration": true,
+    "declaration": false,
     "sourceMap": false,
     "noEmitOnError": false,
     "allowJs": false
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/utils/api-response.ts",
+    "src/utils/helpers.ts",
+    "src/utils/media-signature.ts",
+    "src/utils/url-security.ts",
+    "src/middleware/request-context.ts",
+    "src/routes/chats.ts",
+    "src/routes/instances.ts",
+    "src/routes/messages.ts",
+    "src/routes/ops.ts",
+    "src/routes/webhooks.ts",
+    "src/services/audit-log.ts",
+    "src/services/idempotency.ts",
+    "src/services/instance-config.ts",
+    "src/services/webhooks.ts",
+    "src/workers/webhook-delivery-worker.ts"
+  ]
 }

@@ -1,7 +1,15 @@
+import { timingSafeEqual } from 'node:crypto';
 import { config } from '../config.js';
 import { sendError } from '../utils/api-response.js';
 let cachedSource = '';
 let cachedRecords = [];
+function safeKeyEqual(a, b) {
+    const ab = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ab.length !== bb.length)
+        return false;
+    return timingSafeEqual(ab, bb);
+}
 function normalizeScopes(scopes) {
     if (!Array.isArray(scopes))
         return [];
@@ -28,7 +36,8 @@ function parseConfiguredKeys() {
                     const enabledRaw = item.enabled;
                     if (enabledRaw === false)
                         continue;
-                    const keyId = String(item.id ?? `key_${records.length + 1}`).trim() || `key_${records.length + 1}`;
+                    const keyId = String(item.id ?? `key_${records.length + 1}`).trim() ||
+                        `key_${records.length + 1}`;
                     const scopes = normalizeScopes(item.scopes);
                     records.push({ keyId, key, scopes: scopes.length ? scopes : ['*'] });
                 }
@@ -65,7 +74,7 @@ export function requireApiKey(requiredScopes = []) {
         if (!key) {
             return sendError(res, 401, 'missing_api_key');
         }
-        const matched = records.find((record) => record.key === key);
+        const matched = records.find((record) => safeKeyEqual(record.key, key));
         if (!matched) {
             return sendError(res, 401, 'invalid_api_key');
         }

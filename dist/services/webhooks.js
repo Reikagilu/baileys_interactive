@@ -14,9 +14,8 @@ const allowedEventSet = new Set([
 const db = openDatabase(config.webhooks.dbPath);
 setupSchemaWithRetry();
 function sleepSync(ms) {
-    const shared = new SharedArrayBuffer(4);
-    const view = new Int32Array(shared);
-    Atomics.wait(view, 0, 0, ms);
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin */ }
 }
 function isDatabaseLockedError(error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { log } from '../utils/logger.js';
 function sanitizeRequestPath(pathValue) {
     if (!pathValue)
         return '/';
@@ -17,19 +18,25 @@ export function requestContext(req, res, next) {
         if (!config.logging.requestLogsEnabled)
             return;
         const pathValue = req.originalUrl || req.url;
-        if (pathValue.startsWith('/health') || pathValue.startsWith('/ready') || pathValue.startsWith('/metrics'))
+        if (pathValue.startsWith('/health') ||
+            pathValue.startsWith('/ready') ||
+            pathValue.startsWith('/metrics'))
             return;
         const durationMs = Date.now() - startedAt;
-        const line = {
-            ts: new Date().toISOString(),
-            level: 'info',
-            requestId,
-            method: req.method,
-            path: sanitizeRequestPath(req.originalUrl || req.url),
-            status: res.statusCode,
-            durationMs,
-        };
-        console.log(JSON.stringify(line));
+        const status = res.statusCode;
+        const method = req.method;
+        const path = sanitizeRequestPath(req.originalUrl || req.url);
+        // Use warn for 4xx, error for 5xx, info otherwise
+        const msg = `${method} ${path}  ${status}  ${durationMs}ms  reqId=${requestId}`;
+        if (status >= 500) {
+            log.http.error(msg);
+        }
+        else if (status >= 400) {
+            log.http.warn(msg);
+        }
+        else {
+            log.http.info(msg);
+        }
     });
     next();
 }

@@ -1,5 +1,7 @@
 export declare const config: {
     readonly port: number;
+    /** URL pública deste servidor (usada para gerar URLs de webhook e mídia). */
+    readonly serverUrl: string;
     readonly apiKey: string;
     readonly apiKeysJson: string;
     readonly authFolder: string;
@@ -17,8 +19,19 @@ export declare const config: {
         readonly requestLogsEnabled: boolean;
     };
     readonly security: {
+        readonly trustProxy: boolean;
+        readonly hstsEnabled: boolean;
+        readonly hstsMaxAgeSeconds: number;
         readonly allowPrivateNetworkWebhooks: boolean;
         readonly allowPrivateNetworkIntegrations: boolean;
+        readonly chatwootWebhookSecret: string;
+        readonly apiRateLimitWindowMs: number;
+        readonly apiRateLimitMax: number;
+        readonly webhookRateLimitWindowMs: number;
+        readonly webhookRateLimitMax: number;
+        readonly publicDocsEnabled: boolean;
+        readonly publicMetricsEnabled: boolean;
+        readonly publicReadyEnabled: boolean;
     };
     readonly pairing: {
         readonly enabled: boolean;
@@ -32,6 +45,8 @@ export declare const config: {
     readonly messages: {
         readonly dbPath: string;
         readonly maxPerChat: number;
+        readonly historyTtlDays: number;
+        readonly cleanupIntervalMs: number;
     };
     readonly webhooks: {
         readonly dbPath: string;
@@ -60,6 +75,27 @@ export declare const config: {
     readonly media: {
         readonly signedUrlSecret: string;
         readonly signedUrlTtlSeconds: number;
+    };
+    readonly chatwoot: {
+        /**
+         * Limite máximo de bytes para baixar uma mídia recebida do WhatsApp
+         * e encaminhá-la ao Chatwoot. Default 25MB cobre vídeos e áudios
+         * típicos do WhatsApp. Mídias acima desse limite são puladas e o
+         * Chatwoot recebe apenas o texto/legenda (se houver).
+         */
+        readonly mediaMaxBytes: number;
+        /** Timeout HTTP para requests ao Chatwoot (uploads podem demorar). */
+        readonly requestTimeoutMs: number;
+        /** Retries para falhas transitórias como timeout/429/5xx. */
+        readonly requestRetries: number;
+        /** Pausa entre retries ao Chatwoot. */
+        readonly requestRetryDelayMs: number;
+        /** Atraso entre mensagens durante sync de histórico (anti-overload). */
+        readonly syncMessageDelayMs: number;
+        /** A cada N mensagens o sync faz uma pausa maior para aliviar I/O. */
+        readonly syncBatchSize: number;
+        /** Duração da pausa entre batches. */
+        readonly syncBatchPauseMs: number;
     };
     readonly limits: {
         readonly maxButtons: 3;

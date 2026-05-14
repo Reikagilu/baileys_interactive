@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1.7
-# Estratégia: copia o dist/ base do contexto, recompila automaticamente os
-# arquivos modificados de src/ durante o build e restaura os módulos reais
-# preservados do dist base. Assim `docker compose build` já sobe com tudo certo.
+# Estratégia: instala dependências no container (npm ci), copia o dist/ base,
+# recompila os arquivos modificados de src/ e restaura os módulos reais do dist base.
 
 ARG NODE_VERSION=22
 
@@ -19,8 +18,11 @@ ENV MESSAGES_DB_PATH=data/messages.sqlite
 RUN mkdir -p /app/auth /app/data \
   && chown node:node /app /app/auth /app/data
 
+# Instala dependências primeiro (camada cacheável separada)
 COPY --chown=node:node package*.json ./
-COPY --chown=node:node node_modules ./node_modules
+RUN npm ci --omit=dev --ignore-scripts
+
+# Copia o restante do código
 COPY --chown=node:node dist ./dist
 COPY --chown=node:node public ./public
 COPY --chown=node:node src ./src

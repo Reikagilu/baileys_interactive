@@ -11,6 +11,7 @@ import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields
 import { markMessageSynced } from './chatwoot-sync-store.js';
 import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
 import { markChatwootOriginated } from './chatwoot-tracking.js';
+import { log } from '../utils/logger.js';
 const instances = new Map();
 const reconnectAttempts = new Map();
 const pairingIssuedAt = new Map();
@@ -165,6 +166,35 @@ function normalizeTimestamp(raw) {
         }
     }
     return Date.now();
+}
+// Returns 0 instead of Date.now() when value is missing/invalid.
+// Used for conversationTimestamp so an absent value does NOT overwrite a stored one.
+function normalizeTimestampOrZero(raw) {
+    const toMs = (value) => {
+        if (!Number.isFinite(value) || value <= 0)
+            return 0;
+        return value < 1000000000000 ? value * 1000 : value;
+    };
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+        return toMs(raw);
+    }
+    if (typeof raw === 'string') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed))
+            return toMs(parsed);
+    }
+    if (typeof raw === 'object' && raw !== null) {
+        const maybe = raw;
+        if (typeof maybe.toNumber === 'function') {
+            const val = maybe.toNumber();
+            if (Number.isFinite(val))
+                return toMs(val);
+        }
+        if (typeof maybe.low === 'number') {
+            return toMs(maybe.low);
+        }
+    }
+    return 0;
 }
 function extractChatTitleFromPayload(payload) {
     const chat = (payload ?? {});
@@ -408,11 +438,11 @@ function repairInconsistentOwnSignalSessions(authPath, creds) {
             }
         }
         if (deleted > 0) {
-            console.warn(`[whatsapp][auth-repair] removed ${deleted} stale own-device signal files for lid=${ownLidPrefix}`);
+            log.whatsapp.warn(`auth-repair  removed ${deleted} stale own-device signal files  lid=${ownLidPrefix}`);
         }
     }
     catch (err) {
-        console.warn(`[whatsapp][auth-repair] failed for ${authPath}: ${err instanceof Error ? err.message : String(err)}`);
+        log.whatsapp.warn(`auth-repair  falha ao limpar arquivos de sinal em ${authPath}`, err);
     }
 }
 function shouldRestoreInstanceOnStartup(state, name) {
@@ -1077,49 +1107,61 @@ export async function enrichMediaForChatwoot(messages) {
         // Já tem base64 (enriquecido antes)?
         if (typeof found.node.base64 === 'string' && found.node.base64.length > 0)
             continue;
-        try {
-            const mediaModule = (await import('baileys'));
-            if (typeof mediaModule.downloadContentFromMessage !== 'function')
-                continue;
-            const stream = await mediaModule.downloadContentFromMessage(found.node, MEDIA_NODE_BY_KIND[found.kind].downloadType);
-            const chunks = [];
-            let total = 0;
-            let oversize = false;
-            for await (const chunk of stream) {
-                const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                total += buffer.length;
-                if (total > limit) {
-                    oversize = true;
-                    break;
+        // Retry para download de mídia (máximo 3 tentativas)
+        const maxRetries = 3;
+        let downloadSuccess = false;
+        let lastDownloadError = '';
+        for (let attempt = 1; attempt <= maxRetries && !downloadSuccess; attempt++) {
+            try {
+                const mediaModule = (await import('baileys'));
+                if (typeof mediaModule.downloadContentFromMessage !== 'function') {
+                    lastDownloadError = 'downloadContentFromMessage não disponível';
+                    continue;
                 }
-                chunks.push(buffer);
-            }
-            if (oversize || chunks.length === 0)
-                continue;
-            const base64 = Buffer.concat(chunks).toString('base64');
-            const currentMedia = isRecord(current.media) ? current.media : null;
-            enriched[i] = {
-                ...current,
-                media: currentMedia
-                    ? {
-                        ...currentMedia,
-                        base64,
+                const stream = await mediaModule.downloadContentFromMessage(found.node, MEDIA_NODE_BY_KIND[found.kind].downloadType);
+                const chunks = [];
+                let total = 0;
+                let oversize = false;
+                for await (const chunk of stream) {
+                    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                    total += buffer.length;
+                    if (total > limit) {
+                        oversize = true;
+                        break;
                     }
-                    : {
-                        // current.media was undefined — build a minimal media object so the
-                        // downloaded base64 is not silently discarded (e.g. stickers/audios
-                        // received on a freshly connected instance with no in-memory cache).
-                        kind: found.kind,
-                        mimeType: typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined,
-                        base64,
-                    },
-                message: injectMediaBase64(message, found.kind, base64),
-            };
+                    chunks.push(buffer);
+                }
+                if (oversize || chunks.length === 0) {
+                    lastDownloadError = oversize ? 'mídia excede limite máximo' : 'stream vazio';
+                    continue;
+                }
+                const base64 = Buffer.concat(chunks).toString('base64');
+                const currentMedia = isRecord(current.media) ? current.media : null;
+                enriched[i] = {
+                    ...current,
+                    media: currentMedia
+                        ? {
+                            ...currentMedia,
+                            base64,
+                        }
+                        : {
+                            kind: found.kind,
+                            mimeType: typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined,
+                            base64,
+                        },
+                    message: injectMediaBase64(message, found.kind, base64),
+                };
+                downloadSuccess = true;
+            }
+            catch (err) {
+                lastDownloadError = err instanceof Error ? err.message : String(err);
+                if (attempt < maxRetries) {
+                    await new Promise(r => setTimeout(r, 100 * attempt));
+                }
+            }
         }
-        catch {
-            // Silencia falhas individuais — outras mídias seguem normalmente.
-            continue;
-        }
+        // Se download falhou, a mensagem segue sem mídia (caso esperado)
+        // Não faz sentido tentar mais - a mídia pode não estar mais disponível no WhatsApp
     }
     return enriched;
 }
@@ -1683,10 +1725,10 @@ export async function createInstance(name, authFolder) {
         // before the socket is created so the next attempt starts from a clean session.
         if (hasCorruptExistingRegistration(authState.state.creds)) {
             if (isPairingWindowActive(name) || isAuthRecoveryWindowActive(name)) {
-                console.warn(`[whatsapp][${name}] auth_corrupt_on_boot deferred during recovery window; keeping auth for reconnect/restart recovery`);
+                log.whatsapp.child(name).warn('auth_corrupt_on_boot adiado — janela de recovery/QR ativa, mantendo auth para reconexão');
             }
             else {
-                console.warn(`[whatsapp][${name}] auth_corrupt_on_boot registered=false with existing identity; resetting auth before socket create`);
+                log.whatsapp.child(name).warn('auth_corrupt_on_boot — registered=false com identidade existente; resetando auth antes de criar socket');
                 resetInstanceAuthState(authPath);
                 authState = await useMultiFileAuthState(authPath);
             }
@@ -1810,7 +1852,7 @@ export async function createInstance(name, authFolder) {
                         await autoCreateChatwootInbox(name, linkedNumber ?? null);
                     }
                     catch (err) {
-                        console.error(`[whatsapp][${name}] autoCreateChatwootInbox error`, err);
+                        log.whatsapp.child(name).error('Erro ao criar inbox no Chatwoot automaticamente (autoCreateChatwootInbox)', err);
                     }
                     try {
                         const { getInstanceIntegrations: getInteg } = await import('./integrations.js');
@@ -1823,12 +1865,12 @@ export async function createInstance(name, authFolder) {
                             if (current !== ctx || current?.status !== 'connected')
                                 return;
                             syncHist(name, undefined, 200, 'connect').catch((err) => {
-                                console.warn(`[whatsapp][${name}] connect-trigger sync failed:`, err.message);
+                                log.whatsapp.child(name).warn('connect-trigger sync_failed', err);
                             });
                         }
                     }
                     catch (err) {
-                        console.warn(`[whatsapp][${name}] connect-trigger sync error:`, err.message);
+                        log.whatsapp.child(name).warn('connect-trigger sync_error', err);
                     }
                 })();
             }
@@ -1846,7 +1888,7 @@ export async function createInstance(name, authFolder) {
                         status: 'disconnected',
                     });
                 }
-                console.log(`[whatsapp][${name}] connection_close code=${String(code ?? 'n/a')} message=${String(message ?? 'n/a')}`);
+                log.whatsapp.child(name).info(`connection_close  code=${String(code ?? 'n/a')}  message=${String(message ?? 'n/a')}`);
                 // 515 = restartRequired: durante o pareamento isso e normal. O WhatsApp
                 // pede apenas que o socket seja recriado usando a mesma auth recem-gravada.
                 // Esse caso precisa acontecer ANTES do bloco auth_corrupt, porque nesse
@@ -1880,7 +1922,7 @@ export async function createInstance(name, authFolder) {
                     // devemos apagar a auth; devemos apenas recriar o socket e deixar o
                     // fluxo normal de recovery acontecer.
                     if (recoveryActive && !authLikeClose) {
-                        console.warn(`[whatsapp][${name}] auth_corrupt deferred during active QR/recovery window code=${String(code ?? 'n/a')}`);
+                        log.whatsapp.child(name).warn(`auth_corrupt adiado — janela QR/recovery ativa  code=${String(code ?? 'n/a')}`);
                         closeSocket(ctx.sock);
                         ctx.status = 'connecting';
                         ctx.qr = null;
@@ -1897,10 +1939,10 @@ export async function createInstance(name, authFolder) {
                         return;
                     }
                     if (transientConnectedClose) {
-                        console.warn(`[whatsapp][${name}] auth_corrupt deferred after transient close code=${String(code ?? 'n/a')} previousStatus=connected`);
+                        log.whatsapp.child(name).warn(`auth_corrupt adiado após close transitório  code=${String(code ?? 'n/a')}  previousStatus=connected`);
                     }
                     else {
-                        console.warn(`[whatsapp][${name}] auth_corrupt registered=false with existing identity; resetting auth state${pairingActive ? ' and recreating for fresh QR' : ''}`);
+                        log.whatsapp.child(name).warn(`auth_corrupt — registered=false com identidade existente; resetando auth${pairingActive ? ' e recriando QR' : ''}`);
                         closeSocket(ctx.sock);
                         reconnectAttempts.delete(name);
                         markAutostart(name, false);
@@ -1935,7 +1977,7 @@ export async function createInstance(name, authFolder) {
                     if (isPairingWindowActive(name)) {
                         const folder = ctx.authFolder;
                         const authPath = path.resolve(process.cwd(), folder, name);
-                        console.log(`[whatsapp][${name}] pairing_window_close code=${String(code)} (resetting auth and recreating QR)`);
+                        log.whatsapp.child(name).warn(`pairing_window_close  code=${String(code)}  resetando auth e recriando QR`);
                         closeSocket(ctx.sock);
                         resetInstanceAuthState(authPath);
                         ctx.status = 'connecting';
@@ -1960,7 +2002,7 @@ export async function createInstance(name, authFolder) {
                         const folder = ctx.authFolder;
                         const delayMs = Math.min(1000 * attempts, 6000);
                         markAuthRecoveryWindow(name);
-                        console.log(`[whatsapp][${name}] auth_close_recover code=${String(code)} attempt=${attempts} delay_ms=${delayMs}`);
+                        log.whatsapp.child(name).warn(`auth_close_recover  code=${String(code)}  attempt=${attempts}  delay_ms=${delayMs}`);
                         closeSocket(ctx.sock);
                         ctx.status = 'connecting';
                         trackLastInstanceState(name, {
@@ -1997,7 +2039,7 @@ export async function createInstance(name, authFolder) {
                     const folder = ctx.authFolder;
                     const delayMs = Math.min(1000 * attempts, 6000);
                     markAuthRecoveryWindow(name);
-                    console.log(`[whatsapp][${name}] reconnect_attempt=${attempts} delay_ms=${delayMs}`);
+                    log.whatsapp.child(name).info(`reconnect_attempt=${attempts}  delay_ms=${delayMs}`);
                     closeSocket(ctx.sock);
                     ctx.status = 'connecting';
                     trackLastInstanceState(name, {
@@ -2011,7 +2053,7 @@ export async function createInstance(name, authFolder) {
                     }, delayMs);
                 }
                 else {
-                    console.log(`[whatsapp][${name}] reconnect_exhausted attempts=${attempts}`);
+                    log.whatsapp.child(name).error(`reconnect_exhausted — esgotadas ${attempts} tentativas de reconexão, instância desconectada`);
                 }
             }
         }));
@@ -2051,7 +2093,7 @@ export async function createInstance(name, authFolder) {
                         void dispatchToChatwoot(name, messagesForChatwoot);
                     }
                 })().catch((err) => {
-                    console.error(`[whatsapp][${name}] messages.upsert pipeline error`, err);
+                    log.whatsapp.child(name).error('messages.upsert pipeline_error', err);
                 });
             }
             const settings = getInstanceGeneral(name);
@@ -2110,7 +2152,7 @@ export async function createInstance(name, authFolder) {
                 upsertCachedChatMeta(name, {
                     jid,
                     title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
                 });
             }
             const originalList = Array.isArray(data.messages) ? data.messages : [];
@@ -2143,7 +2185,7 @@ export async function createInstance(name, authFolder) {
                 upsertCachedChatMeta(name, {
                     jid,
                     title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
                 });
             }
         });
@@ -2165,7 +2207,7 @@ export async function createInstance(name, authFolder) {
                 upsertCachedChatMeta(name, {
                     jid,
                     title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
                 });
             }
         });
@@ -2182,7 +2224,7 @@ export async function createInstance(name, authFolder) {
                 upsertCachedChatMeta(name, {
                     jid,
                     title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestamp(item.conversationTimestamp),
+                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
                 });
             }
         });
@@ -2320,8 +2362,12 @@ export function disconnectInstance(name, options) {
         });
     }
     else {
+        // keepAutostart=true é usado no shutdown gracioso — preserva o status atual
+        // (connected/qr/connecting) para que o autoconnect funcione no próximo boot.
+        // Apenas marca stoppedByUser=false sem mudar o status.
+        const currentStatus = lastInstanceState.get(name)?.status ?? ctx.status;
         trackLastInstanceState(name, {
-            status: 'disconnected',
+            status: currentStatus,
             stoppedByUser: false,
         });
     }
@@ -3021,7 +3067,7 @@ export async function sendInstanceMediaMessage(name, jid, params) {
                     signDelimiter: params.signDelimiter,
                 });
                 if (!textResult.ok) {
-                    console.warn(`[whatsapp][${name}] audio caption fallback failed for ${msgId}: ${textResult.error || 'failed_to_send_text'}`);
+                    log.whatsapp.child(name).warn(`audio caption fallback falhou para msgId=${msgId}: ${textResult.error || 'failed_to_send_text'}`);
                 }
             }
         }

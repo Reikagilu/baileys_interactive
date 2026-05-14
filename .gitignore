@@ -1,0 +1,15 @@
+# Dependências
+node_modules/
+
+# Ambiente — NUNCA commitar dados reais
+.env
+
+# Dados persistidos (gerados em runtime)
+auth/
+data/
+
+# Artefatos de build temporários
+dist/dist/
+
+# Logs locais
+*.log
