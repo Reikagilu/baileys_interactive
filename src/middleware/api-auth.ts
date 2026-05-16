@@ -17,11 +17,22 @@ interface ApiPrincipal {
 let cachedSource = '';
 let cachedRecords: KeyRecord[] = [];
 
+/**
+ * Comparação de strings timing-safe com padding para prevenir timing oracle
+ * por comprimento. Idêntico ao padrão de safeEqual em index.ts.
+ * A versão anterior fazia early-return em ab.length !== bb.length, vazando
+ * o comprimento esperado da key via canal de tempo.
+ */
 function safeKeyEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
+  const maxLen = Math.max(ab.length, bb.length);
+  const pa = Buffer.concat([ab, Buffer.alloc(maxLen - ab.length)]);
+  const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
+  // timingSafeEqual exige buffers de mesmo tamanho — garantido pelo padding acima.
+  // O check de comprimento ao final é necessário para correção: dois buffers
+  // com padding podem ter conteúdo igual mas origens de tamanho diferente.
+  return timingSafeEqual(pa, pb) && ab.length === bb.length;
 }
 
 function normalizeScopes(scopes: unknown): string[] {
@@ -50,7 +61,10 @@ function parseConfiguredKeys(): KeyRecord[] {
             String((item as any).id ?? `key_${records.length + 1}`).trim() ||
             `key_${records.length + 1}`;
           const scopes = normalizeScopes((item as any).scopes);
-          records.push({ keyId, key, scopes: scopes.length ? scopes : ['*'] });
+          // Default para [] (sem acesso) em vez de ['*'] (superuser), para não
+          // criar keys root acidentalmente quando o campo scopes for omitido.
+          // Use ['*'] explicitamente no JSON quando quiser acesso total.
+          records.push({ keyId, key, scopes });
         }
       }
     } catch {
@@ -76,14 +90,23 @@ export function requireApiKey(requiredScopes: string[] = []) {
   return (req: Request, res: Response, next: NextFunction) => {
     const records = parseConfiguredKeys();
     if (!records.length) {
+      // Sem keys configuradas: em produção o processo deveria ter abortado
+      // no boot (index.ts:116). Em dev/test, permitir acesso sem auth.
       next();
       return;
     }
-    const key = String(req.header('x-api-key') ?? '').trim();
+    const rawKey = String(req.header('x-api-key') ?? '').trim();
+    // Rejeitar headers excessivamente longos antes de alocar Buffers.
+    const key = rawKey.length > 512 ? '' : rawKey;
     if (!key) {
       return sendError(res, 401, 'missing_api_key');
     }
-    const matched = records.find((record) => safeKeyEqual(record.key, key));
+    // Iterar TODAS as records mesmo após encontrar match para prevenir timing
+    // oracle por posição da key na lista (records.find interrompe cedo).
+    let matched: KeyRecord | undefined;
+    for (const record of records) {
+      if (safeKeyEqual(record.key, key)) matched = record;
+    }
     if (!matched) {
       return sendError(res, 401, 'invalid_api_key');
     }

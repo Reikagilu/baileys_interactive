@@ -185,4 +185,3 @@ export const log = {
     module: (name) => makeLogger(name),
 };
 export default log;
-//# sourceMappingURL=logger.js.map

@@ -95,6 +95,7 @@
   // ============ State ============
   const state = {
     activeSection: 'dashboard',
+    instanceStatus: '',
     inFlight: new Set(),
     selectedChatJid: '',
     chatItems: [],
@@ -152,6 +153,7 @@
     btnDashboardConnect: document.getElementById('btnDashboardConnect'),
     btnDashboardRestart: document.getElementById('btnDashboardRestart'),
     btnDashboardDisconnect: document.getElementById('btnDashboardDisconnect'),
+    btnDashboardRepairSessions: document.getElementById('btnDashboardRepairSessions'),
     dashChatsCount: document.getElementById('dashChatsCount'),
     dashMessagesCount: document.getElementById('dashMessagesCount'),
     dashUnreadCount: document.getElementById('dashUnreadCount'),
@@ -261,6 +263,7 @@
   // ============ Status chip ============
   function updateHeaderStatus(status) {
     const s = (status || '').toLowerCase();
+    state.instanceStatus = s;
     const map = {
       connected: 'state-connected', open: 'state-connected',
       disconnected: 'state-disconnected', close: 'state-disconnected',
@@ -342,7 +345,8 @@
       }
 
       // QR / pairing
-      if (data.status === 'qr') {
+      const pairingModeActive = el.dashboardConnectMode.value === 'pairing';
+      if (data.status === 'qr' && !pairingModeActive) {
         const qrRes = await api(`/v1/instances/${encodeURIComponent(instance)}/qr`);
         if (qrRes.response.ok && qrRes.data.qr) {
           el.dashboardQrImage.src = qrRes.data.qr;
@@ -354,9 +358,13 @@
       if (data.status === 'connected') show(el.dashboardPairingBox, false);
 
       // Stats
-      const statsRes = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
-      if (statsRes.response.ok) {
-        applyDashboardStats(Array.isArray(statsRes.data.chats) ? statsRes.data.chats : []);
+      if (['connected', 'connecting', 'qr', 'pairing'].includes((data.status || '').toLowerCase())) {
+        const statsRes = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
+        if (statsRes.response.ok) {
+          applyDashboardStats(Array.isArray(statsRes.data.chats) ? statsRes.data.chats : []);
+        }
+      } else {
+        applyDashboardStats([]);
       }
       markSynced();
     } catch {} finally { endLoad('dashboard'); }
@@ -377,19 +385,57 @@
   async function connectFromDashboard() {
     setResult(el.dashboardStatus, 'Conectando...', '');
     try {
+      const tryResetCorruptAuth = async (response, data, modeLabel) => {
+        if (response.status !== 409 || data?.error !== 'auth_corrupt_requires_manual_repair') return false;
+        const confirmed = window.confirm(
+          'A autenticacao salva desta instancia esta corrompida.\n\n' +
+          'Isso impede gerar QR/pairing com a sessao atual.\n\n' +
+          `Deseja apagar a sessao salva da instancia ${instance} e tentar ${modeLabel} novamente?`
+        );
+        if (!confirmed) {
+          setResult(el.dashboardStatus, data.message || 'Sessao corrompida. Use logout para limpar a autenticacao salva.', 'error');
+          return true;
+        }
+        setResult(el.dashboardStatus, 'Limpando autenticacao salva...', '');
+        const reset = await api(`/v1/instances/${encodeURIComponent(instance)}/logout`, { method: 'POST' });
+        if (!reset.response.ok) {
+          setResult(el.dashboardStatus, reset.data?.error || 'Falha ao limpar autenticacao salva.', 'error');
+          return true;
+        }
+        setResult(el.dashboardStatus, 'Autenticacao limpa. Tentando novamente...', '');
+        return 'retry';
+      };
+
       if (el.dashboardConnectMode.value === 'pairing') {
         const phone = (el.dashboardPairingPhone.value || '').replace(/\D/g, '');
         if (!phone) { setResult(el.dashboardStatus, 'Informe o número.', 'error'); return; }
-        const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/pairing-code`, {
+        let { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/pairing-code`, {
           method: 'POST', body: JSON.stringify({ phoneNumber: phone })
         });
+        const resetAction = await tryResetCorruptAuth(response, data, 'pairing');
+        if (resetAction === 'retry') {
+          ({ response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/pairing-code`, {
+            method: 'POST', body: JSON.stringify({ phoneNumber: phone })
+          }));
+        } else if (resetAction) {
+          return;
+        }
         if (!response.ok) { setResult(el.dashboardStatus, data.error || 'Falha.', 'error'); return; }
         el.dashboardPairingCode.textContent = data.pairingCode || '-';
         show(el.dashboardPairingBox, true);
         show(el.dashboardQrBox, false);
         setResult(el.dashboardStatus, `Pairing code gerado para ${phone}.`, 'success');
+        await loadHeaderStatus();
+        markSynced();
       } else {
-        const { response, data } = await api('/v1/instances', { method: 'POST', body: JSON.stringify({ instance }) });
+        let { response, data } = await api('/v1/instances', { method: 'POST', body: JSON.stringify({ instance }) });
+        const resetAction = await tryResetCorruptAuth(response, data, 'QR');
+        if (resetAction === 'retry') {
+          ({ response, data } = await api('/v1/instances', { method: 'POST', body: JSON.stringify({ instance }) }));
+        } else if (resetAction) {
+          return;
+        }
+        if (!response.ok) { setResult(el.dashboardStatus, data.message || data.error || 'Falha.', 'error'); return; }
         if (data.qr) {
           el.dashboardQrImage.src = data.qr;
           show(el.dashboardQrBox, true);
@@ -400,7 +446,9 @@
           setResult(el.dashboardStatus, 'Aguardando QR...', '');
         }
       }
-      loadDashboard();
+      if (el.dashboardConnectMode.value !== 'pairing') {
+        loadDashboard();
+      }
     } catch (err) { setResult(el.dashboardStatus, err.message || 'Erro.', 'error'); }
   }
 
@@ -417,6 +465,22 @@
   el.btnDashboardConnect.addEventListener('click', connectFromDashboard);
   el.btnDashboardRestart.addEventListener('click', () => dashboardAction('restart'));
   el.btnDashboardDisconnect.addEventListener('click', () => dashboardAction('disconnect'));
+  el.btnDashboardRepairSessions.addEventListener('click', async () => {
+    if (!confirm('Isso irá remover todas as sessões Signal corrompidas e reiniciar a instância.\n\nContinuar?')) return;
+    setResult(el.dashboardStatus, 'Reparando sessões...', '');
+    try {
+      const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/repair-sessions`, { method: 'POST' });
+      if (!response.ok) {
+        setResult(el.dashboardStatus, data.error || 'Falha ao reparar.', 'error');
+        return;
+      }
+      const msg = `Reparado: ${data.deleted ?? 0} arquivo(s) removido(s).${data.restarted ? ' Instância reiniciada.' : ''}`;
+      setResult(el.dashboardStatus, msg, 'success');
+      setTimeout(loadDashboard, 1500);
+    } catch (err) {
+      setResult(el.dashboardStatus, err.message || 'Erro.', 'error');
+    }
+  });
 
   // ============ Chat (diff-render) ============
   function chatItemSig(c) {
@@ -563,8 +627,20 @@
   async function loadChats() {
     if (!beginLoad('chats')) return;
     try {
+      if (!['connected', 'connecting', 'qr', 'pairing'].includes(state.instanceStatus)) {
+        state.chatItems = [];
+        state.lastChatListMeta = [];
+        el.chatList.innerHTML = '<div class="chat-empty-list">Instancia offline. Conecte a sessao para carregar os chats.</div>';
+        return;
+      }
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/chats`);
       if (!response.ok) {
+        if (response.status === 404 && data.error === 'instance_not_found') {
+          state.chatItems = [];
+          state.lastChatListMeta = [];
+          el.chatList.innerHTML = '<div class="chat-empty-list">Instancia offline. Conecte a sessao para carregar os chats.</div>';
+          return;
+        }
         if (state.chatItems.length === 0) {
           el.chatList.innerHTML = `<div class="chat-empty-list">${escapeHtml(data.error || 'Erro ao carregar.')}</div>`;
         }

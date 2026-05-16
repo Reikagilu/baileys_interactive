@@ -23,12 +23,21 @@ services:
       resources:
         limits:
           # Ajuste conforme o hardware disponível.
-          # 1 CPU e 1 GB RAM são valores conservadores para instâncias médias.
-          cpus: "1.0"
-          memory: 1G
+          # 2 CPUs e 2 GB RAM cobrem syncs iniciais grandes (milhares de
+          # mensagens) sem OOM. SQLite + WAL + ingest chunked aproveitam o
+          # segundo core para I/O em background enquanto o event loop
+          # principal continua livre para o WebSocket do Baileys.
+          cpus: "2.0"
+          memory: 2G
         reservations:
-          cpus: "0.25"
-          memory: 256M
+          cpus: "0.5"
+          memory: 512M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200k"
+        max-file: "1"
 
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]

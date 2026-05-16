@@ -32,56 +32,46 @@ export const INSTANCE_EVENT_NAMES = [
     'TYPEBOT_START',
 ];
 function defaultProxy() {
-    return {
-        enabled: false,
-        protocol: 'http',
-        host: '',
-        port: '',
-        username: '',
-        password: '',
-    };
+    return { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' };
 }
 function defaultGeneral() {
-    return {
-        rejectCalls: false,
-        ignoreGroups: false,
-        alwaysOnline: false,
-        autoReadMessages: false,
-        syncFullHistory: false,
-        readStatus: false,
-    };
+    return { rejectCalls: false, ignoreGroups: false, alwaysOnline: false, autoReadMessages: false, syncFullHistory: false, readStatus: false };
 }
 function defaultEvents() {
-    const toggles = Object.fromEntries(INSTANCE_EVENT_NAMES.map((eventName) => [eventName, false]));
-    return {
-        webhookUrl: '',
-        toggles,
-    };
+    const toggles = Object.fromEntries(INSTANCE_EVENT_NAMES.map((name) => [name, false]));
+    return { webhookUrl: '', toggles };
 }
-function openDatabase() {
+// ---------------------------------------------------------------------------
+// Lazy-init DB
+// ---------------------------------------------------------------------------
+let _db = null;
+function getDb() {
+    if (_db)
+        return _db;
     const resolved = path.resolve(process.cwd(), config.integrations.dbPath);
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
-    const database = new DatabaseSync(resolved);
-    database.exec('PRAGMA busy_timeout = 5000;');
+    const db = new DatabaseSync(resolved);
+    db.exec('PRAGMA busy_timeout = 5000;');
     try {
-        database.exec('PRAGMA journal_mode = WAL;');
+        db.exec('PRAGMA journal_mode = WAL;');
     }
-    catch {
-        // optional
-    }
-    return database;
+    catch { /* can be locked */ }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS instance_panel_configs (
+        instance TEXT PRIMARY KEY,
+        proxy_json TEXT NOT NULL,
+        general_json TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    _db = db;
+    return _db;
 }
-const db = openDatabase();
-db.exec(`
-  CREATE TABLE IF NOT EXISTS instance_panel_configs (
-    instance TEXT PRIMARY KEY,
-    proxy_json TEXT NOT NULL,
-    general_json TEXT NOT NULL,
-    events_json TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-  );
-`);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 function parseObject(raw, fallback) {
     if (typeof raw !== 'string')
         return fallback;
@@ -89,7 +79,13 @@ function parseObject(raw, fallback) {
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== 'object')
             return fallback;
-        return { ...fallback, ...parsed };
+        // Strict merge: só aceita campos presentes no fallback
+        const result = { ...fallback };
+        for (const key of Object.keys(fallback)) {
+            if (key in parsed)
+                result[key] = parsed[key];
+        }
+        return result;
     }
     catch {
         return fallback;
@@ -125,9 +121,10 @@ function mapRow(row) {
         updatedAt: Number(row.updated_at),
     };
 }
-function persist(configRow) {
+function persist(cfg) {
+    const db = getDb();
     const now = Date.now();
-    const existing = db.prepare('SELECT created_at FROM instance_panel_configs WHERE instance = ?').get(configRow.instance);
+    const existing = db.prepare('SELECT created_at FROM instance_panel_configs WHERE instance = ?').get(cfg.instance);
     const createdAt = existing ? Number(existing.created_at) : now;
     db.prepare(`INSERT INTO instance_panel_configs (instance, proxy_json, general_json, events_json, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?)
@@ -135,37 +132,34 @@ function persist(configRow) {
        proxy_json = excluded.proxy_json,
        general_json = excluded.general_json,
        events_json = excluded.events_json,
-       updated_at = excluded.updated_at`).run(configRow.instance, JSON.stringify(configRow.proxy), JSON.stringify(configRow.general), JSON.stringify(configRow.events), createdAt, now);
-    return {
-        ...configRow,
-        createdAt,
-        updatedAt: now,
-    };
+       updated_at = excluded.updated_at`).run(cfg.instance, JSON.stringify(cfg.proxy), JSON.stringify(cfg.general), JSON.stringify(cfg.events), createdAt, now);
+    return { ...cfg, createdAt, updatedAt: now };
 }
+// ---------------------------------------------------------------------------
+// Exports públicos
+// ---------------------------------------------------------------------------
 export function getInstancePanelConfig(instance) {
-    const key = String(instance || '').trim();
+    const db = getDb();
+    const key = String(instance ?? '').trim();
     const row = db.prepare('SELECT * FROM instance_panel_configs WHERE instance = ?').get(key);
     if (!row) {
         const now = Date.now();
-        return {
-            instance: key,
-            proxy: defaultProxy(),
-            general: defaultGeneral(),
-            events: defaultEvents(),
-            createdAt: now,
-            updatedAt: now,
-        };
+        return { instance: key, proxy: defaultProxy(), general: defaultGeneral(), events: defaultEvents(), createdAt: now, updatedAt: now };
     }
     return mapRow(row);
 }
+const ALLOWED_PROXY_PROTOCOLS = new Set(['http', 'https', 'socks4', 'socks5']);
 export function updateInstanceProxy(instance, patch) {
     const current = getInstancePanelConfig(instance);
+    const protocol = String(patch.protocol ?? current.proxy.protocol).trim().toLowerCase() || 'http';
+    if (!ALLOWED_PROXY_PROTOCOLS.has(protocol)) {
+        throw new Error(`Invalid proxy protocol: ${protocol}. Allowed: ${[...ALLOWED_PROXY_PROTOCOLS].join(', ')}`);
+    }
     return persist({
         ...current,
         proxy: {
-            ...current.proxy,
-            ...patch,
-            protocol: String(patch.protocol ?? current.proxy.protocol).trim() || 'http',
+            enabled: patch.enabled ?? current.proxy.enabled,
+            protocol,
             host: String(patch.host ?? current.proxy.host).trim(),
             port: String(patch.port ?? current.proxy.port).trim(),
             username: String(patch.username ?? current.proxy.username).trim(),
@@ -178,7 +172,6 @@ export function updateInstanceGeneral(instance, patch) {
     return persist({
         ...current,
         general: {
-            ...current.general,
             rejectCalls: patch.rejectCalls ?? current.general.rejectCalls,
             ignoreGroups: patch.ignoreGroups ?? current.general.ignoreGroups,
             alwaysOnline: patch.alwaysOnline ?? current.general.alwaysOnline,
@@ -224,12 +217,7 @@ export async function emitInstanceEvent(instance, eventName, payload, options) {
         return { ok: false, skipped: false, error: 'webhook_url_blocked' };
     }
     const targetUrl = urlValidation.normalizedUrl ?? cfg.events.webhookUrl;
-    const body = JSON.stringify({
-        event: eventName,
-        instance,
-        emittedAt: new Date().toISOString(),
-        payload,
-    });
+    const body = JSON.stringify({ event: eventName, instance, emittedAt: new Date().toISOString(), payload });
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.integrations.requestTimeoutMs);
     try {
@@ -240,24 +228,14 @@ export async function emitInstanceEvent(instance, eventName, payload, options) {
             signal: controller.signal,
         });
         if (!response.ok) {
-            return {
-                ok: false,
-                skipped: false,
-                status: response.status,
-                error: `webhook_http_${response.status}`,
-            };
+            return { ok: false, skipped: false, status: response.status, error: `webhook_http_${response.status}` };
         }
         return { ok: true, skipped: false, status: response.status };
     }
     catch (error) {
-        return {
-            ok: false,
-            skipped: false,
-            error: error instanceof Error ? error.message : String(error),
-        };
+        return { ok: false, skipped: false, error: error instanceof Error ? error.message : String(error) };
     }
     finally {
         clearTimeout(timeout);
     }
 }
-//# sourceMappingURL=instance-config.js.map

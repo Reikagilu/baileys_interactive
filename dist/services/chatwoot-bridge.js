@@ -13,11 +13,11 @@
  *   and dispatches messages to WhatsApp via sendMessage
  */
 import { getInstanceIntegrations } from './integrations.js';
-import { listChats, listUnsyncedSyncMessages, getChatTitle } from './message-store.js';
+import { listChats, listUnsyncedSyncMessages, getChatTitle, upsertChatMeta as msUpsertMeta } from './message-store.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
-import { beginMessageSync, finishMessageSync, isMessageSynced, markMessageSynced, startSyncProgress, updateSyncProgress, finishSyncProgress, beginMessageSyncWithPersistence, finishMessageSyncWithPersistence, markMessageSyncedWithPersistence, addPendingMessage, getPendingMessages, removePendingMessage, updatePendingMessageRetry, countPendingMessages, isSyncCancelled, isSyncRunning, appendSyncError, } from './chatwoot-sync-store.js';
+import { beginMessageSync, finishMessageSync, isMessageSynced, markMessageSynced, startSyncProgress, updateSyncProgress, finishSyncProgress, beginMessageSyncWithPersistence, finishMessageSyncWithPersistence, markMessageSyncedWithPersistence, addPendingMessage, getPendingMessages, removePendingMessage, updatePendingMessageRetry, countPendingMessages, prunePendingMessages, isSyncCancelled, isSyncRunning, appendSyncError, } from './chatwoot-sync-store.js';
 /**
  * Formats a raw digit string (e.g. "5511972798737") into a human-readable
  * phone number like "+55 11 97279 8737".
@@ -98,8 +98,42 @@ async function resolveGroupSubject(instanceName, groupJid) {
     // 2) Fallback: SQLite (chat_meta.title)
     const stored = getChatTitle(instanceName, groupJid);
     if (stored) {
-        groupSubjectCache.set(cacheKey, { subject: stored, expires: Date.now() + GROUP_SUBJECT_CACHE_MS });
-        return stored;
+        // Rejeitar se o título armazenado for apenas o JID ou parte dele
+        const rawJidUser = groupJid.split('@')[0];
+        if (stored !== groupJid && stored !== rawJidUser) {
+            groupSubjectCache.set(cacheKey, { subject: stored, expires: Date.now() + GROUP_SUBJECT_CACHE_MS });
+            return stored;
+        }
+    }
+    // 3) Último recurso: usar o número/ID do grupo formatado como "Grupo XXXXXXXX"
+    //    para que o sync nunca retorne null (grupos devem sempre ter nome legível).
+    const groupIdFallback = `Grupo ${groupJid.split('@')[0]}`;
+    groupSubjectCache.set(cacheKey, { subject: groupIdFallback, expires: Date.now() + 60_000 }); // TTL curto para tentar novamente depois
+    return groupIdFallback;
+}
+/**
+ * Formata um número de telefone (dígitos puros, sem +) para exibição legível.
+ * Suporta Brasil (55 + DDD + número) e formatos internacionais genéricos.
+ * Retorna null se o número não tiver formato reconhecível.
+ */
+function formatPhoneNumber(digits) {
+    if (!digits || !/^\d+$/.test(digits))
+        return null;
+    // Brasil: 55 + DDD (2 dígitos) + número (8 ou 9 dígitos) = 12 ou 13 dígitos
+    if (digits.startsWith('55') && (digits.length === 12 || digits.length === 13)) {
+        const ddd = digits.slice(2, 4);
+        const num = digits.slice(4);
+        if (num.length === 9) {
+            return `+55 (${ddd}) ${num.slice(0, 5)}-${num.slice(5)}`;
+        }
+        if (num.length === 8) {
+            return `+55 (${ddd}) ${num.slice(0, 4)}-${num.slice(4)}`;
+        }
+    }
+    // Internacional genérico: +CC XXXXXXXXXXXXXXX
+    // Tenta separar código de país (1-3 dígitos) + resto
+    if (digits.length >= 7 && digits.length <= 15) {
+        return `+${digits}`;
     }
     return null;
 }
@@ -107,35 +141,61 @@ async function resolveGroupSubject(instanceName, groupJid) {
 //   1) Baileys store (the WhatsApp address book — has the user's saved name)
 //   2) SQLite chat_meta.title (persisted pushName from previous messages)
 //   3) Provided fallback (sender.name / pushName from the message itself)
+//   4) Formatted phone number as last resort (never returns raw JID digits)
 // Names equal to the phone number / JID are considered weak and ignored
 // (so we don't end up with "+55 11 9XXXX-XXXX - 5511XXXXXXXXX").
 async function resolveContactName(instanceName, jid, fallback) {
-    const cacheKey = `${instanceName}:${jid}:${fallback ?? ''}`;
+    // Cache key uses only instanceName+jid — not the fallback — so that the
+    // resolved name is reused across messages even when pushName differs slightly.
+    const cacheKey = `${instanceName}:${jid}`;
     const cached = contactNameCache.get(cacheKey);
     if (cached && cached.expires > Date.now())
         return cached.name;
+    const isLid = jid.endsWith('@lid');
     const number = jid.split('@')[0];
-    // Helper: validate that the candidate name is meaningful
+    // Para JIDs @lid, tentar resolver para o PN real via lidMapping antes de tudo.
+    // O PN resolvido é usado como jid canônico para buscar nome no store de contatos.
+    let canonicalJid = jid;
+    let canonicalNumber = number;
+    if (isLid) {
+        try {
+            const wa = await import('./whatsapp.js');
+            const ctx = wa.getInstance(instanceName);
+            const pn = await ctx?.sock?.signalRepository?.lidMapping?.getPNForLID?.(jid);
+            if (pn) {
+                const pnUser = String(pn).split('@')[0].split(':')[0];
+                if (pnUser && /^\d+$/.test(pnUser)) {
+                    canonicalJid = `${pnUser}@s.whatsapp.net`;
+                    canonicalNumber = pnUser;
+                }
+            }
+        }
+        catch {
+            // silent — lidMapping pode não estar disponível
+        }
+    }
+    // Helper: validate that the candidate name is meaningful.
+    // Rejeita apenas JID/LID brutos — números formatados (+55 11 XXXX-XXXX) são aceitos.
     const isUsableName = (name) => {
         if (typeof name !== 'string')
             return false;
         const trimmed = name.trim();
         if (!trimmed)
             return false;
-        if (trimmed === number)
+        // Rejeita se for o JID bruto (ex: "5511999@s.whatsapp.net") ou parte dele
+        if (trimmed === jid || trimmed === canonicalJid)
             return false;
-        if (trimmed === jid)
-            return false;
-        // pure phone-like strings: digits, +, -, spaces, parens
-        if (/^[\d+\-\s()]+$/.test(trimmed))
+        if (trimmed === number || trimmed === canonicalNumber)
             return false;
         return true;
     };
     // 1) Baileys store — the actual WhatsApp address book
+    // Tenta pelo JID canônico (PN) e também pelo LID original
     try {
         const wa = await import('./whatsapp.js');
         const ctx = wa.getInstance(instanceName);
-        const contact = ctx?.sock?.store?.contacts?.[jid];
+        const contacts = ctx?.sock?.store?.contacts;
+        const contact = contacts?.[canonicalJid] ?? (canonicalJid !== jid ? contacts?.[jid] : undefined);
         if (contact) {
             // Order: saved name (verifiedName / name) > push name (notify)
             const candidate = contact.verifiedName || contact.name || contact.notify;
@@ -161,6 +221,20 @@ async function resolveContactName(instanceName, jid, fallback) {
         const resolved = fallback.trim();
         contactNameCache.set(cacheKey, { name: resolved, expires: Date.now() + CONTACT_NAME_CACHE_MS });
         return resolved;
+    }
+    // 4) Último recurso: formatar o número de telefone de forma legível (+CC DD NNNN-NNNN).
+    //    Para @lid sem PN resolvido, não há número para formatar — retorna null.
+    //    Garante que o contato no Chatwoot sempre tenha um nome humano, nunca o JID bruto.
+    const formatted = formatPhoneNumber(canonicalNumber);
+    if (formatted) {
+        contactNameCache.set(cacheKey, { name: formatted, expires: Date.now() + 60_000 }); // TTL curto
+        return formatted;
+    }
+    // Para @lid sem PN: retorna o LID formatado como +digits (evita expor o JID bruto)
+    if (isLid && canonicalNumber) {
+        const lidFormatted = `+${canonicalNumber}`;
+        contactNameCache.set(cacheKey, { name: lidFormatted, expires: Date.now() + 60_000 });
+        return lidFormatted;
     }
     contactNameCache.set(cacheKey, { name: null, expires: Date.now() + CONTACT_NAME_CACHE_MS });
     return null;
@@ -283,29 +357,54 @@ function cacheContact(cfg, contact) {
  * Uses /contacts/filter for phone, /contacts/search for groups.
  */
 async function findContactByPhone(cfg, phone) {
-    const digits = phone.replace(/\+/g, '');
+    const digits = phone.replace(/\D/g, '');
     const cached = getCachedContact(contactByPhoneCache, contactCacheKey(cfg, digits));
     if (cached)
         return cached;
-    try {
+    // Gera variantes para cobrir formatos nacionais/internacionais e com/sem 9 extra (BR).
+    const variants = new Set();
+    variants.add(`+${digits}`); // formato E.164 com +
+    variants.add(digits); // só dígitos
+    // Brasil: número com 13 dígitos (55 + DDD + 9 + 8) → tentar sem o 9 extra (12 dígitos)
+    if (digits.startsWith('55') && digits.length === 13) {
+        const without9 = digits.slice(0, 4) + digits.slice(5); // remove o 9 após DDD
+        variants.add(`+${without9}`);
+        variants.add(without9);
+    }
+    // Brasil: número com 12 dígitos → tentar com 9 extra
+    if (digits.startsWith('55') && digits.length === 12) {
+        const with9 = digits.slice(0, 4) + '9' + digits.slice(4);
+        variants.add(`+${with9}`);
+        variants.add(with9);
+    }
+    // Fetch all variants in parallel — take the first non-null result.
+    // This avoids the serial N-round-trips penalty when the contact exists
+    // under a variant that isn't first in the list (common for BR numbers).
+    const variantList = [...variants];
+    const results = await Promise.allSettled(variantList.map(async (variant) => {
         const payload = {
             payload: [
                 {
                     attribute_key: 'phone_number',
                     filter_operator: 'equal_to',
-                    values: [digits],
+                    values: [variant],
                     query_operator: null,
                 },
             ],
         };
         const res = await cwFetch(cfg, 'POST', '/contacts/filter', payload);
         const contact = res.payload?.[0] ?? null;
-        cacheContact(cfg, contact);
+        if (!contact)
+            throw new Error('not found');
         return contact;
+    }));
+    for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) {
+            cacheContact(cfg, r.value);
+            return r.value;
+        }
     }
-    catch {
-        return null;
-    }
+    return null;
 }
 async function findContactByIdentifier(cfg, identifier) {
     const cached = getCachedContact(contactByIdentifierCache, contactCacheKey(cfg, identifier));
@@ -384,25 +483,24 @@ async function updateContactName(cfg, contactId, newName) {
     }
 }
 /**
- * Considera o nome "fraco" se for vazio, igual ao número, JID ou tiver formato de telefone puro.
- * Útil para detectar contatos que precisam ter nome atualizado quando descobrimos o pushName real.
+ * Considera o nome "fraco" se for vazio, igual ao JID bruto ou ao user do JID (LID/PN sem @domínio).
+ * Número formatado (+55 11 XXXX-XXXX) NÃO é considerado fraco — é um fallback válido.
+ * Útil para detectar contatos que devem ter nome atualizado quando descobrimos o nome real.
  */
-function isWeakName(name, phoneNumber, jid) {
+function isWeakName(name, _phoneNumber, jid) {
     if (!name)
         return true;
     const trimmed = name.trim();
     if (!trimmed)
         return true;
-    if (trimmed === phoneNumber)
-        return true;
-    if (trimmed === `+${phoneNumber}`)
-        return true;
+    // Rejeita JID bruto ou a parte user do JID (ex: "5511999@s.whatsapp.net" ou "5511999")
     if (trimmed === jid)
         return true;
     if (trimmed === jid.split('@')[0])
         return true;
-    // Apenas dígitos, +, traços e espaços = nome fraco (telefone)
-    if (/^[\d+\-\s()]+$/.test(trimmed))
+    // Rejeita números formatados (+55 (11) XXXXX-XXXX, +digits) — são apenas fallback,
+    // qualquer nome com letras tem prioridade sobre número formatado.
+    if (/^[\d\s\+\(\)\-\.]+$/.test(trimmed))
         return true;
     return false;
 }
@@ -558,18 +656,22 @@ async function conversationAlreadyHasSourceId(cfg, conversationId, sourceId) {
     const cachedUntil = conversationMessageSourceHitCache.get(key);
     if (cachedUntil && cachedUntil > Date.now())
         return true;
+    // Cache negativo: se já fizemos scan desta conversa recentemente e não encontramos
+    // o sourceId, evitamos repetir o scan paginado nos próximos 30s.
+    const scanKey = `${cfg.baseUrl}|${cfg.accountId}|${conversationId}|__scanned__`;
+    const scanCachedUntil = conversationMessageSourceHitCache.get(scanKey);
+    if (scanCachedUntil && scanCachedUntil > Date.now())
+        return false;
     const pending = conversationMessageSourceInFlight.get(key);
     if (pending)
         return pending;
     const request = (async () => {
-        // Hard deadline: 60 s total across all page fetches to prevent blocking the event loop.
-        const deadline = Date.now() + 60_000;
+        // Hard limit: check at most 10 pages (≈200 messages) to avoid blocking for long periods.
+        // Trusting the isMessageSynced() SQLite check as primary deduplication; this is a
+        // secondary safety check for messages that may have arrived via other bridges.
+        const MAX_PAGES = 10;
         try {
-            for (let page = 1; page <= 100; page++) {
-                if (Date.now() > deadline) {
-                    log.chatwoot.warn(`conversationAlreadyHasSourceId timeout  conversationId=${conversationId}`);
-                    break;
-                }
+            for (let page = 1; page <= MAX_PAGES; page++) {
                 const data = await cwFetch(cfg, 'GET', `/conversations/${conversationId}/messages?page=${page}`);
                 const messages = extractConversationMessages(data);
                 if (messages.some((message) => String(message?.source_id ?? '').trim() === sourceId)) {
@@ -582,6 +684,8 @@ async function conversationAlreadyHasSourceId(cfg, conversationId, sourceId) {
                 if (messages.length === 0)
                     break;
             }
+            // Cache negativo: evita repetir o scan paginado nos próximos 30s para esta conversa.
+            conversationMessageSourceHitCache.set(scanKey, Date.now() + 30_000);
             return false;
         }
         finally {
@@ -608,9 +712,9 @@ opts) {
             const existing = convList.payload?.filter((c) => c.inbox_id === inboxId) ?? [];
             let conv;
             if (opts.reopenConversation) {
-                // Sort descending by id to ensure we pick the most recent conversation,
-                // since the Chatwoot API does not guarantee a specific order.
-                conv = existing.sort((a, b) => b.id - a.id)[0];
+                // Pick the conversation with the highest id (most recent) without
+                // allocating a new sorted array — O(n) reduce instead of O(n log n) sort.
+                conv = existing.reduce((max, c) => (c.id > max.id ? c : max));
             }
             else {
                 conv = existing.find((c) => c.status !== 'resolved');
@@ -762,9 +866,10 @@ async function loadHydratedChatMessages(instanceName, jid, onlyIds) {
  * Dispatches each message to Chatwoot if integration is enabled.
  */
 export async function dispatchToChatwoot(instanceName, messages) {
+    // getInstanceIntegrations is synchronous (SQLite read) — no await needed.
     let cfg;
     try {
-        const integrations = await getInstanceIntegrations(instanceName);
+        const integrations = getInstanceIntegrations(instanceName);
         cfg = integrations.chatwoot;
     }
     catch {
@@ -785,35 +890,56 @@ export async function dispatchToChatwoot(instanceName, messages) {
         log.chatwoot.child(instanceName).warn(`Inbox "${cfg.nameInbox}" não encontrada no Chatwoot — verifique a configuração inboxId/nameInbox`);
         return;
     }
+    // Group messages by remoteJid so that:
+    //  • Different contacts are dispatched in parallel (up to CONCURRENCY groups at once)
+    //  • Messages within the same chat stay serialized to preserve order + avoid
+    //    duplicate conversation creation races.
+    const CONCURRENCY = 5;
+    const byJid = new Map();
     for (const msg of messages) {
-        const msgId = msg.key?.id;
-        // Usa versão com persistência para survives crash
-        if (!msgId || !beginMessageSyncWithPersistence(instanceName, msgId)) {
-            continue;
-        }
-        try {
-            const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
-            if (msgId && !result.skipped && result.conversationId) {
-                try {
-                    // Usa versão que também remove do in-flight no SQLite
-                    markMessageSyncedWithPersistence(instanceName, msgId, result.conversationId);
-                }
-                catch (dbErr) {
-                    log.chatwoot.child(instanceName).error(`markMessageSynced falhou para msgId=${msgId}`, dbErr);
+        const jid = String(msg.key?.remoteJid ?? '').trim() || '__unknown__';
+        const group = byJid.get(jid);
+        if (group)
+            group.push(msg);
+        else
+            byJid.set(jid, [msg]);
+    }
+    async function dispatchJidGroup(jidMessages) {
+        for (const msg of jidMessages) {
+            const msgId = msg.key?.id;
+            if (!msgId || !beginMessageSyncWithPersistence(instanceName, msgId))
+                continue;
+            try {
+                const result = await dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, { skipPersistedDedupCheck: true });
+                if (!result.skipped && result.conversationId) {
+                    try {
+                        markMessageSyncedWithPersistence(instanceName, msgId, result.conversationId);
+                    }
+                    catch (dbErr) {
+                        log.chatwoot.child(instanceName).error(`markMessageSynced falhou para msgId=${msgId}`, dbErr);
+                    }
                 }
             }
-        }
-        catch (err) {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            log.chatwoot.child(instanceName).error(`dispatch error para msgId=${msg.key?.id} — adicionando à fila de retry`, err);
-            // Adiciona à fila de retry para processamento posterior
-            addPendingMessage(instanceName, msgId, JSON.stringify(msg), errorMsg);
-        }
-        finally {
-            // Usa versão que também remove do in-flight no SQLite
-            finishMessageSyncWithPersistence(instanceName, msgId);
+            catch (err) {
+                const errorMsg = err instanceof Error ? err.message : String(err);
+                log.chatwoot.child(instanceName).error(`dispatch error para msgId=${msg.key?.id} — adicionando à fila de retry`, err);
+                addPendingMessage(instanceName, msgId, JSON.stringify(msg), errorMsg);
+            }
+            finally {
+                finishMessageSyncWithPersistence(instanceName, msgId);
+            }
         }
     }
+    // Process groups with bounded concurrency using a queue-based semaphore.
+    const groups = [...byJid.values()];
+    const queue = [...groups];
+    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+        let group;
+        while ((group = queue.shift())) {
+            await dispatchJidGroup(group);
+        }
+    });
+    await Promise.allSettled(workers);
 }
 /**
  * Extract the best text content from a normalized message.
@@ -897,6 +1023,12 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     // so the check was never true and they would reach Chatwoot causing HTTP 422 loops.
     if (msgType === 'unknown' && !hasContent)
         return { skipped: true };
+    // Em sync-history, mídias antigas com falha de decriptação só geram ruído.
+    // Para mensagens novas, deixamos seguir para que o Chatwoot receba ao menos
+    // o placeholder legível em vez de a mensagem sumir completamente.
+    if (options.isHistorical && msg.media?.omittedReason === 'decryption_failed' && !msg.media?.base64) {
+        return { skipped: true };
+    }
     // ── Contact resolution ──
     // For groups: contact is the SENDER (participant), conversation is the GROUP
     // For individuals: contact is the remote JID (or own number for outgoing)
@@ -921,30 +1053,46 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         conversationJid = remoteJid;
         contactJid = remoteJid;
         phoneNumber = ''; // groups have no phone number
-        // Resolver o nome REAL do grupo (subject) via socket Baileys ou chat_meta
+        // Identify participant (sender) upfront so we can decide whether to parallelize.
+        const participant = isFromMe
+            ? '' // own messages in groups: no sender prefix needed (shown as outgoing)
+            : (key.participant ?? '');
+        // Resolver nome do grupo e do remetente em paralelo quando ambos são necessários.
         let groupSubject = null;
         if (useRealNames) {
-            groupSubject = await resolveGroupSubject(instanceName, remoteJid);
+            if (participant) {
+                // Ambas as resoluções são independentes — paralelize para reduzir latência.
+                const [resolvedSubject, resolvedParticipantName] = await Promise.all([
+                    resolveGroupSubject(instanceName, remoteJid),
+                    resolveContactName(instanceName, participant, sender?.name || pushName),
+                ]);
+                groupSubject = resolvedSubject;
+                // pushName em mensagens de grupo é o nome do REMETENTE, NÃO do grupo — ignorar para o título.
+                contactName = groupSubject || remoteJid.split('@')[0];
+                // Identify the actual sender for message prefix
+                {
+                    const participantNumber = participant.split('@')[0];
+                    const formattedPhone = formatPhoneDisplay(participantNumber);
+                    // Nomes "fracos" (igual ao número/JID) são filtrados por resolveContactName.
+                    senderLabel = resolvedParticipantName
+                        ? `${formattedPhone} - ${resolvedParticipantName}`
+                        : formattedPhone;
+                }
+            }
+            else {
+                // Própria mensagem ou sem participante: só precisa do subject do grupo.
+                groupSubject = await resolveGroupSubject(instanceName, remoteJid);
+                // pushName em mensagens de grupo é o nome do REMETENTE, NÃO do grupo — ignorar para o título.
+                contactName = groupSubject || remoteJid.split('@')[0];
+            }
         }
-        // pushName em mensagens de grupo é o nome do REMETENTE, NÃO do grupo — ignorar para o título.
-        contactName = groupSubject || remoteJid.split('@')[0];
-        // Identify the actual sender for message prefix (sempre, mesmo se importContacts=false — é só prefixo)
-        {
-            const participant = isFromMe
-                ? '' // own messages in groups: no sender prefix needed (shown as outgoing)
-                : (key.participant ?? '');
+        else {
+            // importContacts=false: usar somente o ID do grupo.
+            contactName = remoteJid.split('@')[0];
+            // Identify the actual sender for message prefix (sempre — é só prefixo)
             if (participant) {
                 const participantNumber = participant.split('@')[0];
-                const formattedPhone = formatPhoneDisplay(participantNumber);
-                // Resolve nome real do contato pelo Baileys store > SQLite > pushName atual.
-                // Nomes "fracos" (igual ao número/JID) são filtrados por resolveContactName.
-                const participantName = useRealNames
-                    ? await resolveContactName(instanceName, participant, sender?.name || pushName)
-                    : null;
-                // Format: "+55 11 97279 8737 - Nome" or just the formatted number
-                senderLabel = participantName
-                    ? `${formattedPhone} - ${participantName}`
-                    : formattedPhone;
+                senderLabel = formatPhoneDisplay(participantNumber);
             }
         }
     }
@@ -954,9 +1102,18 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
         contactJid = remoteJid;
         phoneNumber = remoteJid.split('@')[0];
         if (useRealNames) {
-            // Prioridade: chat_meta.title (pushName persistido em mensagens anteriores) > sender.name > pushName atual > número
+            // Nome forte (com letras) vindo da mensagem: pushName ou sender.name — prioridade máxima
+            const incomingName = (!isFromMe && (sender?.name || pushName)) || undefined;
             const storedTitle = getChatTitle(instanceName, remoteJid);
-            contactName = storedTitle || sender?.name || pushName || phoneNumber;
+            if (incomingName && /[a-zA-ZÀ-ÿ]/.test(incomingName)) {
+                // pushName ou sender.name tem letras: persistir no chat_meta e usar como nome
+                msUpsertMeta(instanceName, remoteJid, { title: incomingName });
+                contactName = incomingName;
+            }
+            else {
+                // Sem nome forte vindo da mensagem: usar o que já está salvo (pode ser nome real ou número)
+                contactName = storedTitle || incomingName || phoneNumber;
+            }
         }
         else {
             // importContacts=false: usar somente número
@@ -1034,14 +1191,17 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     }
     // Sign outgoing messages with agent name if enabled
     if (cfg.signMessages && isFromMe) {
-        const delimiter = cfg.signDelimiter ?? '\n';
+        // Normaliza escape sequences do delimiter (ex.: '\\n' → '\n')
+        const rawDelimiter = cfg.signDelimiter ?? '\n';
+        const delimiter = rawDelimiter.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
         const agentName = cfg.nameInbox || instanceName;
+        const label = `*${agentName}:*`;
         if (content) {
-            content = `*${agentName}*${delimiter}${content}`;
+            content = `${label}${delimiter}${content}`;
         }
         else if (attachments && attachments.length > 0) {
             // sign even when only attachment is present
-            content = `*${agentName}*`;
+            content = label;
         }
     }
     const messageType = isFromMe ? 'outgoing' : 'incoming';
@@ -1204,6 +1364,31 @@ function buildAgentNameFromPayload(payload) {
     ].map(normalizeAgentDisplayName).find(Boolean);
     return fallback;
 }
+// Module-level constants — allocated once, not per call.
+const FILE_EXT_TO_MIME = {
+    mp3: 'audio/mpeg', ogg: 'audio/ogg; codecs=opus', oga: 'audio/ogg; codecs=opus', opus: 'audio/ogg; codecs=opus',
+    m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', flac: 'audio/flac',
+    mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
+    mkv: 'video/x-matroska', webm: 'video/webm',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+    pdf: 'application/pdf', doc: 'application/msword',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ppt: 'application/vnd.ms-powerpoint',
+    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    zip: 'application/zip', rar: 'application/x-rar-compressed',
+    txt: 'text/plain', csv: 'text/csv',
+};
+const CHATWOOT_CATEGORY_TO_MIME = {
+    audio: 'audio/mpeg',
+    video: 'video/mp4',
+    image: 'image/jpeg',
+    sticker: 'image/webp',
+    document: 'application/octet-stream',
+    file: 'application/octet-stream',
+};
 /**
  * Chatwoot's attachment `file_type` field can be a bare category name
  * ("audio", "video", "image", "document", "sticker") rather than a full
@@ -1212,45 +1397,32 @@ function buildAgentNameFromPayload(payload) {
  * If the value already looks like a MIME type (contains '/') it is returned
  * as-is.
  */
-function normalizeChatwootFileType(fileType, fileName) {
+function normalizeChatwootFileType(fileType, fileName, mediaUrl) {
     const ft = fileType.trim().toLowerCase();
     if (!ft)
         return undefined;
     // Already a full MIME type.
     if (ft.includes('/'))
         return ft;
-    // Try to infer from fileName extension first.
-    if (fileName) {
-        const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
-        const extMap = {
-            mp3: 'audio/mpeg', ogg: 'audio/ogg; codecs=opus', oga: 'audio/ogg; codecs=opus', opus: 'audio/ogg; codecs=opus',
-            m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', flac: 'audio/flac',
-            mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
-            mkv: 'video/x-matroska', webm: 'video/webm',
-            jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
-            webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
-            pdf: 'application/pdf', doc: 'application/msword',
-            docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            xls: 'application/vnd.ms-excel',
-            xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            ppt: 'application/vnd.ms-powerpoint',
-            pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            zip: 'application/zip', rar: 'application/x-rar-compressed',
-            txt: 'text/plain', csv: 'text/csv',
-        };
-        if (extMap[ext])
-            return extMap[ext];
-    }
-    // Map bare Chatwoot category → default MIME.
-    const categoryMap = {
-        audio: 'audio/ogg; codecs=opus', // WhatsApp voice notes are ogg/opus by default
-        video: 'video/mp4',
-        image: 'image/jpeg',
-        sticker: 'image/webp',
-        document: 'application/octet-stream',
-        file: 'application/octet-stream',
+    // Try to infer from fileName or URL extension first.
+    const inferExt = () => {
+        const fromFileName = fileName?.split('.').pop()?.toLowerCase() ?? '';
+        if (fromFileName)
+            return fromFileName;
+        if (!mediaUrl)
+            return '';
+        try {
+            const pathname = new URL(mediaUrl).pathname;
+            return pathname.split('.').pop()?.toLowerCase() ?? '';
+        }
+        catch {
+            return mediaUrl.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase() ?? '';
+        }
     };
-    return categoryMap[ft] ?? 'application/octet-stream';
+    const ext = inferExt();
+    if (ext && FILE_EXT_TO_MIME[ext])
+        return FILE_EXT_TO_MIME[ext];
+    return CHATWOOT_CATEGORY_TO_MIME[ft] ?? 'application/octet-stream';
 }
 /**
  * Process a Chatwoot webhook event.
@@ -1314,7 +1486,7 @@ export function parseChatwootWebhook(payload) {
         .map(({ attachment, mediaUrl }) => {
         const fileName = typeof attachment.file_name === 'string' ? attachment.file_name : undefined;
         const rawType = typeof attachment.file_type === 'string' ? attachment.file_type : '';
-        const mimeType = normalizeChatwootFileType(rawType, fileName);
+        const mimeType = normalizeChatwootFileType(rawType, fileName, mediaUrl);
         return { mediaUrl: mediaUrl, mimeType, fileName };
     });
     if (attachments.length > 0) {
@@ -1360,22 +1532,47 @@ export async function syncContactNamesToChatwoot(instanceName) {
             }
             seenJids.add(jid);
             const isGroup = jid.endsWith('@g.us');
-            const phoneNumber = jid.split('@')[0];
+            const isLidJid = jid.endsWith('@lid');
+            const rawNumber = jid.split('@')[0];
+            // Para @lid, tentar resolver PN canônico via lidMapping
+            let canonicalJid = jid;
+            let phoneNumber = rawNumber;
+            if (isLidJid) {
+                try {
+                    const wa = await import('./whatsapp.js');
+                    const ctx = wa.getInstance(instanceName);
+                    const pn = await ctx?.sock?.signalRepository?.lidMapping?.getPNForLID?.(jid);
+                    if (pn) {
+                        const pnUser = String(pn).split('@')[0].split(':')[0];
+                        if (pnUser && /^\d+$/.test(pnUser)) {
+                            canonicalJid = `${pnUser}@s.whatsapp.net`;
+                            phoneNumber = pnUser;
+                            // Dedupe: se já processamos o PN canônico, pular o LID
+                            if (seenJids.has(canonicalJid)) {
+                                skipped += 1;
+                                continue;
+                            }
+                            seenJids.add(canonicalJid);
+                        }
+                    }
+                }
+                catch { /* silent */ }
+            }
             const desiredName = isGroup
                 ? await resolveGroupSubject(instanceName, jid)
                 : await resolveContactName(instanceName, jid, chat.title || null);
-            if (!desiredName || isWeakName(desiredName, phoneNumber, jid)) {
+            // Pular apenas se não houver nome nenhum — número formatado já é válido.
+            // Nunca expor JID ou LID bruto.
+            if (!desiredName) {
                 skipped += 1;
                 continue;
             }
             try {
-                const contact = await findContactByIdentifier(cfg, jid)
-                    || (!isGroup ? await findContactByPhone(cfg, `+${phoneNumber}`) : null);
+                // Buscar por JID canônico (PN) e LID — o Chatwoot pode ter criado com qualquer um
+                const contact = await findContactByIdentifier(cfg, canonicalJid)
+                    ?? (canonicalJid !== jid ? await findContactByIdentifier(cfg, jid) : null)
+                    ?? (!isGroup ? await findContactByPhone(cfg, `+${phoneNumber}`) : null);
                 if (!contact) {
-                    skipped += 1;
-                    continue;
-                }
-                if ((contact.name || '').trim() === desiredName.trim()) {
                     skipped += 1;
                     continue;
                 }
@@ -1538,9 +1735,10 @@ export async function syncHistoryToChatwoot(instanceName, jid, limitPerChat = 20
     if (isSyncRunning(instanceName)) {
         return { ok: false, synced: 0, errors: 0, error: 'A sync is already running for this instance' };
     }
+    // getInstanceIntegrations is synchronous — no await needed.
     let cfg;
     try {
-        const integrations = await getInstanceIntegrations(instanceName);
+        const integrations = getInstanceIntegrations(instanceName);
         cfg = integrations.chatwoot;
     }
     catch (e) {
@@ -1809,11 +2007,21 @@ async function processRetryBatch() {
     log.chatwoot.info(`Retry batch: ${pending.length} mensagens pendentes`);
     for (const item of pending) {
         const { id, instance, msgId, payload, attempt, lastError } = item;
-        const msg = JSON.parse(payload);
-        // Get instance config
+        // Payload corrompido (truncado por crash, etc.) bloqueia todo o batch indefinidamente
+        // sem este try/catch, pois o loop for seria abortado e o item jamais removido.
+        let msg;
+        try {
+            msg = JSON.parse(payload);
+        }
+        catch {
+            log.chatwoot.error(`Retry: payload corrompido para msgId=${msgId} instance=${instance} — removendo da fila`);
+            removePendingMessage(id);
+            continue;
+        }
+        // Get instance config (synchronous — no await needed).
         let cfg;
         try {
-            const integrations = await getInstanceIntegrations(instance);
+            const integrations = getInstanceIntegrations(instance);
             cfg = integrations.chatwoot;
         }
         catch {
@@ -1858,8 +2066,25 @@ function startRetryWorker() {
         return;
     _retryWorkerRunning = true;
     log.chatwoot.info(`Worker de retry iniciado (interval=${RETRY_INTERVAL_MS}ms)`);
+    // Força inicialização do DB para que countPendingMessages funcione corretamente
+    // mesmo que nenhuma mensagem tenha chegado desde o restart (quando _db ainda é null).
+    try {
+        countPendingMessages();
+    }
+    catch { /* ignore */ }
+    let _retryTick = 0;
     setInterval(async () => {
         try {
+            _retryTick++;
+            // A cada 100 ticks (~1000s) prune mensagens expiradas da fila para evitar
+            // retry infinito de mensagens mortas (sem this, entradas com attempt>10
+            // são filtradas por getPendingMessages mas ficam consumindo espaço no DB).
+            if (_retryTick % 100 === 0) {
+                try {
+                    prunePendingMessages();
+                }
+                catch { /* ignore */ }
+            }
             const pendingCount = countPendingMessages();
             if (pendingCount > 0) {
                 log.chatwoot.debug(`Verificando ${pendingCount} mensagens pendentes`);
@@ -1873,4 +2098,3 @@ function startRetryWorker() {
 }
 // Inicia o worker de retry imediatamente
 startRetryWorker();
-//# sourceMappingURL=chatwoot-bridge.js.map

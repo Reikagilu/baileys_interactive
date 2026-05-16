@@ -120,14 +120,50 @@ function parseJson<T extends object>(value: unknown, fallback: T): T {
   }
 }
 
-function toRow(row: Record<string, unknown>): InstanceIntegrations {
+/**
+ * Converte uma row do DB em InstanceIntegrations.
+ * @param redactSecrets Quando true (padrão: false), mascara apiAccessToken e
+ *   authHeaderValue para evitar vazamento em listagens/reads pela API pública.
+ *   Use false apenas internamente (quando o token é necessário para chamar Chatwoot/n8n).
+ */
+function toRow(row: Record<string, unknown>, redactSecrets = false): InstanceIntegrations {
+  const chatwoot = parseJson<ChatwootConfig>(row.chatwoot_json, defaultChatwoot());
+  const n8n = parseJson<N8nConfig>(row.n8n_json, defaultN8n());
+  if (redactSecrets) {
+    chatwoot.apiAccessToken = chatwoot.apiAccessToken ? '***' : '';
+    n8n.authHeaderValue = n8n.authHeaderValue ? '***' : '';
+  }
   return {
     instance: String(row.instance),
-    chatwoot: parseJson<ChatwootConfig>(row.chatwoot_json, defaultChatwoot()),
-    n8n: parseJson<N8nConfig>(row.n8n_json, defaultN8n()),
+    chatwoot,
+    n8n,
     createdAt: Number(row.created_at ?? Date.now()),
     updatedAt: Number(row.updated_at ?? Date.now()),
   };
+}
+
+/**
+ * Mascara tokens sensíveis de um objeto InstanceIntegrations já parsed.
+ * Use quando o objeto foi obtido via getInstanceIntegrations() e precisa
+ * ser serializado para resposta de API.
+ */
+export function redactIntegrations(integration: InstanceIntegrations): InstanceIntegrations {
+  return {
+    ...integration,
+    chatwoot: {
+      ...integration.chatwoot,
+      apiAccessToken: integration.chatwoot.apiAccessToken ? '***' : '',
+    },
+    n8n: {
+      ...integration.n8n,
+      authHeaderValue: integration.n8n.authHeaderValue ? '***' : '',
+    },
+  };
+}
+
+/** Versão pública (mascara tokens sensíveis). */
+export function toPublicRow(row: Record<string, unknown>): InstanceIntegrations {
+  return toRow(row, true);
 }
 
 export function getInstanceIntegrations(instance: string): InstanceIntegrations {
@@ -152,8 +188,10 @@ export function getInstanceIntegrations(instance: string): InstanceIntegrations 
 
 // Cache for slug→instance lookups. Invalidated on every config update.
 // TTL of 60s as safety net in case invalidation is missed.
+// MAX_SLUG_CACHE_SIZE caps memory usage against slug-spray attacks.
 const _slugCache = new Map<string, { instance: string | null; exp: number }>();
 const SLUG_CACHE_TTL_MS = 60_000;
+const MAX_SLUG_CACHE_SIZE = 2000;
 
 export function invalidateSlugCache(): void {
   _slugCache.clear();
@@ -168,7 +206,10 @@ export function findInstanceByWebhookSlug(slug: string): string | null {
   if (!normalized) return null;
 
   const cached = _slugCache.get(normalized);
-  if (cached && cached.exp > Date.now()) return cached.instance;
+  if (cached) {
+    if (cached.exp > Date.now()) return cached.instance;
+    _slugCache.delete(normalized); // expired
+  }
 
   const rows = db
     .prepare('SELECT instance, chatwoot_json FROM integration_configs')
@@ -183,13 +224,19 @@ export function findInstanceByWebhookSlug(slug: string): string | null {
       break;
     }
   }
+
+  // Evict oldest entries when cache is full to bound memory usage.
+  if (_slugCache.size >= MAX_SLUG_CACHE_SIZE) {
+    const firstKey = _slugCache.keys().next().value;
+    if (firstKey !== undefined) _slugCache.delete(firstKey);
+  }
   _slugCache.set(normalized, { instance: found, exp: Date.now() + SLUG_CACHE_TTL_MS });
   return found;
 }
 
-export function listIntegrationInstances(): InstanceIntegrations[] {
+export function listIntegrationInstances(redactSecrets = true): InstanceIntegrations[] {
   const rows = db.prepare('SELECT * FROM integration_configs ORDER BY updated_at DESC').all() as Array<Record<string, unknown>>;
-  return rows.map(toRow);
+  return rows.map((r) => toRow(r, redactSecrets));
 }
 
 function saveInstanceIntegrations(next: InstanceIntegrations): InstanceIntegrations {
@@ -219,14 +266,29 @@ function saveInstanceIntegrations(next: InstanceIntegrations): InstanceIntegrati
   };
 }
 
+/**
+ * Remove keys whose value is `undefined` to make patches truly partial.
+ * Sem isso, o spread `{...current, ...patch}` mant\u00e9m chaves com `undefined`,
+ * que `JSON.stringify` em seguida omite, apagando dados existentes no banco.
+ */
+function pruneUndefined<T extends object>(patch: Partial<T>): Partial<T> {
+  const out: Partial<T> = {};
+  for (const key of Object.keys(patch) as Array<keyof T>) {
+    const value = patch[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
 export function updateChatwootConfig(instance: string, patch: Partial<ChatwootConfig>): InstanceIntegrations {
   const current = getInstanceIntegrations(instance);
+  const cleanPatch = pruneUndefined(patch);
   const next: InstanceIntegrations = {
     ...current,
     chatwoot: {
       ...current.chatwoot,
-      ...patch,
-      baseUrl: normalizeBaseUrl(patch.baseUrl ?? current.chatwoot.baseUrl),
+      ...cleanPatch,
+      baseUrl: normalizeBaseUrl(cleanPatch.baseUrl ?? current.chatwoot.baseUrl),
     },
   };
   return saveInstanceIntegrations(next);
@@ -234,11 +296,12 @@ export function updateChatwootConfig(instance: string, patch: Partial<ChatwootCo
 
 export function updateN8nConfig(instance: string, patch: Partial<N8nConfig>): InstanceIntegrations {
   const current = getInstanceIntegrations(instance);
+  const cleanPatch = pruneUndefined(patch);
   const next: InstanceIntegrations = {
     ...current,
     n8n: {
       ...current.n8n,
-      ...patch,
+      ...cleanPatch,
     },
   };
   return saveInstanceIntegrations(next);

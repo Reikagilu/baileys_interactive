@@ -7,6 +7,7 @@ import { validateOutboundUrl } from '../utils/url-security.js';
 import {
   getInstanceIntegrations,
   listIntegrationInstances,
+  redactIntegrations,
   testChatwoot,
   testN8n,
   updateChatwootConfig,
@@ -25,7 +26,9 @@ const HEADER_NAME_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 
 function isOptionalNumericId(value: unknown): boolean {
   if (value === undefined) return true;
-  return NUMERIC_ID_PATTERN.test(String(value).trim());
+  const s = String(value).trim();
+  if (s === '') return true; // string vazia = limpar o campo (aceita)
+  return NUMERIC_ID_PATTERN.test(s);
 }
 
 function isOptionalMaxLength(value: unknown, max: number): boolean {
@@ -35,8 +38,11 @@ function isOptionalMaxLength(value: unknown, max: number): boolean {
 
 function buildWebhookPayload(instance: string, integration = getInstanceIntegrations(instance)) {
   const slug = integration.chatwoot.webhookSlug?.trim() || instance;
+  // Mascara tokens sensíveis antes de retornar ao cliente. getInstanceIntegrations
+  // retorna os tokens em texto claro (necessário para uso interno). redactIntegrations
+  // substitui apiAccessToken e authHeaderValue por '***'.
   return {
-    integration,
+    integration: redactIntegrations(integration),
     chatwootWebhookUrl: buildChatwootWebhookUrl(slug),
   };
 }

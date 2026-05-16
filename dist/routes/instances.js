@@ -2,7 +2,7 @@ import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import { createInstance, getInstance, getAllInstances, getInstanceChatList, getInstanceChatMediaBinary, getInstanceChatMessagesWithMedia, markInstanceChatAsRead, normalizePairingPhoneNumber, removeInstance, requestInstancePairingCode, disconnectInstance, logoutInstance, applyInstanceRuntimeSettings, applyReadSettingsToCachedMessages, syncInstanceChatHistory, } from '../services/whatsapp.js';
+import { createInstance, getInstance, getAllInstances, getInstanceChatList, getInstanceChatMediaBinary, getInstanceChatMessagesWithMedia, markInstanceChatAsRead, normalizePairingPhoneNumber, removeInstance, requestInstancePairingCode, disconnectInstance, logoutInstance, applyInstanceRuntimeSettings, applyReadSettingsToCachedMessages, syncInstanceChatHistory, repairInstanceSessions, } from '../services/whatsapp.js';
 import { config } from '../config.js';
 import { writeAuditEvent } from '../services/audit-log.js';
 import { INSTANCE_EVENT_NAMES, emitInstanceEvent, getInstancePanelConfig, updateInstanceEvents, updateInstanceGeneral, updateInstanceProxy, } from '../services/instance-config.js';
@@ -10,17 +10,38 @@ import { isValidInstanceName, normalizeInstanceName } from '../utils/helpers.js'
 import { sendError, sendOk } from '../utils/api-response.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
 const router = Router();
+// Mutex para prevenir race condition em criação simultânea da mesma instância.
+// Set de nomes de instâncias atualmente em processo de criação/pairing.
+const _creatingInstances = new Set();
 function listSavedInstances() {
     const authDir = path.resolve(process.cwd(), config.authFolder);
     try {
         if (!fs.existsSync(authDir))
             return [];
-        return fs.readdirSync(authDir, { withFileTypes: true })
+        return fs
+            .readdirSync(authDir, { withFileTypes: true })
             .filter((entry) => entry.isDirectory() && isValidInstanceName(entry.name))
             .map((entry) => entry.name.trim());
     }
     catch {
         return [];
+    }
+}
+function hasIncompleteSavedPairingAuth(name) {
+    const authPath = path.resolve(process.cwd(), config.authFolder, name, 'creds.json');
+    try {
+        if (!fs.existsSync(authPath))
+            return false;
+        const creds = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+        const registered = creds?.registered === true;
+        const hasPersistedIdentity = Boolean(String(creds?.me?.id ?? '').trim() ||
+            String(creds?.me?.lid ?? '').trim());
+        const hasCompletedPairingState = Boolean(creds?.account) ||
+            (Array.isArray(creds?.signalIdentities) && creds.signalIdentities.length > 0);
+        return !registered && hasPersistedIdentity && !hasCompletedPairingState;
+    }
+    catch {
+        return false;
     }
 }
 router.param('name', (req, res, next, rawName) => {
@@ -42,8 +63,24 @@ router.post('/', async (req, res) => {
         if (!name) {
             return sendError(res, 400, 'invalid_instance_name');
         }
-        const result = await createInstance(name, config.authFolder);
+        // Mutex: previne duas criações simultâneas da mesma instância.
+        if (_creatingInstances.has(name)) {
+            return sendError(res, 409, 'instance_creation_in_progress', 'A criação desta instância já está em andamento.', {
+                instance: name,
+            });
+        }
+        _creatingInstances.add(name);
+        let result;
+        try {
+            result = await createInstance(name, config.authFolder);
+        }
+        finally {
+            _creatingInstances.delete(name);
+        }
         if (!result.ok) {
+            if (result.error === 'auth_corrupt_requires_manual_repair') {
+                return sendError(res, 409, result.error, 'A autenticacao salva desta instancia esta corrompida e precisa de reparo manual antes de conectar novamente.', { instance: name });
+            }
             return sendError(res, 500, 'instance_create_failed', result.error);
         }
         let qrBase64;
@@ -115,7 +152,7 @@ router.post('/:name/pairing-code', async (req, res) => {
     }
     const { name } = req.params;
     const body = (req.body ?? {});
-    const rawPhone = String(body.phoneNumber ?? body.number ?? '').trim();
+    const rawPhone = String((body.phoneNumber ?? body.number) ?? '').trim();
     if (!rawPhone) {
         return sendError(res, 400, 'phone_number_required');
     }
@@ -123,96 +160,130 @@ router.post('/:name/pairing-code', async (req, res) => {
     if (!phoneNumber) {
         return sendError(res, 400, 'invalid_phone_number');
     }
-    let ctx = getInstance(name);
-    let justCreatedOrReset = false;
-    if (!ctx) {
-        const created = await createInstance(name, config.authFolder);
-        if (!created.ok) {
-            return sendError(res, 500, 'instance_create_failed', created.error, { instance: name });
-        }
-        ctx = getInstance(name);
-        justCreatedOrReset = true;
-    }
-    if (!ctx) {
-        return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
-    }
-    if (ctx.status !== 'connected' && !justCreatedOrReset && config.pairing.forceFreshSession) {
-        await logoutInstance(name, config.authFolder);
-        const recreatedFresh = await createInstance(name, config.authFolder);
-        if (!recreatedFresh.ok) {
-            return sendError(res, 500, 'instance_recreate_failed', recreatedFresh.error, { instance: name });
-        }
-        ctx = getInstance(name);
-        justCreatedOrReset = true;
-        if (!ctx) {
-            return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
-        }
-    }
-    if (ctx.status === 'qr' || ctx.status === 'disconnected') {
-        disconnectInstance(name);
-        const recreated = await createInstance(name, config.authFolder);
-        if (!recreated.ok) {
-            return sendError(res, 500, 'instance_recreate_failed', recreated.error, { instance: name });
-        }
-        ctx = getInstance(name);
-        justCreatedOrReset = true;
-        if (!ctx) {
-            return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
-        }
-    }
-    if (justCreatedOrReset) {
-        await new Promise((resolve) => setTimeout(resolve, 2500));
-    }
-    let result = await requestInstancePairingCode(name, phoneNumber);
-    const transientPairingError = (() => {
-        const errorText = String(result.error ?? '').toLowerCase();
-        return (result.error === 'pairing_channel_not_ready' ||
-            result.error === 'empty_pairing_code' ||
-            result.error === 'pairing_code_unavailable' ||
-            errorText.includes('connection closed') ||
-            errorText.includes('stream errored') ||
-            errorText.includes('timed out'));
-    })();
-    if (!result.ok && transientPairingError) {
-        disconnectInstance(name);
-        const recreated = await createInstance(name, config.authFolder);
-        if (recreated.ok) {
-            await new Promise((resolve) => setTimeout(resolve, 1200));
-            result = await requestInstancePairingCode(name, phoneNumber);
-        }
-    }
-    if (!result.ok) {
-        if (result.error === 'instance_already_connected') {
-            return sendError(res, 409, result.error, undefined, { instance: name, status: result.status ?? ctx.status });
-        }
-        if (result.error === 'session_already_registered') {
-            return sendError(res, 409, result.error, undefined, { instance: name, status: result.status ?? ctx.status });
-        }
-        if (result.error === 'instance_not_found') {
-            return sendError(res, 404, result.error, undefined, { instance: name });
-        }
-        if (result.error === 'pairing_channel_not_ready' ||
-            result.error === 'empty_pairing_code' ||
-            result.error === 'pairing_code_unavailable' ||
-            result.error === 'pairing_code_unstable') {
-            return sendError(res, 503, result.error, undefined, { instance: name, status: result.status ?? ctx.status });
-        }
-        return sendError(res, 400, result.error ?? 'pairing_code_failed', undefined, {
+    // Mutex: previne dois requests de pairing-code simultâneos para a mesma instância.
+    if (_creatingInstances.has(name)) {
+        return sendError(res, 409, 'instance_creation_in_progress', 'Operação de pairing já em andamento para esta instância.', {
             instance: name,
-            status: result.status ?? ctx.status,
         });
     }
-    writeAuditEvent(req, res, {
-        action: 'instances.pairing_code.generate',
-        target: name,
-        details: { phoneNumber },
-    });
-    return sendOk(res, {
-        instance: name,
-        status: result.status ?? ctx.status,
-        phoneNumber,
-        pairingCode: result.pairingCode,
-    });
+    _creatingInstances.add(name);
+    try {
+        let ctx = getInstance(name);
+        let justCreatedOrReset = false;
+        if (!ctx) {
+            const created = await createInstance(name, config.authFolder);
+            if (!created.ok) {
+                if (created.error === 'auth_corrupt_requires_manual_repair') {
+                    return sendError(res, 409, created.error, 'A autenticacao salva desta instancia esta corrompida e precisa de reparo manual antes de gerar pairing code.', { instance: name });
+                }
+                return sendError(res, 500, 'instance_create_failed', created.error, { instance: name });
+            }
+            ctx = getInstance(name);
+            justCreatedOrReset = true;
+        }
+        if (!ctx) {
+            return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
+        }
+        if (ctx.status !== 'connected' && !justCreatedOrReset && config.pairing.forceFreshSession) {
+            await logoutInstance(name, config.authFolder);
+            const recreatedFresh = await createInstance(name, config.authFolder);
+            if (!recreatedFresh.ok) {
+                return sendError(res, 500, 'instance_recreate_failed', recreatedFresh.error, { instance: name });
+            }
+            ctx = getInstance(name);
+            justCreatedOrReset = true;
+            if (!ctx) {
+                return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
+            }
+        }
+        const shouldForceFreshPairingAuth = config.pairing.forceFreshSession || hasIncompleteSavedPairingAuth(name);
+        if (ctx.status === 'qr' || ctx.status === 'disconnected') {
+            if (shouldForceFreshPairingAuth) {
+                await logoutInstance(name, config.authFolder);
+            }
+            else {
+                disconnectInstance(name);
+            }
+            const recreated = await createInstance(name, config.authFolder);
+            if (!recreated.ok) {
+                return sendError(res, 500, 'instance_recreate_failed', recreated.error, { instance: name });
+            }
+            ctx = getInstance(name);
+            justCreatedOrReset = true;
+            if (!ctx) {
+                return sendError(res, 500, 'instance_not_available', undefined, { instance: name });
+            }
+        }
+        if (justCreatedOrReset) {
+            await new Promise((resolve) => setTimeout(resolve, 2500));
+        }
+        let result = await requestInstancePairingCode(name, phoneNumber);
+        const transientPairingError = (() => {
+            const errorText = String(result.error ?? '').toLowerCase();
+            return (result.error === 'pairing_channel_not_ready' ||
+                result.error === 'empty_pairing_code' ||
+                result.error === 'pairing_code_unavailable' ||
+                errorText.includes('connection closed') ||
+                errorText.includes('stream errored') ||
+                errorText.includes('timed out'));
+        })();
+        if (!result.ok && (transientPairingError || result.error === 'pairing_code_unstable')) {
+            if (shouldForceFreshPairingAuth || result.error === 'pairing_code_unstable') {
+                await logoutInstance(name, config.authFolder);
+            }
+            else {
+                disconnectInstance(name);
+            }
+            const recreated = await createInstance(name, config.authFolder);
+            if (recreated.ok) {
+                result = await requestInstancePairingCode(name, phoneNumber);
+            }
+        }
+        if (!result.ok) {
+            if (result.error === 'instance_already_connected') {
+                return sendError(res, 409, result.error, undefined, {
+                    instance: name,
+                    status: result.status ?? ctx.status,
+                });
+            }
+            if (result.error === 'session_already_registered') {
+                return sendError(res, 409, result.error, undefined, {
+                    instance: name,
+                    status: result.status ?? ctx.status,
+                });
+            }
+            if (result.error === 'instance_not_found') {
+                return sendError(res, 404, result.error, undefined, { instance: name });
+            }
+            if (result.error === 'pairing_channel_not_ready' ||
+                result.error === 'empty_pairing_code' ||
+                result.error === 'pairing_code_unavailable' ||
+                result.error === 'pairing_code_unstable') {
+                return sendError(res, 503, result.error, undefined, {
+                    instance: name,
+                    status: result.status ?? ctx.status,
+                });
+            }
+            return sendError(res, 400, result.error ?? 'pairing_code_failed', undefined, {
+                instance: name,
+                status: result.status ?? ctx.status,
+            });
+        }
+        writeAuditEvent(req, res, {
+            action: 'instances.pairing_code.generate',
+            target: name,
+            details: { phoneNumber },
+        });
+        return sendOk(res, {
+            instance: name,
+            status: result.status ?? ctx.status,
+            phoneNumber,
+            pairingCode: result.pairingCode,
+        });
+    }
+    finally {
+        _creatingInstances.delete(name);
+    }
 });
 /**
  * GET /v1/instances/:name/details
@@ -265,6 +336,28 @@ router.post('/:name/restart', async (req, res) => {
     return sendOk(res, { instance: name });
 });
 /**
+ * POST /v1/instances/:name/repair-sessions
+ * Remove arquivos de sessão Signal corrompidos e reinicia a instância.
+ * Resolve erros "Decryption Failed" / "Session Error" causados por sessões dessincronizadas.
+ */
+router.post('/:name/repair-sessions', async (req, res) => {
+    const { name } = req.params;
+    const result = await repairInstanceSessions(name, config.authFolder);
+    if (!result.ok) {
+        return sendError(res, 400, result.error ?? 'repair_failed', undefined, { instance: name });
+    }
+    writeAuditEvent(req, res, {
+        action: 'instances.repair_sessions',
+        target: name,
+        details: { deleted: result.deleted, restarted: result.restarted },
+    });
+    return sendOk(res, {
+        instance: name,
+        deleted: result.deleted,
+        restarted: result.restarted,
+    });
+});
+/**
  * GET /v1/instances/:name/chats
  */
 router.get('/:name/chats', (req, res) => {
@@ -289,6 +382,7 @@ router.get('/:name/chats/:jid/messages', async (req, res) => {
 });
 /**
  * GET /v1/instances/:name/media/:mediaId
+ * Nota: sem validação HMAC para manter compatibilidade com o comportamento atual.
  */
 router.get('/:name/media/:mediaId', (req, res) => {
     const { name, mediaId } = req.params;
@@ -420,8 +514,8 @@ router.patch('/:name/settings/general', async (req, res) => {
         details: updated.general,
     });
     const runtime = applyInstanceRuntimeSettings(name);
-    const readSyncEnabled = (!before.general.autoReadMessages && updated.general.autoReadMessages)
-        || (!before.general.readStatus && updated.general.readStatus);
+    const readSyncEnabled = (!before.general.autoReadMessages && updated.general.autoReadMessages) ||
+        (!before.general.readStatus && updated.general.readStatus);
     const readSyncResult = readSyncEnabled
         ? await applyReadSettingsToCachedMessages(name)
         : { ok: true, count: 0 };
@@ -441,6 +535,8 @@ router.patch('/:name/settings/general', async (req, res) => {
         requiresReconnect,
     });
 });
+// Whitelist de protocolos permitidos para proxy
+const ALLOWED_PROXY_PROTOCOLS = ['http', 'https', 'socks4', 'socks5'];
 /**
  * PATCH /v1/instances/:name/settings/proxy
  */
@@ -448,6 +544,15 @@ router.patch('/:name/settings/proxy', (req, res) => {
     const { name } = req.params;
     const before = getInstancePanelConfig(name);
     const body = (req.body ?? {});
+    // Validação de protocol whitelist
+    if (body.protocol !== undefined) {
+        const proto = String(body.protocol).trim().toLowerCase();
+        if (!ALLOWED_PROXY_PROTOCOLS.includes(proto)) {
+            return sendError(res, 400, 'invalid_proxy_protocol', 'Protocol must be one of: http, https, socks4, socks5.', {
+                allowed: ALLOWED_PROXY_PROTOCOLS,
+            });
+        }
+    }
     const nextEnabled = body.enabled ?? before.proxy.enabled;
     const nextHost = String(body.host ?? before.proxy.host).trim();
     const nextPort = String(body.port ?? before.proxy.port).trim();
@@ -473,15 +578,17 @@ router.patch('/:name/settings/proxy', (req, res) => {
             hasCredentials: Boolean(updated.proxy.username || updated.proxy.password),
         },
     });
-    const requiresReconnect = before.proxy.enabled !== updated.proxy.enabled
-        || before.proxy.protocol !== updated.proxy.protocol
-        || before.proxy.host !== updated.proxy.host
-        || before.proxy.port !== updated.proxy.port
-        || before.proxy.username !== updated.proxy.username
-        || before.proxy.password !== updated.proxy.password;
+    const requiresReconnect = before.proxy.enabled !== updated.proxy.enabled ||
+        before.proxy.protocol !== updated.proxy.protocol ||
+        before.proxy.host !== updated.proxy.host ||
+        before.proxy.port !== updated.proxy.port ||
+        before.proxy.username !== updated.proxy.username ||
+        before.proxy.password !== updated.proxy.password;
+    // Remove credenciais sensíveis da resposta HTTP para evitar vazamento.
+    const { username: _u, password: _p, ...safeProxy } = updated.proxy;
     return sendOk(res, {
         instance: name,
-        proxy: updated.proxy,
+        proxy: { ...safeProxy, hasCredentials: Boolean(updated.proxy.username || updated.proxy.password) },
         requiresReconnect,
     });
 });
@@ -545,11 +652,7 @@ router.post('/:name/events/test', async (req, res) => {
     if (!INSTANCE_EVENT_NAMES.includes(eventName)) {
         return sendError(res, 400, 'invalid_event_name');
     }
-    const testResult = await emitInstanceEvent(name, eventName, {
-        source: 'manual_test',
-    }, {
-        ignoreToggle: true,
-    });
+    const testResult = await emitInstanceEvent(name, eventName, { source: 'manual_test' }, { ignoreToggle: true });
     if (!testResult.ok) {
         const statusCode = testResult.skipped ? 400 : 502;
         return sendError(res, statusCode, testResult.error ?? 'event_test_failed', undefined, {
@@ -652,4 +755,3 @@ router.delete('/:name', (req, res) => {
     return sendOk(res, { instance: name, removed: true });
 });
 export default router;
-//# sourceMappingURL=instances.js.map

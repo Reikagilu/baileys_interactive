@@ -1,49 +1,39 @@
-import crypto from 'node:crypto';
-function toBase64Url(input) {
-    return input
-        .toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/g, '');
-}
-function fromBase64Url(input) {
-    const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = normalized.length % 4;
-    const padded = pad === 0 ? normalized : normalized + '='.repeat(4 - pad);
-    return Buffer.from(padded, 'base64');
-}
-function mediaSignaturePayload(instance, mediaId, exp) {
-    return `${instance}:${mediaId}:${exp}`;
-}
+import { createHmac, timingSafeEqual } from 'node:crypto';
+/**
+ * Gera um token HMAC-SHA256 assinado para URLs de mídia temporárias.
+ * Formato: `sig` = HMAC(secret, `${instance}:${mediaId}:${exp}`)
+ */
 export function signMediaUrlToken(secret, instance, mediaId, exp) {
-    const payload = mediaSignaturePayload(instance, mediaId, exp);
-    const mac = crypto.createHmac('sha256', secret).update(payload).digest();
-    return toBase64Url(mac);
+    const payload = `${instance}:${mediaId}:${exp}`;
+    return createHmac('sha256', secret).update(payload).digest('hex');
 }
+/**
+ * Verifica um token de URL de mídia assinado.
+ * Retorna `{ ok: true, exp }` se válido, ou `{ ok: false, error }` se inválido/expirado.
+ */
 export function verifyMediaUrlToken(secret, instance, mediaId, expRaw, sigRaw) {
-    const exp = Number.parseInt(String(expRaw ?? ''), 10);
+    const expStr = String(expRaw ?? '').trim();
     const sig = String(sigRaw ?? '').trim();
-    if (!Number.isFinite(exp) || exp <= 0 || !sig) {
+    if (!expStr || !sig)
         return { ok: false, error: 'invalid_token' };
-    }
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    if (exp < nowSeconds) {
+    const exp = Number(expStr);
+    if (!Number.isFinite(exp))
+        return { ok: false, error: 'invalid_token' };
+    // Verificar expiração primeiro (não vaza info sobre assinatura)
+    if (Date.now() > exp)
         return { ok: false, error: 'expired_token' };
-    }
+    // Verificar assinatura timing-safe
     const expected = signMediaUrlToken(secret, instance, mediaId, exp);
     try {
-        const expectedBytes = fromBase64Url(expected);
-        const sigBytes = fromBase64Url(sig);
-        if (expectedBytes.length !== sigBytes.length) {
+        const a = Buffer.from(expected, 'hex');
+        const b = Buffer.from(sig.length === expected.length ? sig : '', 'hex');
+        if (a.length !== b.length)
             return { ok: false, error: 'invalid_token' };
-        }
-        if (!crypto.timingSafeEqual(expectedBytes, sigBytes)) {
+        if (!timingSafeEqual(a, b))
             return { ok: false, error: 'invalid_token' };
-        }
-        return { ok: true, exp };
     }
     catch {
         return { ok: false, error: 'invalid_token' };
     }
+    return { ok: true, exp };
 }
-//# sourceMappingURL=media-signature.js.map

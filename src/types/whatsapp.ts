@@ -12,6 +12,10 @@ export interface InstanceContext {
     linkedNumber?: string | null;
     profilePictureUrl?: string | null;
     profileName?: string | null;
+    /** Memoized on connection.open — user part of own PN JID (before @). */
+    ownPnUser?: string;
+    /** Memoized on connection.open — user part of own LID JID (before @). */
+    ownLidUser?: string;
 }
 export interface WASocketLike {
     sendMessage: (jid: string, content: MessageContent) => Promise<{

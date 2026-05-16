@@ -7,17 +7,20 @@ import { isValidInstanceName } from '../utils/helpers.js';
 import { signMediaUrlToken } from '../utils/media-signature.js';
 import { emitWebhookEvent } from './webhooks.js';
 import { emitInstanceEvent, getInstanceGeneral, getInstancePanelConfig } from './instance-config.js';
-import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, } from './message-store.js';
+import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, runInTransaction as msRunInTransaction, } from './message-store.js';
 import { markMessageSynced } from './chatwoot-sync-store.js';
+import { getInstanceIntegrations } from './integrations.js';
 import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
 import { markChatwootOriginated } from './chatwoot-tracking.js';
 import { log } from '../utils/logger.js';
+import { validateOutboundUrl } from '../utils/url-security.js';
 const instances = new Map();
 const reconnectAttempts = new Map();
 const pairingIssuedAt = new Map();
 const authRecoveryIssuedAt = new Map();
 const alwaysOnlineIntervals = new Map();
 const syncHistoryIntervals = new Map();
+const forceAppStateResync = new Set();
 const syncHistoryInFlight = new Set();
 const syncHistoryCursor = new Map();
 let processShuttingDown = false;
@@ -47,8 +50,6 @@ const MEDIA_NODE_BY_KIND = {
     document: { field: 'documentMessage', downloadType: 'document' },
 };
 const EXTERNAL_MESSAGE_STRIP_KEYS = new Set([
-    'fileEncSha256',
-    'fileSha256',
     'waveform',
     'messageContextInfo',
 ]);
@@ -130,15 +131,23 @@ function loadMediaIndex() {
         // ignore malformed index
     }
 }
+// Debounce para persistMediaIndex: em grupos ativos com muitas mídias,
+// chamadas síncronas a cada mensagem geram I/O excessivo. Agrupa em 1.5s.
+let _persistMediaIndexTimer = null;
 function persistMediaIndex() {
-    try {
-        fs.mkdirSync(runtimePath, { recursive: true });
-        const payload = Object.fromEntries([...chatMediaBinaryStore.entries()].sort(([a], [b]) => a.localeCompare(b)));
-        fs.writeFileSync(mediaIndexPath, JSON.stringify(payload, null, 2), 'utf8');
-    }
-    catch {
-        // ignore persistence failures
-    }
+    if (_persistMediaIndexTimer)
+        return;
+    _persistMediaIndexTimer = setTimeout(() => {
+        _persistMediaIndexTimer = null;
+        try {
+            fs.mkdirSync(runtimePath, { recursive: true });
+            const payload = Object.fromEntries([...chatMediaBinaryStore.entries()].sort(([a], [b]) => a.localeCompare(b)));
+            fs.writeFileSync(mediaIndexPath, JSON.stringify(payload, null, 2), 'utf8');
+        }
+        catch {
+            // ignore persistence failures
+        }
+    }, 1500);
 }
 function normalizeTimestamp(raw) {
     const toMs = (value) => {
@@ -167,8 +176,11 @@ function normalizeTimestamp(raw) {
     }
     return Date.now();
 }
-// Returns 0 instead of Date.now() when value is missing/invalid.
-// Used for conversationTimestamp so an absent value does NOT overwrite a stored one.
+/**
+ * Like normalizeTimestamp but returns 0 instead of Date.now() when the raw
+ * value is missing/invalid. Used for chat metadata (conversationTimestamp)
+ * so that an absent timestamp does NOT overwrite a previously stored one.
+ */
 function normalizeTimestampOrZero(raw) {
     const toMs = (value) => {
         if (!Number.isFinite(value) || value <= 0)
@@ -321,8 +333,21 @@ function persistLastInstanceState() {
         stopped_by_user = excluded.stopped_by_user,
         updated_at = excluded.updated_at
     `);
-        for (const [name, state] of lastInstanceState.entries()) {
-            upsert.run(name, state.status, state.wasConnected ? 1 : 0, state.stoppedByUser ? 1 : 0, state.updatedAt);
+        // Envolver em transação: com N instâncias, N upserts individuais sem transação
+        // causam N flushes do WAL, bloqueando o event loop desnecessariamente.
+        db.exec('BEGIN');
+        try {
+            for (const [name, state] of lastInstanceState.entries()) {
+                upsert.run(name, state.status, state.wasConnected ? 1 : 0, state.stoppedByUser ? 1 : 0, state.updatedAt);
+            }
+            db.exec('COMMIT');
+        }
+        catch (txErr) {
+            try {
+                db.exec('ROLLBACK');
+            }
+            catch { /* ignore */ }
+            throw txErr;
         }
         // Mantém o arquivo local apenas como espelho legível/fallback legado.
         fs.mkdirSync(runtimePath, { recursive: true });
@@ -385,10 +410,27 @@ function extractOwnLidPrefix(creds) {
     const lid = String(creds?.me?.lid ?? '').trim();
     return lid ? lid.split(':')[0].split('@')[0] : '';
 }
-function hasCorruptExistingRegistration(creds) {
+function extractOwnPhonePrefix(creds) {
+    const id = String(creds?.me?.id ?? '').trim();
+    return id ? id.split(':')[0].split('@')[0] : '';
+}
+function hasCorruptExistingRegistration(instanceName, creds) {
     if (!creds || creds.registered !== false)
         return false;
-    return Boolean(String(creds.me?.id ?? '').trim() || String(creds.me?.lid ?? '').trim());
+    const hasPersistedIdentity = Boolean(String(creds.me?.id ?? '').trim() || String(creds.me?.lid ?? '').trim());
+    if (!hasPersistedIdentity)
+        return false;
+    const priorState = lastInstanceState.get(instanceName);
+    const hasCompletedPairingState = isCompletedPairingState(creds);
+    // In this Baileys fork, QR-linked sessions can remain with registered=false
+    // even after successful pairing. Treat it as corruption only when the auth
+    // looks incomplete AND the instance had previously been connected.
+    if (hasCompletedPairingState)
+        return false;
+    return Boolean(priorState?.wasConnected);
+}
+function isCompletedPairingState(creds) {
+    return Boolean(creds?.account) || (Array.isArray(creds?.signalIdentities) && creds.signalIdentities.length > 0);
 }
 function resetInstanceAuthState(authPath) {
     try {
@@ -406,9 +448,21 @@ function resetInstanceAuthState(authPath) {
         // best effort
     }
 }
-function repairInconsistentOwnSignalSessions(authPath, creds) {
-    if (creds?.registered !== false)
+function maybeResetInstanceAuthState(name, authPath, reason) {
+    if (!config.whatsapp.autoResetCorruptAuth) {
+        log.whatsapp.child(name).error(`auto_auth_reset_blocked  reason=${reason}  action=preserve_auth  hint=enable_WHATSAPP_AUTO_RESET_CORRUPT_AUTH_if_you_really_want_destructive_recovery`);
+        return false;
+    }
+    resetInstanceAuthState(authPath);
+    return true;
+}
+function repairInconsistentOwnSignalSessions(authPath, creds, instanceName) {
+    if (!hasCorruptExistingRegistration(instanceName, creds))
         return;
+    if (!config.whatsapp.autoResetCorruptAuth) {
+        log.whatsapp.child(instanceName).warn('auth-repair skipped  action=preserve_auth  reason=auto_reset_disabled');
+        return;
+    }
     const ownLidPrefix = extractOwnLidPrefix(creds);
     if (!ownLidPrefix || !fs.existsSync(authPath))
         return;
@@ -457,6 +511,132 @@ function shouldRestoreInstanceOnStartup(state, name) {
     // Backward compatibility for older installs that have auth folders but no
     // persisted last-state metadata yet.
     return autostartInstances.has(name);
+}
+/**
+ * Throttled cleanup das sessões Signal próprias do usuário (note-to-self) que
+ * caíram em estado corrompido (Counter Error / Bad MAC) — tipicamente após
+ * reconexões durante o flush de stanzas pendentes.
+ *
+ * Sem essa função, o Baileys aguarda `maxMsgRetryCount` (configurado para 2)
+ * tentativas antes de limpar a sessão automaticamente, gerando ruído no log e
+ * mantendo a sessão quebrada por mais tempo. Aqui detectamos via
+ * `messageStubType === CIPHERTEXT` (= falha de descriptografia entregue ao
+ * upper-layer) que o destino é o LID próprio e disparamos `deleteSession`
+ * imediatamente, forçando renegociação na próxima mensagem.
+ *
+ * Throttle por JID (60s) evita loops caso a renegociação demore.
+ */
+const selfSessionCleanupCooldownMs = 60_000;
+const selfSessionCleanupRecent = new Map();
+async function handleCorruptedSelfSessions(name, ctx, list) {
+    if (!list || list.length === 0)
+        return;
+    // CIPHERTEXT stub = 2. Hardcoded para evitar dynamic import por chamada
+    // (proto.WebMessageInfo.StubType.CIPHERTEXT === 2 em todas as versões do Baileys).
+    const CIPHERTEXT_STUB = 2;
+    const sock = ctx.sock;
+    // Use memoized values from ctx when available (populated at connection.open).
+    // Fallback to reading from creds/user on first call.
+    let ownPnUser = ctx.ownPnUser ?? '';
+    let ownLidUser = ctx.ownLidUser ?? '';
+    if (!ownPnUser && !ownLidUser) {
+        // me.id pode ser "551197...@s.whatsapp.net" ou "551197...:46@s.whatsapp.net".
+        const rawPn = String(sock.authState?.creds?.me?.id ?? sock.user?.id ?? '');
+        const rawLid = String(sock.authState?.creds?.me?.lid ?? sock.user?.lid ?? '');
+        ownPnUser = rawPn ? rawPn.split('@')[0].split(':')[0] : '';
+        ownLidUser = rawLid ? rawLid.split('@')[0].split(':')[0] : '';
+        // Memoize for subsequent calls on this instance.
+        if (ownPnUser)
+            ctx.ownPnUser = ownPnUser;
+        if (ownLidUser)
+            ctx.ownLidUser = ownLidUser;
+    }
+    const rawPn = String(sock.authState?.creds?.me?.id ?? sock.user?.id ?? '');
+    const rawLid = String(sock.authState?.creds?.me?.lid ?? sock.user?.lid ?? '');
+    const pnDomain = rawPn.includes('@') ? '@' + rawPn.split('@')[1] : '@s.whatsapp.net';
+    const lidDomain = rawLid.includes('@') ? '@' + rawLid.split('@')[1] : '@lid';
+    const ownPn = ownPnUser ? `${ownPnUser}${pnDomain}` : '';
+    const ownLid = ownLidUser ? `${ownLidUser}${lidDomain}` : '';
+    if (!ownPn && !ownLid)
+        return;
+    const toCleanup = new Set();
+    for (const msg of list) {
+        const stub = msg.messageStubType;
+        if (stub !== CIPHERTEXT_STUB)
+            continue;
+        const key = msg.key ?? {};
+        const remoteJid = String(key.remoteJid ?? '');
+        const participant = String(key.participant ?? '');
+        const candidate = participant || remoteJid;
+        if (!candidate)
+            continue;
+        const candidateUser = candidate.split('@')[0].split(':')[0];
+        // Apenas para sessão própria (note-to-self): o JID é o usuário próprio
+        // (em PN ou LID).
+        const isSelf = (ownPnUser && candidateUser === ownPnUser) ||
+            (ownLidUser && candidateUser === ownLidUser);
+        if (!isSelf)
+            continue;
+        const now = Date.now();
+        const last = selfSessionCleanupRecent.get(candidate) ?? 0;
+        if (now - last < selfSessionCleanupCooldownMs)
+            continue;
+        selfSessionCleanupRecent.set(candidate, now);
+        // Inclui AMBOS o JID detectado (PN ou LID) e seu par para garantir que
+        // os dois arquivos de sessão em disco sejam removidos. O deleteSession do
+        // Baileys usa jidToSignalProtocolAddress que gera a chave de arquivo por
+        // JID individualmente:
+        //   - PN "551197...@s.whatsapp.net" → addr "551197...0" → file session-551197...0.json
+        //   - LID "100158...:0@lid" → signalUser="100158..._1", addr="100158..._1.0" → file session-100158..._1.0.json
+        // Se só passarmos o PN, o arquivo do LID permanece corrompido (e vice-versa).
+        // Sempre passamos ambos com device=0 (que é o device das sessões note-to-self).
+        toCleanup.add(candidate);
+        // Adiciona o JID par: se o candidato é PN, adiciona o LID com device 0 e vice-versa
+        if (ownPnUser && candidateUser === ownPnUser && ownLidUser) {
+            // LID com device 0 (format: user:0@lid)
+            toCleanup.add(`${ownLidUser}:0@lid`);
+        }
+        else if (ownLidUser && candidateUser === ownLidUser && ownPnUser) {
+            // PN com device 0 (format: user:0@s.whatsapp.net)
+            toCleanup.add(`${ownPnUser}:0@s.whatsapp.net`);
+        }
+    }
+    if (toCleanup.size === 0)
+        return;
+    const deleteSession = sock.signalRepository?.deleteSession;
+    if (typeof deleteSession !== 'function')
+        return;
+    const jids = Array.from(toCleanup);
+    try {
+        await deleteSession.call(sock.signalRepository, jids);
+        log.whatsapp
+            .child(name)
+            .info('self_session_corrupted_cleaned', { jids, count: jids.length });
+    }
+    catch (err) {
+        log.whatsapp.child(name).warn('self_session_cleanup_failed', { jids, err });
+    }
+    // Invalida o peerSessionsCache interno do Baileys para os JIDs deletados.
+    // Sem isso, o cache ainda diz "true" e o próximo sendMessage pula o fetch
+    // de pre-keys (assertSessions force=false), falhando a encriptação
+    // silenciosamente. O invalidatePeerSessionCache é exposto via patch 4.
+    if (typeof sock.invalidatePeerSessionCache === 'function') {
+        try {
+            sock.invalidatePeerSessionCache(jids);
+            log.whatsapp.child(name).debug('peer_session_cache_invalidated', { jids });
+        }
+        catch (err) {
+            log.whatsapp.child(name).warn('peer_session_cache_invalidate_failed', { jids, err });
+        }
+    }
+    // Limita o tamanho do mapa de cooldown para evitar leak.
+    if (selfSessionCleanupRecent.size > 200) {
+        const cutoff = Date.now() - selfSessionCleanupCooldownMs * 5;
+        for (const [jid, ts] of selfSessionCleanupRecent) {
+            if (ts < cutoff)
+                selfSessionCleanupRecent.delete(jid);
+        }
+    }
 }
 loadMediaIndex();
 purgeExpiredMediaBinaries();
@@ -575,7 +755,8 @@ async function runContinuousHistorySync(name, ctx) {
                 const response = await anySock.fetchMessageHistory(CONTINUOUS_HISTORY_FETCH_COUNT, oldestKey, oldestTimestamp);
                 const messages = extractMessagesFromHistoryResponse(response);
                 if (messages.length > 0) {
-                    ingestMessagesToCache(name, messages, { fromHistory: true });
+                    // Chunked async para não bloquear o event loop em batches grandes.
+                    await ingestHistoryMessagesChunked(name, messages);
                 }
             }
             catch {
@@ -740,23 +921,24 @@ function maxMediaBytes(kind, scope) {
 }
 function purgeExpiredMediaBinaries(now = Date.now()) {
     const ttl = config.limits.chatMediaRetentionMs;
-    let changed = false;
+    const toDelete = [];
     for (const [mediaId, item] of chatMediaBinaryStore.entries()) {
         if (item.expiresAt <= now || now - item.createdAt > ttl) {
-            const absolutePath = path.join(mediaStoragePath, item.relativePath);
-            try {
-                if (fs.existsSync(absolutePath))
-                    fs.rmSync(absolutePath, { force: true });
-            }
-            catch {
-                // ignore deletion failures
-            }
-            chatMediaBinaryStore.delete(mediaId);
-            changed = true;
+            toDelete.push(mediaId);
         }
     }
-    if (changed)
-        persistMediaIndex();
+    if (!toDelete.length)
+        return;
+    for (const mediaId of toDelete) {
+        const item = chatMediaBinaryStore.get(mediaId);
+        if (!item)
+            continue;
+        const absolutePath = path.join(mediaStoragePath, item.relativePath);
+        // Use async deletion to avoid blocking the event loop; fire-and-forget.
+        fs.promises.rm(absolutePath, { force: true }).catch(() => { });
+        chatMediaBinaryStore.delete(mediaId);
+    }
+    persistMediaIndex();
 }
 function clearInstanceMediaBinaries(instance, force = false) {
     if (!force)
@@ -889,6 +1071,30 @@ function findMediaNode(message, depth = 0) {
     }
     return null;
 }
+/**
+ * Serializa os campos essenciais do node de mídia do Baileys para JSON persistível.
+ * Converte Buffers para base64 e mantém apenas os campos necessários para re-download futuro.
+ */
+function serializeMediaSourceNode(node) {
+    const DOWNLOAD_FIELDS = ['url', 'directPath', 'mediaKey', 'fileEncSha256', 'fileSha256', 'fileLength', 'mediaKeyTimestamp'];
+    const out = {};
+    for (const field of DOWNLOAD_FIELDS) {
+        const val = node[field];
+        if (val === undefined || val === null)
+            continue;
+        if (Buffer.isBuffer(val)) {
+            out[field] = val.toString('base64');
+            out[`${field}__enc`] = 'base64'; // marker para re-hidratação
+        }
+        else if (typeof val === 'bigint') {
+            out[field] = val.toString();
+        }
+        else {
+            out[field] = val;
+        }
+    }
+    return out;
+}
 function injectMediaBase64(message, kind, base64, depth = 0) {
     if (!isRecord(message) || depth > 6)
         return message;
@@ -947,24 +1153,26 @@ async function downloadMediaBase64(node, kind, scope = 'webhook') {
         const module = (await import('baileys'));
         if (typeof module.downloadContentFromMessage !== 'function')
             return { omittedReason: 'download_failed' };
-        const stream = await module.downloadContentFromMessage(node, MEDIA_NODE_BY_KIND[kind].downloadType);
-        const chunks = [];
-        let total = 0;
-        const limit = maxMediaBytes(kind, scope);
-        for await (const chunk of stream) {
-            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            total += buffer.length;
-            if (total > limit) {
-                return { omittedReason: 'too_large' };
+        const DOWNLOAD_TIMEOUT_MS = 30_000;
+        const downloadPromise = (async () => {
+            const stream = await module.downloadContentFromMessage(node, MEDIA_NODE_BY_KIND[kind].downloadType);
+            const chunks = [];
+            let total = 0;
+            const limit = maxMediaBytes(kind, scope);
+            for await (const chunk of stream) {
+                const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                total += buffer.length;
+                if (total > limit) {
+                    return { omittedReason: 'too_large' };
+                }
+                chunks.push(buffer);
             }
-            chunks.push(buffer);
-        }
-        if (!chunks.length)
-            return { omittedReason: 'download_failed' };
-        return {
-            base64: Buffer.concat(chunks).toString('base64'),
-            bytes: total,
-        };
+            if (!chunks.length)
+                return { omittedReason: 'download_failed' };
+            return { base64: Buffer.concat(chunks).toString('base64'), bytes: total };
+        })();
+        const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve({ omittedReason: 'download_failed' }), DOWNLOAD_TIMEOUT_MS));
+        return await Promise.race([downloadPromise, timeoutPromise]);
     }
     catch {
         return { omittedReason: 'download_failed' };
@@ -1061,23 +1269,70 @@ async function enrichIncomingMediaBase64(messages) {
     if (!config.webhooks.includeIncomingMediaBase64 || messages.length === 0)
         return messages;
     const enriched = [...messages];
-    for (let i = 0; i < messages.length; i += 1) {
-        const current = messages[i];
+    // Parallel download with concurrency cap to avoid hammering WA servers.
+    const CONCURRENCY = 4;
+    const tasks = messages.map((current, i) => async () => {
         const message = isRecord(current.message) ? current.message : null;
         if (!message)
-            continue;
+            return;
         const found = findMediaNode(message);
         if (!found)
-            continue;
+            return;
         const mediaData = await downloadMediaBase64(found.node, found.kind, 'webhook');
         if (!mediaData?.base64)
-            continue;
+            return;
         enriched[i] = {
             ...current,
             message: injectMediaBase64(message, found.kind, mediaData.base64),
         };
-    }
+    });
+    // Run tasks with bounded concurrency using a simple semaphore pattern.
+    const queue = [...tasks];
+    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+        let task;
+        while ((task = queue.shift())) {
+            try {
+                await task();
+            }
+            catch { /* per-item errors are non-fatal */ }
+        }
+    });
+    await Promise.all(workers);
     return enriched;
+}
+/**
+ * Re-hidrata um node de mídia serializado (com Buffers em base64) de volta
+ * para o formato que o Baileys espera em `downloadContentFromMessage`.
+ */
+function rehydrateMediaSourceNode(src) {
+    const out = {};
+    for (const [key, val] of Object.entries(src)) {
+        if (key.endsWith('__enc'))
+            continue; // marker de encoding, não é campo real
+        const encKey = `${key}__enc`;
+        if (src[encKey] === 'base64' && typeof val === 'string') {
+            out[key] = Buffer.from(val, 'base64');
+        }
+        else {
+            out[key] = val;
+        }
+    }
+    return out;
+}
+function classifyChatwootMediaDownloadFailure(errorMessage) {
+    const normalized = errorMessage.trim().toLowerCase();
+    if (!normalized)
+        return 'download_failed';
+    if (normalized.includes('excede limite') || normalized.includes('too large'))
+        return 'too_large';
+    if (normalized.includes('bad decrypt') ||
+        normalized.includes('decryption failed') ||
+        normalized.includes('cannot derive from empty media key') ||
+        normalized.includes('empty media key') ||
+        normalized.includes('bad mac')) {
+        return 'decryption_failed';
+    }
+    return 'download_failed';
 }
 /**
  * Garante que mensagens com mídia tenham `base64` inline para que o
@@ -1091,81 +1346,119 @@ async function enrichIncomingMediaBase64(messages) {
  *
  * Não modifica mensagens sem mídia. Retorna sempre o mesmo array de tamanho.
  */
+/**
+ * Processa uma única mensagem para enrichMediaForChatwoot.
+ * Extraída para permitir paralelismo via Promise.all.
+ */
+async function enrichSingleMessageForChatwoot(current, limit) {
+    const message = isRecord(current.message) ? current.message : null;
+    if (!message)
+        return current;
+    const currentMedia = isRecord(current.media) ? current.media : null;
+    // Já tem base64 diretamente no campo media (mídia enviada por nós)?
+    if (typeof currentMedia?.base64 === 'string' && currentMedia.base64.length > 0)
+        return current;
+    let found = findMediaNode(message);
+    if (!found)
+        return current;
+    // Já tem base64 (enriquecido antes)?
+    if (typeof found.node.base64 === 'string' && found.node.base64.length > 0)
+        return current;
+    // Se o node não tem as chaves de download (url/directPath/mediaKey), tentar
+    // usar o _src persistido no media (salvo durante ingestão da mensagem).
+    const persistedSrc = isRecord(currentMedia?._src) ? currentMedia._src : null;
+    const hasDownloadKeys = typeof found.node.url === 'string' || typeof found.node.directPath === 'string';
+    if (!hasDownloadKeys && persistedSrc) {
+        found = { kind: found.kind, node: { ...found.node, ...rehydrateMediaSourceNode(persistedSrc) } };
+    }
+    // Retry para download de mídia (máximo 3 tentativas)
+    const maxRetries = 3;
+    let lastDownloadError = '';
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            // downloadContentFromMessage não é re-exportado pelo index do baileys;
+            // importar direto do módulo utilitário onde está definido.
+            const mediaModule = (await import('baileys/lib/Utils/messages-media.js'));
+            if (typeof mediaModule.downloadContentFromMessage !== 'function') {
+                lastDownloadError = 'downloadContentFromMessage não disponível';
+                break;
+            }
+            const stream = await mediaModule.downloadContentFromMessage(found.node, MEDIA_NODE_BY_KIND[found.kind].downloadType);
+            const chunks = [];
+            let total = 0;
+            let oversize = false;
+            for await (const chunk of stream) {
+                const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                total += buffer.length;
+                if (total > limit) {
+                    oversize = true;
+                    break;
+                }
+                chunks.push(buffer);
+            }
+            if (oversize || chunks.length === 0) {
+                lastDownloadError = oversize ? 'mídia excede limite máximo' : 'stream vazio';
+                break; // Oversize/empty não vai melhorar com retry
+            }
+            const base64 = Buffer.concat(chunks).toString('base64');
+            const enrichedMedia = isRecord(current.media) ? current.media : null;
+            return {
+                ...current,
+                media: enrichedMedia
+                    ? { ...enrichedMedia, base64 }
+                    : {
+                        kind: found.kind,
+                        mimeType: typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined,
+                        base64,
+                    },
+                message: injectMediaBase64(message, found.kind, base64),
+            };
+        }
+        catch (err) {
+            lastDownloadError = err instanceof Error ? err.message : String(err);
+            if (attempt < maxRetries) {
+                await new Promise(r => setTimeout(r, 100 * attempt));
+            }
+        }
+    }
+    // Download falhou - marcar omittedReason.
+    log.whatsapp.warn('enrichMediaForChatwoot_failed', { kind: found.kind, error: lastDownloadError });
+    const existingMedia = isRecord(current.media) ? current.media : null;
+    if (existingMedia && !existingMedia.base64) {
+        return {
+            ...current,
+            media: {
+                ...existingMedia,
+                omittedReason: classifyChatwootMediaDownloadFailure(lastDownloadError),
+            },
+        };
+    }
+    return current;
+}
 export async function enrichMediaForChatwoot(messages) {
     if (messages.length === 0)
         return messages;
     const limit = config.chatwoot.mediaMaxBytes;
-    const enriched = [...messages];
-    for (let i = 0; i < messages.length; i += 1) {
-        const current = messages[i];
-        const message = isRecord(current.message) ? current.message : null;
-        if (!message)
-            continue;
-        const found = findMediaNode(message);
-        if (!found)
-            continue;
-        // Já tem base64 (enriquecido antes)?
-        if (typeof found.node.base64 === 'string' && found.node.base64.length > 0)
-            continue;
-        // Retry para download de mídia (máximo 3 tentativas)
-        const maxRetries = 3;
-        let downloadSuccess = false;
-        let lastDownloadError = '';
-        for (let attempt = 1; attempt <= maxRetries && !downloadSuccess; attempt++) {
-            try {
-                const mediaModule = (await import('baileys'));
-                if (typeof mediaModule.downloadContentFromMessage !== 'function') {
-                    lastDownloadError = 'downloadContentFromMessage não disponível';
-                    continue;
-                }
-                const stream = await mediaModule.downloadContentFromMessage(found.node, MEDIA_NODE_BY_KIND[found.kind].downloadType);
-                const chunks = [];
-                let total = 0;
-                let oversize = false;
-                for await (const chunk of stream) {
-                    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                    total += buffer.length;
-                    if (total > limit) {
-                        oversize = true;
-                        break;
-                    }
-                    chunks.push(buffer);
-                }
-                if (oversize || chunks.length === 0) {
-                    lastDownloadError = oversize ? 'mídia excede limite máximo' : 'stream vazio';
-                    continue;
-                }
-                const base64 = Buffer.concat(chunks).toString('base64');
-                const currentMedia = isRecord(current.media) ? current.media : null;
-                enriched[i] = {
-                    ...current,
-                    media: currentMedia
-                        ? {
-                            ...currentMedia,
-                            base64,
-                        }
-                        : {
-                            kind: found.kind,
-                            mimeType: typeof found.node.mimetype === 'string' ? found.node.mimetype : undefined,
-                            base64,
-                        },
-                    message: injectMediaBase64(message, found.kind, base64),
-                };
-                downloadSuccess = true;
-            }
-            catch (err) {
-                lastDownloadError = err instanceof Error ? err.message : String(err);
-                if (attempt < maxRetries) {
-                    await new Promise(r => setTimeout(r, 100 * attempt));
-                }
-            }
+    // Parallel download with bounded concurrency (4 simultaneous) to avoid
+    // hammering WA CDN while still reducing total latency by N-fold on bursts.
+    const CONCURRENCY = 4;
+    const enriched = new Array(messages.length);
+    const tasks = messages.map((msg, i) => async () => {
+        enriched[i] = await enrichSingleMessageForChatwoot(msg, limit);
+    });
+    const queue = [...tasks];
+    const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+        let task;
+        while ((task = queue.shift())) {
+            await task();
         }
-        // Se download falhou, a mensagem segue sem mídia (caso esperado)
-        // Não faz sentido tentar mais - a mídia pode não estar mais disponível no WhatsApp
-    }
+    });
+    await Promise.all(workers);
     return enriched;
 }
 function stripMessageNoise(value, depth = 0) {
+    if (Buffer.isBuffer(value))
+        return value;
     if (!isRecord(value) || depth > 8)
         return value;
     const output = {};
@@ -1308,7 +1601,10 @@ async function resolveReactionTarget(instance, rawMessage) {
     }
     const chats = chatCache.get(instance);
     const chat = chats?.get(chatJid);
-    const target = chat?.messages.find((item) => item.id === ref.targetMessageId) ?? null;
+    // Use O(1) Map lookup when available; fallback to linear scan if not yet built.
+    const target = chat
+        ? (chat.messagesById?.get(ref.targetMessageId) ?? chat.messages.find((item) => item.id === ref.targetMessageId) ?? null)
+        : null;
     if (!target) {
         return {
             id: ref.targetMessageId,
@@ -1361,64 +1657,71 @@ function getCachedMessageForRaw(instance, rawMessage) {
     const chat = chats?.get(jid);
     if (!chat)
         return null;
+    // Use O(1) Map lookup when available (built lazily in updateCachedMessage).
+    if (chat.messagesById)
+        return chat.messagesById.get(id) ?? null;
     return chat.messages.find((item) => item.id === id) ?? null;
 }
-async function normalizeUpsertMessagesForExternal(instance, messages) {
-    const normalized = [];
-    for (const raw of messages) {
-        const cleaned = stripMessageNoise(raw);
-        const inferredType = detectRawMessageType(raw.message);
-        cleaned.message_type = inferredType;
-        cleaned.messageType = inferredType;
-        const cryptoContext = extractCompactCryptoContext(raw);
-        if (cryptoContext) {
-            cleaned.crypto = cryptoContext;
-        }
-        const senderFallback = extractSender(raw);
-        cleaned.sender = {
-            name: senderFallback.senderName,
-            number: senderFallback.senderNumber,
-        };
-        const quotedMessageId = extractQuotedMessageId(raw);
-        if (quotedMessageId)
-            cleaned.quotedMessageId = quotedMessageId;
-        const cached = getCachedMessageForRaw(instance, raw);
-        if (cached) {
-            await ensureCachedMessageMedia(instance, cached);
-            cleaned.text = cached.text;
-            if (cached.quotedMessageId)
-                cleaned.quotedMessageId = cached.quotedMessageId;
-            const resolvedType = cached.media?.kind ?? inferredType;
-            cleaned.message_type = resolvedType;
-            cleaned.messageType = resolvedType;
-            cleaned.sender = {
-                name: cached.senderName,
-                number: cached.senderNumber,
-            };
-            if (cached.media) {
-                cleaned.media = {
-                    kind: cached.media.kind,
-                    mimeType: cached.media.mimeType,
-                    fileName: cached.media.fileName,
-                    caption: cached.media.caption,
-                    mediaId: cached.media.mediaId,
-                    url: cached.media.mediaId ? buildMediaUrl(instance, cached.media.mediaId) : undefined,
-                    base64: config.webhooks.includeIncomingMediaBase64 ? cached.media.base64 : undefined,
-                    bytes: cached.media.bytes,
-                    omittedReason: cached.media.omittedReason,
-                };
-            }
-        }
-        if (cleaned.message_type === 'reaction' || cleaned.messageType === 'reaction') {
-            const reactionTarget = await resolveReactionTarget(instance, raw);
-            if (reactionTarget) {
-                cleaned.reaction_target = reactionTarget;
-                cleaned.reactionTarget = reactionTarget;
-            }
-        }
-        normalized.push(cleaned);
+async function normalizeSingleMessageForExternal(instance, raw) {
+    const cleaned = stripMessageNoise(raw);
+    const inferredType = detectRawMessageType(raw.message);
+    cleaned.message_type = inferredType;
+    cleaned.messageType = inferredType;
+    const cryptoContext = extractCompactCryptoContext(raw);
+    if (cryptoContext) {
+        cleaned.crypto = cryptoContext;
     }
-    return normalized;
+    const senderFallback = extractSender(raw);
+    cleaned.sender = {
+        name: senderFallback.senderName,
+        number: senderFallback.senderNumber,
+    };
+    const quotedMessageId = extractQuotedMessageId(raw);
+    if (quotedMessageId)
+        cleaned.quotedMessageId = quotedMessageId;
+    const cached = getCachedMessageForRaw(instance, raw);
+    if (cached) {
+        await ensureCachedMessageMedia(instance, cached);
+        cleaned.text = cached.text;
+        if (cached.quotedMessageId)
+            cleaned.quotedMessageId = cached.quotedMessageId;
+        const resolvedType = cached.media?.kind ?? inferredType;
+        cleaned.message_type = resolvedType;
+        cleaned.messageType = resolvedType;
+        cleaned.sender = {
+            name: cached.senderName,
+            number: cached.senderNumber,
+        };
+        if (cached.media) {
+            cleaned.media = {
+                kind: cached.media.kind,
+                mimeType: cached.media.mimeType,
+                fileName: cached.media.fileName,
+                caption: cached.media.caption,
+                mediaId: cached.media.mediaId,
+                url: cached.media.mediaId ? buildMediaUrl(instance, cached.media.mediaId) : undefined,
+                base64: config.webhooks.includeIncomingMediaBase64 ? cached.media.base64 : undefined,
+                bytes: cached.media.bytes,
+                omittedReason: cached.media.omittedReason,
+                // Passa _src para que enrichMediaForChatwoot possa re-hidratar as chaves
+                // de download mesmo quando o node da mensagem não as contém (leitura do banco).
+                _src: cached.media._src,
+            };
+        }
+    }
+    if (cleaned.message_type === 'reaction' || cleaned.messageType === 'reaction') {
+        const reactionTarget = await resolveReactionTarget(instance, raw);
+        if (reactionTarget) {
+            cleaned.reaction_target = reactionTarget;
+            cleaned.reactionTarget = reactionTarget;
+        }
+    }
+    return cleaned;
+}
+async function normalizeUpsertMessagesForExternal(instance, messages) {
+    // Process each message independently in parallel — each item involves async
+    // media-ensure and reaction-target lookups that are independent across messages.
+    return Promise.all(messages.map((raw) => normalizeSingleMessageForExternal(instance, raw)));
 }
 function ensureInstanceChatMap(instance) {
     let map = chatCache.get(instance);
@@ -1440,7 +1743,11 @@ function updateCachedMessage(instance, payload) {
         lastTimestamp: 0,
         messages: [],
     };
-    const existingMessage = chat.messages.find((message) => message.id === payload.id);
+    // Inicializa o índice por ID na primeira utilização (lazy build O(N) uma vez).
+    if (!chat.messagesById) {
+        chat.messagesById = new Map(chat.messages.map((m) => [m.id, m]));
+    }
+    const existingMessage = chat.messagesById.get(payload.id);
     if (existingMessage) {
         if (payload.senderName)
             existingMessage.senderName = payload.senderName;
@@ -1484,11 +1791,32 @@ function updateCachedMessage(instance, payload) {
         chat.lastMessage = payload.text;
         chat.lastTimestamp = payload.timestamp;
     }
+    // Atualizar title com pushName quando o título atual é apenas o número de telefone.
+    // Só atualiza se a integração Chatwoot da instância tiver importContacts=true.
+    // Nunca usa o pushName de mensagens fromMe (que seria o nome da própria instância).
+    if (payload.senderName &&
+        !payload.fromMe && // pushName de fromMe é o nome da própria instância, não do contato
+        !payload.participant && // não é grupo (participant seria o JID do membro)
+        !payload.jid.endsWith('@g.us') &&
+        !payload.jid.endsWith('@newsletter')) {
+        const _importContactsCfg = getInstanceIntegrations(instance).chatwoot;
+        if (_importContactsCfg?.importContacts === true) {
+            const currentTitle = chat.title || '';
+            const isPhoneOnlyTitle = /^\d+$/.test(currentTitle);
+            if (isPhoneOnlyTitle || !currentTitle) {
+                chat.title = payload.senderName;
+                try {
+                    msUpsertMeta(instance, payload.jid, { title: payload.senderName });
+                }
+                catch { /* best-effort */ }
+            }
+        }
+    }
     const incrementUnread = payload.incrementUnread ?? !payload.fromMe;
     if (incrementUnread) {
         chat.unreadCount += 1;
     }
-    chat.messages.push({
+    const newMsg = {
         id: payload.id,
         fromMe: payload.fromMe,
         text: payload.text,
@@ -1500,7 +1828,17 @@ function updateCachedMessage(instance, payload) {
         media: payload.media,
         contact: payload.contact,
         mediaSource: payload.mediaSource,
-    });
+    };
+    chat.messages.push(newMsg);
+    chat.messagesById?.set(newMsg.id, newMsg);
+    // Sliding window: mantém no máximo maxPerChat mensagens em memória para
+    // evitar crescimento ilimitado do cache em grupos muito ativos.
+    const maxInMem = config.messages.maxPerChat;
+    if (chat.messages.length > maxInMem) {
+        chat.messages = chat.messages.slice(-maxInMem);
+        // Rebuild do índice após o slice para remover entradas expiradas.
+        chat.messagesById = new Map(chat.messages.map((m) => [m.id, m]));
+    }
     chats.set(payload.jid, chat);
     // ── Persistência SQLite ────────────────────────────────────────────────────
     try {
@@ -1513,7 +1851,16 @@ function updateCachedMessage(instance, payload) {
             senderNumber: payload.senderNumber,
             participant: payload.participant,
             quotedMessageId: payload.quotedMessageId,
-            media: payload.media,
+            media: payload.media
+                ? {
+                    ...payload.media,
+                    // Persistir chaves de download para permitir re-download futuro.
+                    // Buffers são serializados como base64 com marker __enc.
+                    ...(payload.mediaSource?.node
+                        ? { _src: serializeMediaSourceNode(payload.mediaSource.node) }
+                        : {}),
+                }
+                : undefined,
             contact: payload.contact,
         });
         if (shouldAdvanceLastMessage) {
@@ -1593,52 +1940,116 @@ function ingestMessagesToCache(instance, rawMessages, options) {
             return !remoteJid.endsWith('@g.us');
         })
         : rawMessages;
+    // Para batches de history sync (que podem ter milhares de mensagens), envolve
+    // tudo em uma única transação SQLite. Sem isso cada upsert vira um fsync
+    // separado e bloqueia o event loop por segundos, derrubando o keepalive do
+    // socket WhatsApp (causa-raiz dos 408 em loop durante a sync inicial).
+    const runIngest = () => {
+        let inserted = 0;
+        for (const msg of list) {
+            const key = (msg.key ?? {});
+            const remoteJid = String(key.remoteJid ?? '').trim();
+            const id = String(key.id ?? '').trim();
+            if (!remoteJid || !id)
+                continue;
+            const message = msg.message;
+            if (isSkippableSystemMessage(message))
+                continue;
+            const timestamp = normalizeTimestamp(msg.messageTimestamp);
+            const text = extractMessageText(message);
+            const sender = extractSender(msg);
+            const mediaMeta = extractMediaMeta(message);
+            const contactMeta = extractContactMeta(message);
+            const mediaFound = findMediaNode(message);
+            const quotedMessageId = extractQuotedMessageId(msg);
+            const wasInserted = updateCachedMessage(instance, {
+                jid: remoteJid,
+                id,
+                fromMe: Boolean(key.fromMe),
+                text,
+                timestamp,
+                incrementUnread: fromHistory ? false : !Boolean(key.fromMe),
+                senderName: sender.senderName,
+                senderNumber: sender.senderNumber,
+                participant: typeof key.participant === 'string' ? key.participant.trim() || undefined : undefined,
+                quotedMessageId,
+                media: mediaMeta
+                    ? {
+                        kind: mediaMeta.kind,
+                        mimeType: mediaMeta.mimeType,
+                        fileName: mediaMeta.fileName,
+                        caption: mediaMeta.caption,
+                        base64: mediaMeta.base64,
+                    }
+                    : undefined,
+                contact: contactMeta ?? undefined,
+                mediaSource: mediaFound ?? undefined,
+            });
+            if (wasInserted)
+                inserted += 1;
+        }
+        return inserted;
+    };
+    // Threshold: para fromHistory >= 20 msgs, ou para qualquer batch >= 100,
+    // vale a pena agrupar em transação (fsync único).
+    const useTransaction = (fromHistory && list.length >= 20) || list.length >= 100;
     let inserted = 0;
-    for (const msg of list) {
-        const key = (msg.key ?? {});
-        const remoteJid = String(key.remoteJid ?? '').trim();
-        const id = String(key.id ?? '').trim();
-        if (!remoteJid || !id)
-            continue;
-        const message = msg.message;
-        if (isSkippableSystemMessage(message))
-            continue;
-        const timestamp = normalizeTimestamp(msg.messageTimestamp);
-        const text = extractMessageText(message);
-        const sender = extractSender(msg);
-        const mediaMeta = extractMediaMeta(message);
-        const contactMeta = extractContactMeta(message);
-        const mediaFound = findMediaNode(message);
-        const quotedMessageId = extractQuotedMessageId(msg);
-        const wasInserted = updateCachedMessage(instance, {
-            jid: remoteJid,
-            id,
-            fromMe: Boolean(key.fromMe),
-            text,
-            timestamp,
-            incrementUnread: fromHistory ? false : !Boolean(key.fromMe),
-            senderName: sender.senderName,
-            senderNumber: sender.senderNumber,
-            participant: typeof key.participant === 'string' ? key.participant.trim() || undefined : undefined,
-            quotedMessageId,
-            media: mediaMeta
-                ? {
-                    kind: mediaMeta.kind,
-                    mimeType: mediaMeta.mimeType,
-                    fileName: mediaMeta.fileName,
-                    caption: mediaMeta.caption,
-                    base64: mediaMeta.base64,
-                }
-                : undefined,
-            contact: contactMeta ?? undefined,
-            mediaSource: mediaFound ?? undefined,
-        });
-        if (wasInserted)
-            inserted += 1;
+    if (useTransaction) {
+        try {
+            inserted = msRunInTransaction(runIngest);
+        }
+        catch (err) {
+            log.whatsapp.child(instance).warn('ingest_transaction_failed_fallback', err);
+            inserted = runIngest();
+        }
+    }
+    else {
+        inserted = runIngest();
     }
     return { list, inserted };
 }
+/**
+ * Versão async chunked de ingest para batches grandes de history sync.
+ * Quebra a lista em pedaços de `chunkSize` e cede ao event loop entre chunks
+ * (`setImmediate`), permitindo que o WebSocket do Baileys leia heartbeats e
+ * envie acks sem ter que esperar o ingest inteiro terminar. Cada chunk roda
+ * em sua própria transação SQLite.
+ *
+ * Use isto em handlers como `messaging-history.set`/`messages.set` que podem
+ * receber milhares de mensagens em um único evento.
+ */
+const HISTORY_INGEST_CHUNK_SIZE = 200;
+function nextTickYield() {
+    return new Promise((resolve) => setImmediate(resolve));
+}
+async function ingestHistoryMessagesChunked(instance, rawMessages) {
+    if (!rawMessages || rawMessages.length === 0) {
+        return { list: [], inserted: 0 };
+    }
+    // Para listas pequenas, usa o caminho síncrono direto (com transaction).
+    if (rawMessages.length <= HISTORY_INGEST_CHUNK_SIZE) {
+        return ingestMessagesToCache(instance, rawMessages, { fromHistory: true });
+    }
+    const aggregatedList = [];
+    let totalInserted = 0;
+    for (let i = 0; i < rawMessages.length; i += HISTORY_INGEST_CHUNK_SIZE) {
+        const chunk = rawMessages.slice(i, i + HISTORY_INGEST_CHUNK_SIZE);
+        const result = ingestMessagesToCache(instance, chunk, { fromHistory: true });
+        aggregatedList.push(...result.list);
+        totalInserted += result.inserted;
+        // Cede ao event loop entre chunks para deixar o socket processar I/O.
+        if (i + HISTORY_INGEST_CHUNK_SIZE < rawMessages.length) {
+            await nextTickYield();
+        }
+    }
+    return { list: aggregatedList, inserted: totalInserted };
+}
 function closeSocket(sock) {
+    // Remove todos os event listeners do socket morto para evitar acúmulo em reconexões.
+    try {
+        sock.ev?.removeAllListeners?.();
+    }
+    catch { /* ignore */ }
     try {
         sock.ws?.close?.();
     }
@@ -1711,26 +2122,45 @@ export async function createInstance(name, authFolder) {
         if (ctx.status === 'qr' && ctx.qr) {
             return { ok: true, instance: name, qr: ctx.qr };
         }
-        // disconnected ou connecting: remove e recria para nova tentativa
-        closeSocket(ctx.sock);
+        // disconnected ou connecting: para intervalos órfãos, remove do Map e fecha socket
+        stopAlwaysOnline(name);
+        stopContinuousHistorySync(name);
         instances.delete(name);
+        reconnectAttempts.delete(name);
+        closeSocket(ctx.sock);
     }
     try {
         const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, fetchLatestWaWebVersion, Browsers, } = await import('baileys');
         const authPath = path.resolve(process.cwd(), authFolder, name);
         let authState = await useMultiFileAuthState(authPath);
-        repairInconsistentOwnSignalSessions(authPath, authState.state.creds);
+        repairInconsistentOwnSignalSessions(authPath, authState.state.creds, name);
+        if (authState.state.creds.registered !== true && isCompletedPairingState(authState.state.creds)) {
+            authState.state.creds.registered = true;
+            await authState.saveCreds().catch((err) => {
+                log.whatsapp.child(name).error('saveCreds_failed_on_boot_registered_normalize', err);
+            });
+        }
         // If the persisted auth is partially populated but not actually registered,
         // it is unusable for both reconnect and fresh QR generation. Reset it here
         // before the socket is created so the next attempt starts from a clean session.
-        if (hasCorruptExistingRegistration(authState.state.creds)) {
+        if (hasCorruptExistingRegistration(name, authState.state.creds)) {
             if (isPairingWindowActive(name) || isAuthRecoveryWindowActive(name)) {
                 log.whatsapp.child(name).warn('auth_corrupt_on_boot adiado — janela de recovery/QR ativa, mantendo auth para reconexão');
             }
             else {
-                log.whatsapp.child(name).warn('auth_corrupt_on_boot — registered=false com identidade existente; resetando auth antes de criar socket');
-                resetInstanceAuthState(authPath);
-                authState = await useMultiFileAuthState(authPath);
+                log.whatsapp.child(name).warn('auth_corrupt_on_boot — registered=false com identidade existente; recovery não destrutivo antes de criar socket');
+                if (maybeResetInstanceAuthState(name, authPath, 'auth_corrupt_on_boot')) {
+                    authState = await useMultiFileAuthState(authPath);
+                }
+                else {
+                    trackLastInstanceState(name, {
+                        status: 'auth_invalid',
+                        wasConnected: false,
+                        stoppedByUser: false,
+                    });
+                    markAutostart(name, false);
+                    return { ok: false, instance: name, error: 'auth_corrupt_requires_manual_repair' };
+                }
             }
         }
         const { state, saveCreds } = authState;
@@ -1772,6 +2202,26 @@ export async function createInstance(name, authFolder) {
             browser: Browsers.windows('Chrome'),
             syncFullHistory: generalSettings.syncFullHistory,
             logger: silentLogger,
+            // Accelerate session cleanup: reduce retries for corrupted sessions (Bad MAC/Counter Error)
+            // Default maxMsgRetryCount is 5; reducing to 2 means corrupted sessions are cleaned faster.
+            maxMsgRetryCount: 2,
+            // Ensure auto session recreation is enabled (default: true, making explicit)
+            enableAutoSessionRecreation: true,
+            // Aumenta keepalive de 15s (default) para 25s para reduzir reconexões espúrias
+            // em redes com latência (Docker bridge, NAT, ISPs com idle-timeout curto).
+            // Cada reconexão dispara reentrega de stanzas pelo WhatsApp, o que causa
+            // Counter Errors (Key already used) em sessões Signal — em especial na sessão
+            // própria do usuário (note-to-self). Reduzir reconexões = reduzir Counter Errors.
+            keepAliveIntervalMs: 25_000,
+            // Ensure corrupted sessions are auto-deleted after retries exhausted (default: true)
+            sessionCleanupConfig: {
+                autoCleanCorrupted: true,
+                enabled: true,
+                cleanupOnStartup: true,
+                secondaryDeviceInactiveDays: 7,
+                primaryDeviceInactiveDays: 30,
+                lidOrphanHours: 24,
+            },
         };
         if (proxyAgentResult.agent) {
             socketOptions.agent = proxyAgentResult.agent;
@@ -1793,7 +2243,9 @@ export async function createInstance(name, authFolder) {
             stoppedByUser: false,
         });
         sock.ev.on('creds.update', (creds) => {
-            void saveCreds();
+            void saveCreds().catch((err) => {
+                log.whatsapp.child(name).error('saveCreds_failed', err);
+            });
             const registered = Boolean(creds?.registered);
             if (registered) {
                 pairingIssuedAt.delete(name);
@@ -1818,6 +2270,12 @@ export async function createInstance(name, authFolder) {
                 ctx.qr = null;
                 authRecoveryIssuedAt.delete(name);
                 reconnectAttempts.set(name, 0);
+                if (state.creds.registered !== true && isCompletedPairingState(state.creds)) {
+                    state.creds.registered = true;
+                    void saveCreds().catch((err) => {
+                        log.whatsapp.child(name).error('saveCreds_failed_after_registered_normalize', err);
+                    });
+                }
                 markAutostart(name, true);
                 trackLastInstanceState(name, {
                     status: 'connected',
@@ -1829,6 +2287,15 @@ export async function createInstance(name, authFolder) {
                 const linkedNumber = linkedJid ? linkedJid.split(':')[0].split('@')[0] : '';
                 ctx.linkedNumber = linkedNumber || null;
                 ctx.profileName = String(currentUser.name ?? '').trim() || null;
+                // Memoize own JID user parts so handleCorruptedSelfSessions avoids
+                // recomputing them on every messages.upsert event.
+                {
+                    const sockTyped = ctx.sock;
+                    const rawPn = String(sockTyped.authState?.creds?.me?.id ?? sockTyped.user?.id ?? '');
+                    const rawLid = String(sockTyped.authState?.creds?.me?.lid ?? sockTyped.user?.lid ?? '');
+                    ctx.ownPnUser = rawPn ? rawPn.split('@')[0].split(':')[0] : undefined;
+                    ctx.ownLidUser = rawLid ? rawLid.split('@')[0].split(':')[0] : undefined;
+                }
                 if (typeof ctx.sock.profilePictureUrl === 'function' && linkedJid) {
                     ctx.sock
                         .profilePictureUrl(linkedJid)
@@ -1845,6 +2312,18 @@ export async function createInstance(name, authFolder) {
                 }
                 startAlwaysOnline(name, ctx);
                 startContinuousHistorySync(name, ctx);
+                // Nota: não chamamos assertSessions para o próprio JID (note-to-self) porque
+                // o WA recusa buscar pre-keys do próprio número. A sessão Signal é reconstruída
+                // automaticamente quando o WA envia novas pre-keys na próxima troca de mensagens.
+                if (forceAppStateResync.has(name)) {
+                    forceAppStateResync.delete(name);
+                    const anySock = ctx.sock;
+                    if (typeof anySock.resyncAppState === 'function') {
+                        void anySock.resyncAppState(['critical_block', 'regular']).catch((err) => {
+                            log.whatsapp.child(name).warn('forced_app_state_resync_failed', err);
+                        });
+                    }
+                }
                 // Auto-create Chatwoot inbox if configured + auto-sync history if Import Messages is enabled.
                 // Wait a few seconds before sync so initial history sync has had time to populate the SQLite store.
                 void (async () => {
@@ -1905,12 +2384,14 @@ export async function createInstance(name, authFolder) {
                     });
                     stopAlwaysOnline(name);
                     stopContinuousHistorySync(name);
+                    // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                     setTimeout(() => {
-                        createInstance(name, folder).catch(() => { });
+                        if (!processShuttingDown)
+                            createInstance(name, folder).catch(() => { });
                     }, 2000);
                     return;
                 }
-                if (hasCorruptExistingRegistration(state.creds)) {
+                if (hasCorruptExistingRegistration(name, state.creds)) {
                     const pairingActive = isPairingWindowActive(name);
                     const recoveryActive = isAuthRecoveryWindowActive(name);
                     const authLikeClose = code === DisconnectReason.loggedOut || code === DisconnectReason.connectionReplaced;
@@ -1933,23 +2414,25 @@ export async function createInstance(name, authFolder) {
                         });
                         stopAlwaysOnline(name);
                         stopContinuousHistorySync(name);
+                        // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                         setTimeout(() => {
-                            createInstance(name, folder).catch(() => { });
+                            if (!processShuttingDown)
+                                createInstance(name, folder).catch(() => { });
                         }, 1200);
                         return;
                     }
                     if (transientConnectedClose) {
+                        // Session was connected — treat as transient disconnect, let normal reconnect logic handle it below.
                         log.whatsapp.child(name).warn(`auth_corrupt adiado após close transitório  code=${String(code ?? 'n/a')}  previousStatus=connected`);
                     }
                     else {
-                        log.whatsapp.child(name).warn(`auth_corrupt — registered=false com identidade existente; resetando auth${pairingActive ? ' e recriando QR' : ''}`);
+                        log.whatsapp.child(name).warn(`auth_corrupt — registered=false com identidade existente; recovery${pairingActive ? ' durante pairing' : ''}`);
                         closeSocket(ctx.sock);
                         reconnectAttempts.delete(name);
-                        markAutostart(name, false);
-                        resetInstanceAuthState(authPath);
+                        const authWasReset = maybeResetInstanceAuthState(name, authPath, 'auth_corrupt_after_close');
                         stopAlwaysOnline(name);
                         stopContinuousHistorySync(name);
-                        if (pairingActive) {
+                        if (pairingActive && authWasReset) {
                             ctx.status = 'connecting';
                             ctx.qr = null;
                             trackLastInstanceState(name, {
@@ -1957,8 +2440,10 @@ export async function createInstance(name, authFolder) {
                                 wasConnected: false,
                                 stoppedByUser: false,
                             });
+                            // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                             setTimeout(() => {
-                                createInstance(name, folder).catch(() => { });
+                                if (!processShuttingDown)
+                                    createInstance(name, folder).catch(() => { });
                             }, 1200);
                         }
                         else {
@@ -1966,7 +2451,7 @@ export async function createInstance(name, authFolder) {
                             trackLastInstanceState(name, {
                                 status: 'disconnected',
                                 wasConnected: false,
-                                stoppedByUser: true,
+                                stoppedByUser: false,
                             });
                             pairingIssuedAt.delete(name);
                         }
@@ -1977,9 +2462,14 @@ export async function createInstance(name, authFolder) {
                     if (isPairingWindowActive(name)) {
                         const folder = ctx.authFolder;
                         const authPath = path.resolve(process.cwd(), folder, name);
-                        log.whatsapp.child(name).warn(`pairing_window_close  code=${String(code)}  resetando auth e recriando QR`);
+                        log.whatsapp.child(name).warn(`pairing_window_close  code=${String(code)}  destructive_recovery=${String(config.whatsapp.autoResetCorruptAuth)}`);
                         closeSocket(ctx.sock);
-                        resetInstanceAuthState(authPath);
+                        stopAlwaysOnline(name);
+                        stopContinuousHistorySync(name);
+                        const authWasReset = maybeResetInstanceAuthState(name, authPath, 'pairing_window_close');
+                        if (!authWasReset) {
+                            log.whatsapp.child(name).warn(`pairing_window_close  preserve_auth_and_reconnect  code=${String(code)}`);
+                        }
                         ctx.status = 'connecting';
                         ctx.qr = null;
                         reconnectAttempts.set(name, 0);
@@ -1988,10 +2478,10 @@ export async function createInstance(name, authFolder) {
                             wasConnected: false,
                             stoppedByUser: false,
                         });
-                        stopAlwaysOnline(name);
-                        stopContinuousHistorySync(name);
+                        // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                         setTimeout(() => {
-                            createInstance(name, folder).catch(() => { });
+                            if (!processShuttingDown)
+                                createInstance(name, folder).catch(() => { });
                         }, 1200);
                         return;
                     }
@@ -2009,8 +2499,10 @@ export async function createInstance(name, authFolder) {
                             status: 'connecting',
                             stoppedByUser: false,
                         });
+                        // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                         setTimeout(() => {
-                            createInstance(name, folder).catch(() => { });
+                            if (!processShuttingDown)
+                                createInstance(name, folder).catch(() => { });
                         }, delayMs);
                         return;
                     }
@@ -2019,9 +2511,9 @@ export async function createInstance(name, authFolder) {
                     reconnectAttempts.delete(name);
                     markAutostart(name, false);
                     trackLastInstanceState(name, {
-                        status: 'disconnected',
+                        status: 'auth_invalid',
                         wasConnected: false,
-                        stoppedByUser: true,
+                        stoppedByUser: false,
                     });
                     chatCache.delete(name);
                     clearInstanceMediaBinaries(name, true);
@@ -2030,7 +2522,29 @@ export async function createInstance(name, authFolder) {
                     return;
                 }
                 // For transient closes (timeout/network/stream), only auto-recreate if it was already connected.
+                // Exception: code=408 (QR expired) while in QR mode but auth files exist means
+                // the session was previously established — auto-regenerate QR instead of giving up.
                 if (previousStatus !== 'connected') {
+                    if (code === 408) {
+                        const folder = ctx.authFolder;
+                        const authPath = path.resolve(process.cwd(), folder, name);
+                        let hasAuthFiles = false;
+                        try {
+                            hasAuthFiles = fs.readdirSync(authPath).length > 0;
+                        }
+                        catch { /* ignore */ }
+                        if (hasAuthFiles) {
+                            log.whatsapp.child(name).info(`qr_expired_retry — auth existe, recriando QR  code=${String(code)}`);
+                            closeSocket(ctx.sock);
+                            ctx.status = 'connecting';
+                            ctx.qr = null;
+                            trackLastInstanceState(name, { status: 'connecting', stoppedByUser: false });
+                            // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
+                            setTimeout(() => { if (!processShuttingDown)
+                                createInstance(name, folder).catch(() => { }); }, 2000);
+                            return;
+                        }
+                    }
                     return;
                 }
                 const attempts = (reconnectAttempts.get(name) ?? 0) + 1;
@@ -2048,12 +2562,22 @@ export async function createInstance(name, authFolder) {
                     });
                     stopAlwaysOnline(name);
                     stopContinuousHistorySync(name);
+                    // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
                     setTimeout(() => {
-                        createInstance(name, folder).catch(() => { });
+                        if (!processShuttingDown)
+                            createInstance(name, folder).catch(() => { });
                     }, delayMs);
                 }
                 else {
                     log.whatsapp.child(name).error(`reconnect_exhausted — esgotadas ${attempts} tentativas de reconexão, instância desconectada`);
+                    // Cleanup completo: remover do Map, parar intervalos, atualizar estado persistido.
+                    // Sem cleanup, o socket morto e os intervalos ficam em memória indefinidamente.
+                    stopAlwaysOnline(name);
+                    stopContinuousHistorySync(name);
+                    closeSocket(ctx.sock);
+                    instances.delete(name);
+                    reconnectAttempts.delete(name);
+                    trackLastInstanceState(name, { status: 'disconnected', wasConnected: false, stoppedByUser: false });
                 }
             }
         }));
@@ -2062,6 +2586,53 @@ export async function createInstance(name, authFolder) {
             const originalList = Array.isArray(data.messages) ? data.messages : [];
             const ingested = ingestMessagesToCache(name, originalList, { fromHistory: false });
             const list = ingested.list;
+            // Detecta mensagens que falharam descriptografia (CIPHERTEXT stub) na própria
+            // sessão Signal do usuário (note-to-self) ou em sessões com Counter Error
+            // recorrente, e dispara cleanup imediato dessa sessão para forçar
+            // renegociação. Sem isso, o Baileys aguarda maxMsgRetryCount (2) tentativas
+            // antes de limpar — o que gera spam de logs "Counter Error" e mantém a
+            // sessão quebrada por mais tempo.
+            void handleCorruptedSelfSessions(name, ctx, list).catch((err) => {
+                log.whatsapp.child(name).warn('handleCorruptedSelfSessions_failed', err);
+            });
+            // Resolver títulos de JIDs @lid via lidMapping → nome do contato, quando importContacts=true
+            void (async () => {
+                try {
+                    const lidMapping = ctx.sock?.signalRepository?.lidMapping;
+                    if (!lidMapping?.getPNForLID)
+                        return;
+                    const importContactsEnabled = getInstanceIntegrations(name).chatwoot?.importContacts === true;
+                    if (!importContactsEnabled)
+                        return;
+                    const store = ctx.sock?.store?.contacts;
+                    // Cachear fora do loop para evitar O(N_chats × N_msgs) por upsert
+                    const chatList = getInstanceChatList(name);
+                    const chatListByJid = new Map(chatList.map((c) => [c.jid, c]));
+                    for (const msg of list) {
+                        const msgJid = String(msg.jid ?? '');
+                        if (!msgJid.endsWith('@lid'))
+                            continue;
+                        const existing = chatListByJid.get(msgJid);
+                        if (existing?.title && !/^\d+$/.test(existing.title))
+                            continue; // já tem nome real
+                        const pn = await lidMapping.getPNForLID(msgJid).catch(() => null);
+                        if (!pn)
+                            continue;
+                        const pnUser = String(pn).split('@')[0].split(':')[0];
+                        if (!pnUser || !/^\d+$/.test(pnUser))
+                            continue;
+                        const pnJid = `${pnUser}@s.whatsapp.net`;
+                        const contact = store?.[pnJid] ?? store?.[msgJid];
+                        const name_ = String(contact?.verifiedName || contact?.name || contact?.notify || msg.senderName || '').trim();
+                        if (name_ && !/^\d+$/.test(name_) && name_ !== pnUser) {
+                            upsertCachedChatMeta(name, { jid: msgJid, title: name_ });
+                            // Atualizar também o JID PN se existir no cache
+                            upsertCachedChatMeta(name, { jid: pnJid, title: name_ });
+                        }
+                    }
+                }
+                catch { /* best-effort */ }
+            })();
             if (list.length > 0) {
                 (async () => {
                     const enrichedList = await enrichIncomingMediaBase64(list);
@@ -2131,35 +2702,56 @@ export async function createInstance(name, authFolder) {
         sock.ev.on('messages.set', (payload) => {
             const data = (payload ?? {});
             const originalList = Array.isArray(data.messages) ? data.messages : [];
-            const ingested = ingestMessagesToCache(name, originalList, { fromHistory: true });
-            if (ingested.list.length > 0) {
-                void emitInstanceEvent(name, 'MESSAGES_SET', {
-                    ...(typeof payload === 'object' && payload !== null ? payload : {}),
-                    messages: ingested.list,
-                });
-            }
+            // Ingest chunked + async para não bloquear o event loop em syncs grandes.
+            void ingestHistoryMessagesChunked(name, originalList).then((ingested) => {
+                if (ingested.list.length > 0) {
+                    void emitInstanceEvent(name, 'MESSAGES_SET', {
+                        ...(typeof payload === 'object' && payload !== null ? payload : {}),
+                        messages: ingested.list,
+                    });
+                }
+            }).catch((err) => {
+                log.whatsapp.child(name).warn('messages_set_ingest_failed', err);
+            });
         });
         sock.ev.on('messaging-history.set', (payload) => {
             const data = (payload ?? {});
             const settings = getInstanceGeneral(name);
             const chats = Array.isArray(data.chats) ? data.chats : [];
-            for (const item of chats) {
-                const jid = String(item.id ?? item.jid ?? '').trim();
-                if (!jid)
-                    continue;
-                if (settings.ignoreGroups && jid.endsWith('@g.us'))
-                    continue;
-                upsertCachedChatMeta(name, {
-                    jid,
-                    title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
-                });
+            // Agrupa upsert de chat_meta em uma única transação (mesmo problema:
+            // sem isso cada chat vira um fsync em série).
+            if (chats.length > 0) {
+                try {
+                    msRunInTransaction(() => {
+                        for (const item of chats) {
+                            const jid = String(item.id ?? item.jid ?? '').trim();
+                            if (!jid)
+                                continue;
+                            if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                                continue;
+                            upsertCachedChatMeta(name, {
+                                jid,
+                                title: extractChatTitleFromPayload(item),
+                                timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
+                            });
+                        }
+                    });
+                }
+                catch (err) {
+                    log.whatsapp.child(name).warn('history_chats_ingest_failed', err);
+                }
             }
             const originalList = Array.isArray(data.messages) ? data.messages : [];
-            const ingested = ingestMessagesToCache(name, originalList, { fromHistory: true });
-            if (ingested.list.length > 0) {
-                void emitInstanceEvent(name, 'MESSAGES_SET', { payload: { messages: ingested.list } });
-            }
+            // Ingest chunked + async para não bloquear o event loop. Esse handler
+            // tipicamente recebe centenas/milhares de mensagens — sem o chunking,
+            // o keepalive estoura e a conexão cai (408), reiniciando a sync em loop.
+            void ingestHistoryMessagesChunked(name, originalList).then((ingested) => {
+                if (ingested.list.length > 0) {
+                    void emitInstanceEvent(name, 'MESSAGES_SET', { payload: { messages: ingested.list } });
+                }
+            }).catch((err) => {
+                log.whatsapp.child(name).warn('messaging_history_set_ingest_failed', err);
+            });
             if (chats.length > 0) {
                 void emitInstanceEvent(name, 'CHATS_SET', { payload: { chats } });
             }
@@ -2176,66 +2768,172 @@ export async function createInstance(name, authFolder) {
             void emitInstanceEvent(name, 'CHATS_UPDATE', { payload });
             const settings = getInstanceGeneral(name);
             const updates = Array.isArray(payload) ? payload : [];
-            for (const item of updates) {
-                const jid = String(item.id ?? item.jid ?? '').trim();
-                if (!jid)
-                    continue;
-                if (settings.ignoreGroups && jid.endsWith('@g.us'))
-                    continue;
-                upsertCachedChatMeta(name, {
-                    jid,
-                    title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
-                });
+            const doChatsUpdate = () => {
+                for (const item of updates) {
+                    const jid = String(item.id ?? item.jid ?? '').trim();
+                    if (!jid)
+                        continue;
+                    if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                        continue;
+                    upsertCachedChatMeta(name, {
+                        jid,
+                        title: extractChatTitleFromPayload(item),
+                        timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
+                    });
+                }
+            };
+            if (updates.length >= 5) {
+                try {
+                    msRunInTransaction(doChatsUpdate);
+                }
+                catch {
+                    doChatsUpdate();
+                }
+            }
+            else {
+                doChatsUpdate();
             }
         });
         sock.ev.on('groups.update', (payload) => {
             emitWebhookEvent('groups.update', { instance: name, payload }, name);
             void emitInstanceEvent(name, 'GROUP_UPDATE', { payload });
+            // Persistir subject atualizado no chat_meta quando o nome do grupo muda
+            const updates = Array.isArray(payload) ? payload : [];
+            for (const item of updates) {
+                const jid = String(item.id ?? '').trim();
+                const subject = String(item.subject ?? '').trim();
+                if (jid && subject) {
+                    upsertCachedChatMeta(name, { jid, title: subject });
+                }
+            }
         });
         sock.ev.on('chats.set', (payload) => {
             void emitInstanceEvent(name, 'CHATS_SET', { payload });
             const settings = getInstanceGeneral(name);
             const data = (payload ?? {});
             const chats = Array.isArray(data.chats) ? data.chats : [];
-            for (const item of chats) {
-                const jid = String(item.id ?? item.jid ?? '').trim();
-                if (!jid)
-                    continue;
-                if (settings.ignoreGroups && jid.endsWith('@g.us'))
-                    continue;
-                upsertCachedChatMeta(name, {
-                    jid,
-                    title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
-                });
+            const doChatsSet = () => {
+                for (const item of chats) {
+                    const jid = String(item.id ?? item.jid ?? '').trim();
+                    if (!jid)
+                        continue;
+                    if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                        continue;
+                    upsertCachedChatMeta(name, {
+                        jid,
+                        title: extractChatTitleFromPayload(item),
+                        timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
+                    });
+                }
+            };
+            if (chats.length >= 5) {
+                try {
+                    msRunInTransaction(doChatsSet);
+                }
+                catch {
+                    doChatsSet();
+                }
+            }
+            else {
+                doChatsSet();
             }
         });
         sock.ev.on('chats.upsert', (payload) => {
             void emitInstanceEvent(name, 'CHATS_UPSERT', { payload });
             const settings = getInstanceGeneral(name);
             const list = Array.isArray(payload) ? payload : [];
-            for (const item of list) {
-                const jid = String(item.id ?? item.jid ?? '').trim();
-                if (!jid)
-                    continue;
-                if (settings.ignoreGroups && jid.endsWith('@g.us'))
-                    continue;
-                upsertCachedChatMeta(name, {
-                    jid,
-                    title: extractChatTitleFromPayload(item),
-                    timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
-                });
+            const doChatsUpsert = () => {
+                for (const item of list) {
+                    const jid = String(item.id ?? item.jid ?? '').trim();
+                    if (!jid)
+                        continue;
+                    if (settings.ignoreGroups && jid.endsWith('@g.us'))
+                        continue;
+                    upsertCachedChatMeta(name, {
+                        jid,
+                        title: extractChatTitleFromPayload(item),
+                        timestamp: normalizeTimestampOrZero(item.conversationTimestamp),
+                    });
+                }
+            };
+            if (list.length >= 5) {
+                try {
+                    msRunInTransaction(doChatsUpsert);
+                }
+                catch {
+                    doChatsUpsert();
+                }
+            }
+            else {
+                doChatsUpsert();
             }
         });
         sock.ev.on('contacts.set', (payload) => {
             void emitInstanceEvent(name, 'CONTACTS_SET', { payload });
+            // Persistir nomes dos contatos no chat_meta apenas se importContacts=true
+            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
+                return;
+            const data = (payload ?? {});
+            const contacts = Array.isArray(data.contacts) ? data.contacts : [];
+            if (contacts.length > 0) {
+                try {
+                    msRunInTransaction(() => {
+                        for (const c of contacts) {
+                            const jid = String(c.id ?? '').trim();
+                            if (!jid)
+                                continue;
+                            const title = extractChatTitleFromPayload(c);
+                            if (title && title !== jid.split('@')[0]) {
+                                upsertCachedChatMeta(name, { jid, title });
+                            }
+                        }
+                    });
+                }
+                catch (err) {
+                    log.whatsapp.child(name).warn('contacts_set_meta_failed', err);
+                }
+            }
         });
         sock.ev.on('contacts.update', (payload) => {
             void emitInstanceEvent(name, 'CONTACTS_UPDATE', { payload });
+            // Atualizar nomes dos contatos no chat_meta apenas se importContacts=true
+            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
+                return;
+            const updates = Array.isArray(payload) ? payload : [];
+            for (const c of updates) {
+                const jid = String(c.id ?? '').trim();
+                if (!jid)
+                    continue;
+                const title = extractChatTitleFromPayload(c);
+                if (title && title !== jid.split('@')[0]) {
+                    upsertCachedChatMeta(name, { jid, title });
+                }
+            }
         });
         sock.ev.on('contacts.upsert', (payload) => {
             void emitInstanceEvent(name, 'CONTACTS_UPSERT', { payload });
+            // Persistir nomes dos contatos no chat_meta apenas se importContacts=true
+            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
+                return;
+            const contacts = Array.isArray(payload) ? payload : [];
+            if (contacts.length > 0) {
+                try {
+                    msRunInTransaction(() => {
+                        for (const c of contacts) {
+                            const jid = String(c.id ?? '').trim();
+                            if (!jid)
+                                continue;
+                            const title = extractChatTitleFromPayload(c);
+                            if (title && title !== jid.split('@')[0]) {
+                                upsertCachedChatMeta(name, { jid, title });
+                            }
+                        }
+                    });
+                }
+                catch (err) {
+                    log.whatsapp.child(name).warn('contacts_upsert_meta_failed', err);
+                }
+            }
         });
         sock.ev.on('groups.upsert', (payload) => {
             void emitInstanceEvent(name, 'GROUPS_UPSERT', { payload });
@@ -2311,6 +3009,7 @@ export async function requestInstancePairingCode(name, phoneNumber) {
             return { ok: false, error: 'pairing_code_not_supported' };
         }
         try {
+            pairingIssuedAt.set(name, Date.now());
             const pairingCode = await requestPairingCode(phoneNumber);
             const code = String(pairingCode ?? '').trim();
             if (code) {
@@ -2350,9 +3049,15 @@ export function disconnectInstance(name, options) {
     const ctx = instances.get(name);
     if (!ctx)
         return false;
-    closeSocket(ctx.sock);
+    // Captura o status ANTES de fechar o socket — closeSocket() pode disparar
+    // connection.update síncronamente e sobrescrever lastInstanceState com 'disconnected'.
+    const statusBeforeClose = ctx.status;
+    // Remove do Map ANTES de fechar o socket para que o guard `instances.get(name) !== ctx`
+    // no handler connection.update detecte o socket como "stale" e retorne sem sobrescrever
+    // o lastInstanceState com 'disconnected'.
     instances.delete(name);
     reconnectAttempts.delete(name);
+    closeSocket(ctx.sock);
     if (!options?.keepAutostart) {
         markAutostart(name, false);
         trackLastInstanceState(name, {
@@ -2364,10 +3069,10 @@ export function disconnectInstance(name, options) {
     else {
         // keepAutostart=true é usado no shutdown gracioso — preserva o status atual
         // (connected/qr/connecting) para que o autoconnect funcione no próximo boot.
-        // Apenas marca stoppedByUser=false sem mudar o status.
-        const currentStatus = lastInstanceState.get(name)?.status ?? ctx.status;
+        // Usa statusBeforeClose (capturado antes do closeSocket) para não sofrer race
+        // com o evento connection.update que marca 'disconnected' ao fechar o socket.
         trackLastInstanceState(name, {
-            status: currentStatus,
+            status: statusBeforeClose,
             stoppedByUser: false,
         });
     }
@@ -2432,6 +3137,79 @@ export async function logoutInstance(name, authFolder) {
 /**
  * Remove a instância (fecha socket e remove do mapa). Não apaga credenciais.
  */
+/**
+ * Repara sessões Signal corrompidas de uma instância.
+ * Remove arquivos de sessão de contatos específicos (ou todos) e reinicia a instância.
+ * Útil quando ocorrem erros "Decryption Failed" / "Session Error" repetidos.
+ */
+export async function repairInstanceSessions(name, authFolder) {
+    const normalizedName = String(name ?? '').trim();
+    if (!isValidInstanceName(normalizedName)) {
+        return { ok: false, deleted: 0, restarted: false, error: 'invalid_instance_name' };
+    }
+    const authPath = path.resolve(process.cwd(), authFolder, normalizedName);
+    if (!fs.existsSync(authPath)) {
+        return { ok: false, deleted: 0, restarted: false, error: 'auth_path_not_found' };
+    }
+    let deleted = 0;
+    const ctx = getInstance(normalizedName);
+    const readOwnPrefixes = () => {
+        try {
+            const credsRaw = fs.readFileSync(path.join(authPath, 'creds.json'), 'utf8');
+            const creds = JSON.parse(credsRaw);
+            return {
+                ownLidPrefix: extractOwnLidPrefix(creds),
+                ownPhonePrefix: extractOwnPhonePrefix(creds),
+            };
+        }
+        catch {
+            return { ownLidPrefix: '', ownPhonePrefix: '' };
+        }
+    };
+    const ownFromCreds = readOwnPrefixes();
+    const currentUser = (ctx?.sock?.user ?? {});
+    const ownLidPrefix = String(currentUser.lid ?? '').trim().split(':')[0].split('@')[0] || ownFromCreds.ownLidPrefix;
+    const ownPhonePrefix = String(currentUser.id ?? '').trim().split(':')[0].split('@')[0] || ownFromCreds.ownPhonePrefix;
+    try {
+        const entries = fs.readdirSync(authPath, { withFileTypes: true });
+        // Remove todos os arquivos de sessão Signal de outros contatos/dispositivos:
+        // session-<jid>.json, sender-key-<group>--<jid>--<idx>.json, tctoken-<lid>@lid.json
+        const SESSION_RE = /^session-(?!creds).*\.json$/;
+        const SENDER_KEY_RE = /^sender-key-.*\.json$/;
+        const TCTOKEN_RE = /^tctoken-.*@lid\.json$/;
+        const ownLidMappingReverse = ownLidPrefix ? `lid-mapping-${ownLidPrefix}_reverse.json` : '';
+        const ownPhoneMapping = ownPhonePrefix ? `lid-mapping-${ownPhonePrefix}.json` : '';
+        for (const entry of entries) {
+            if (!entry.isFile())
+                continue;
+            const { name: fileName } = entry;
+            const isOwnMapping = fileName === ownLidMappingReverse || fileName === ownPhoneMapping;
+            if (!SESSION_RE.test(fileName) && !SENDER_KEY_RE.test(fileName) && !TCTOKEN_RE.test(fileName) && !isOwnMapping)
+                continue;
+            try {
+                fs.unlinkSync(path.join(authPath, fileName));
+                deleted += 1;
+            }
+            catch {
+                // ignora falhas individuais
+            }
+        }
+        log.whatsapp.child(normalizedName).warn(`repair_sessions  deleted=${deleted} session/sender-key/tctoken files`);
+    }
+    catch (err) {
+        log.whatsapp.child(normalizedName).error('repair_sessions  falha ao ler diretório de auth', err);
+        return { ok: false, deleted, restarted: false, error: 'read_auth_dir_failed' };
+    }
+    // Reinicia a instância para recarregar auth state sem chaves antigas em memória
+    let restarted = false;
+    if (ctx) {
+        forceAppStateResync.add(normalizedName);
+        disconnectInstance(normalizedName, { keepAutostart: true });
+        const recreated = await createInstance(normalizedName, authFolder);
+        restarted = recreated.ok;
+    }
+    return { ok: true, deleted, restarted };
+}
 export function removeInstance(name) {
     const removed = disconnectInstance(name);
     if (removed)
@@ -2677,7 +3455,10 @@ function buildQuotedMessage(name, jid, replyToId) {
     // Only quote messages that are already present in the live in-memory chat cache.
     // Quoting older/stale SQLite-only messages tends to produce a temporary
     // "Aguardando mensagem" placeholder on the device.
-    const target = chatCache.get(name)?.get(jid)?.messages.find((item) => item.id === replyToId);
+    const chat = chatCache.get(name)?.get(jid);
+    const target = chat
+        ? (chat.messagesById?.get(replyToId) ?? chat.messages.find((item) => item.id === replyToId))
+        : undefined;
     if (!target)
         return null;
     let message;
@@ -2816,7 +3597,7 @@ export async function syncInstanceChatHistory(name, jid, options) {
             done = true;
             break;
         }
-        const result = ingestMessagesToCache(name, raw, { fromHistory: true });
+        const result = await ingestHistoryMessagesChunked(name, raw);
         imported += result.inserted;
         batches += 1;
         if (result.inserted === 0) {
@@ -2888,7 +3669,21 @@ export async function applyReadSettingsToCachedMessages(name) {
  * Send a plain-text message via an active WhatsApp instance.
  * Used by the Chatwoot webhook handler to reply from Chatwoot to WhatsApp.
  */
+// Regex permissivo para JIDs válidos do WhatsApp:
+// - Individual: dígitos@s.whatsapp.net
+// - Grupo: dígitos-dígitos@g.us
+// - LID: dígitos@lid
+// - Newsletter: dígitos@newsletter
+const VALID_JID_RE = /^[\d-]+@(s\.whatsapp\.net|g\.us|lid|newsletter|broadcast)$/;
+/**
+ * Valida formato básico de JID para evitar injeção de JID arbitrário.
+ */
+function isValidJid(jid) {
+    return VALID_JID_RE.test(jid);
+}
 export async function sendInstanceTextMessage(name, jid, text, options) {
+    if (!isValidJid(jid))
+        return { ok: false, error: 'invalid_jid' };
     const ctx = instances.get(name);
     if (!ctx || !ctx.sock)
         return { ok: false, error: 'instance_not_found' };
@@ -2900,21 +3695,23 @@ export async function sendInstanceTextMessage(name, jid, text, options) {
         const quoted = options?.replyToId ? buildQuotedMessage(name, jid, options.replyToId) : undefined;
         const sent = await ctx.sock.sendMessage(jid, { text: finalText }, quoted ? { quoted } : undefined);
         const msgId = sent?.key?.id;
-        if (msgId) {
-            markChatwootOriginated(msgId);
-            // Persistently mark Chatwoot-originated outbound messages so history sync
-            // never sends them back into Chatwoot after TTL expiry or process restart.
-            markMessageSynced(name, msgId, 0);
-            updateCachedMessage(name, {
-                jid,
-                id: msgId,
-                fromMe: true,
-                text: finalText,
-                timestamp: Date.now(),
-                quotedMessageId: options?.replyToId,
-            });
+        // Se o Baileys não retornou um msgId, o envio não foi confirmado — retorna erro.
+        if (!msgId) {
+            return { ok: false, error: 'send_no_ack' };
         }
-        return { ok: true, id: msgId ?? undefined };
+        markChatwootOriginated(msgId);
+        // Persistently mark Chatwoot-originated outbound messages so history sync
+        // never sends them back into Chatwoot after TTL expiry or process restart.
+        markMessageSynced(name, msgId, 0);
+        updateCachedMessage(name, {
+            jid,
+            id: msgId,
+            fromMe: true,
+            text: finalText,
+            timestamp: Date.now(),
+            quotedMessageId: options?.replyToId,
+        });
+        return { ok: true, id: msgId };
     }
     catch (err) {
         return { ok: false, error: String(err) };
@@ -2955,11 +3752,21 @@ async function fetchMediaToBuffer(mediaUrl) {
     // HTTP(S) — usa fetch nativo (Node 20+). Sem auth: o Chatwoot expõe data_url
     // por endpoint público assinado por padrão (ActiveStorage / S3 / etc.).
     // O AbortController cobre tanto o handshake/headers quanto o download do body.
+    // Validação de segurança: bloqueia SSRF para redes privadas/internas.
+    // Permite private network apenas se ALLOW_PRIVATE_NETWORK_INTEGRATIONS=true
+    // (mesmo flag usado para integrações como n8n).
+    const urlValidation = validateOutboundUrl(mediaUrl, {
+        allowPrivateNetwork: config.security.allowPrivateNetworkIntegrations,
+    });
+    if (!urlValidation.ok) {
+        return { error: `media_url_blocked: ${urlValidation.error}` };
+    }
+    const safeMediaUrl = urlValidation.normalizedUrl ?? mediaUrl;
     let response;
     const controller = new AbortController();
     const fetchTimeout = setTimeout(() => controller.abort(), 60_000);
     try {
-        response = await fetch(mediaUrl, { signal: controller.signal });
+        response = await fetch(safeMediaUrl, { signal: controller.signal });
         if (!response.ok) {
             clearTimeout(fetchTimeout);
             return { error: `media_fetch_status_${response.status}` };
@@ -2986,6 +3793,8 @@ async function fetchMediaToBuffer(mediaUrl) {
  * de download silencioso quando a URL exige headers/cookies.
  */
 export async function sendInstanceMediaMessage(name, jid, params) {
+    if (!isValidJid(jid))
+        return { ok: false, error: 'invalid_jid' };
     const ctx = instances.get(name);
     if (!ctx || !ctx.sock)
         return { ok: false, error: 'instance_not_found' };
@@ -3005,7 +3814,10 @@ export async function sendInstanceMediaMessage(name, jid, params) {
         const sendAsVoiceNote = shouldSendAsVoiceNote(mime, params.fileName);
         let content;
         let needsAudioCaptionFallback = false;
-        if (mime.startsWith('image/')) {
+        if (mime === 'image/webp') {
+            content = { sticker: fetched.buffer };
+        }
+        else if (mime.startsWith('image/')) {
             content = { image: fetched.buffer, mimetype: mime, caption: signedCaption };
         }
         else if (mime.startsWith('video/')) {
@@ -3025,56 +3837,65 @@ export async function sendInstanceMediaMessage(name, jid, params) {
                 caption: signedCaption,
             };
         }
+        if (needsAudioCaptionFallback) {
+            const textResult = await sendInstanceTextMessage(name, jid, rawCaption, {
+                replyToId: params.replyToId,
+                agentName: params.agentName,
+                signDelimiter: params.signDelimiter,
+            });
+            if (!textResult.ok) {
+                log.whatsapp.child(name).warn(`audio caption fallback falhou antes da mídia para jid=${jid}: ${textResult.error || 'failed_to_send_text'}`);
+            }
+        }
         const quoted = params.replyToId ? buildQuotedMessage(name, jid, params.replyToId) : undefined;
         const sent = await ctx.sock.sendMessage(jid, content, quoted ? { quoted } : undefined);
         const msgId = sent?.key?.id;
-        if (msgId) {
-            markChatwootOriginated(msgId);
-            // Persistently mark Chatwoot-originated outbound messages so history sync
-            // never sends them back into Chatwoot after TTL expiry or process restart.
-            markMessageSynced(name, msgId, 0);
-            const mediaKind = mime === 'image/webp'
-                ? 'sticker'
-                : mime.startsWith('image/')
-                    ? 'image'
-                    : mime.startsWith('video/')
-                        ? 'video'
-                        : mime.startsWith('audio/')
-                            ? 'audio'
-                            : 'document';
-            const persistedText = mediaKind === 'audio'
-                ? '[audio]'
-                : (signedCaption || `[${mediaKind}]`);
-            updateCachedMessage(name, {
-                jid,
-                id: msgId,
-                fromMe: true,
-                text: persistedText,
-                timestamp: Date.now(),
-                quotedMessageId: params.replyToId,
-                media: {
-                    kind: mediaKind,
-                    mimeType: mime,
-                    fileName: params.fileName,
-                    caption: signedCaption || undefined,
-                    bytes: fetched.buffer.length,
-                },
-            });
-            if (needsAudioCaptionFallback) {
-                const textResult = await sendInstanceTextMessage(name, jid, rawCaption, {
-                    replyToId: params.replyToId,
-                    agentName: params.agentName,
-                    signDelimiter: params.signDelimiter,
-                });
-                if (!textResult.ok) {
-                    log.whatsapp.child(name).warn(`audio caption fallback falhou para msgId=${msgId}: ${textResult.error || 'failed_to_send_text'}`);
-                }
-            }
+        // Se o Baileys não retornou um msgId, o envio não foi confirmado — retorna erro.
+        if (!msgId) {
+            return { ok: false, error: 'send_no_ack' };
         }
-        return { ok: true, id: msgId ?? undefined };
+        markChatwootOriginated(msgId);
+        // Persistently mark Chatwoot-originated outbound messages so history sync
+        // never sends them back into Chatwoot after TTL expiry or process restart.
+        markMessageSynced(name, msgId, 0);
+        const mediaKind = mime === 'image/webp'
+            ? 'sticker'
+            : mime.startsWith('image/')
+                ? 'image'
+                : mime.startsWith('video/')
+                    ? 'video'
+                    : mime.startsWith('audio/')
+                        ? 'audio'
+                        : 'document';
+        const persistedText = mediaKind === 'audio'
+            ? '[audio]'
+            : (signedCaption || `[${mediaKind}]`);
+        // Persiste base64 da mídia enviada diretamente — evita a necessidade de
+        // re-download via downloadContentFromMessage (que exige mediaKey/url do WA).
+        // Para note-to-self e casos onde o WA não consegue reencriptar, o base64
+        // inline garante que o Chatwoot receba a mídia corretamente.
+        const sentBase64 = fetched.buffer.length <= config.chatwoot.mediaMaxBytes
+            ? fetched.buffer.toString('base64')
+            : undefined;
+        updateCachedMessage(name, {
+            jid,
+            id: msgId,
+            fromMe: true,
+            text: persistedText,
+            timestamp: Date.now(),
+            quotedMessageId: params.replyToId,
+            media: {
+                kind: mediaKind,
+                mimeType: mime,
+                fileName: params.fileName,
+                caption: signedCaption || undefined,
+                bytes: fetched.buffer.length,
+                base64: sentBase64,
+            },
+        });
+        return { ok: true, id: msgId };
     }
     catch (err) {
         return { ok: false, error: String(err) };
     }
 }
-//# sourceMappingURL=whatsapp.js.map

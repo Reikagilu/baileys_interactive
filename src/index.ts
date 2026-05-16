@@ -4,14 +4,11 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
 import swaggerUiDist from 'swagger-ui-dist';
-// These routers still live as the real implementation under dist/routes.
-// Importing them directly here keeps `tsx src/index.ts` and future builds using
-// the working handlers instead of the stub files that remain in src/routes.
-import instancesRouter from '../dist/routes/instances.js';
-import messagesRouter from '../dist/routes/messages.js';
-import webhooksRouter from '../dist/routes/webhooks.js';
-import chatsRouter from '../dist/routes/chats.js';
-import opsRouter from '../dist/routes/ops.js';
+import instancesRouter from './routes/instances.js';
+import messagesRouter from './routes/messages.js';
+import webhooksRouter from './routes/webhooks.js';
+import chatsRouter from './routes/chats.js';
+import opsRouter from './routes/ops.js';
 import integrationsRouter from './routes/integrations.js';
 import { openApiSpec } from './docs/openapi.js';
 import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
@@ -32,10 +29,22 @@ import { startMessageCleanupJob, stopMessageCleanupJob } from './services/messag
 function extractChatwootSourceIds(payload: ChatwootWebhookPayload): string[] {
   const attrs = payload.content_attributes ?? {};
   const candidates = new Set<string>();
+  // Os stores internos (`isChatwootOriginated`, `isMessageSynced`) são populados
+  // com o `key.id` puro do Baileys (sem prefixo). Mas o Chatwoot devolve o
+  // source_id como "WAID:<id>" (formato compatível com EvolutionAPI). Para que
+  // a deduplicação anti-loop funcione em qualquer formato, adicionamos AMBAS
+  // as variantes (com e sem prefixo) ao Set sempre que possível.
   const add = (value: unknown) => {
     if (typeof value !== 'string') return;
     const trimmed = value.trim();
-    if (trimmed) candidates.add(trimmed);
+    if (!trimmed) return;
+    candidates.add(trimmed);
+    if (trimmed.startsWith('WAID:')) {
+      const stripped = trimmed.slice(5).trim();
+      if (stripped) candidates.add(stripped);
+    } else {
+      candidates.add(`WAID:${trimmed}`);
+    }
   };
 
   add(payload.source_id);
@@ -124,6 +133,15 @@ app.set('trust proxy', config.security.trustProxy);
 type RateEntry = { count: number; resetAt: number };
 const rateBuckets = new Map<string, RateEntry>();
 
+// Cleanup periódico para evitar crescimento ilimitado do Map sob spray de IPs.
+// O intervalo de 60s é suficiente para não acumular entre janelas de rate-limit.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateBuckets) {
+    if (entry.resetAt <= now) rateBuckets.delete(key);
+  }
+}, 60_000).unref();
+
 function clientIp(req: express.Request): string {
   if (config.security.trustProxy) {
     const forwarded = String(req.headers['x-forwarded-for'] ?? '').split(',')[0]?.trim();
@@ -135,8 +153,15 @@ function clientIp(req: express.Request): string {
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+  // Pad both buffers to the same length before comparing to avoid leaking
+  // secret length via timing (early return on length mismatch defeats timingSafeEqual).
+  const maxLen = Math.max(ab.length, bb.length);
+  const pa = Buffer.concat([ab, Buffer.alloc(maxLen - ab.length)]);
+  const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
+  // timingSafeEqual is O(len) regardless of content — the length check at the
+  // end is still needed for correctness (two padded buffers of same length may
+  // compare equal even though originals differ in length).
+  return crypto.timingSafeEqual(pa, pb) && ab.length === bb.length;
 }
 
 function isValidChatwootWebhookSecret(req: express.Request): boolean {
@@ -151,13 +176,12 @@ function isValidChatwootWebhookSecret(req: express.Request): boolean {
 
 function rateLimit(scope: string, max: number, windowMs: number) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const key = `${scope}:${clientIp(req)}`;
+    // Prefer API key as rate-limit identity (more fair behind reverse-proxy):
+    // avoids all clients sharing the same proxy IP being throttled together.
+    const apiKey = String(req.headers['x-api-key'] ?? '').trim();
+    const identity = apiKey ? `key:${apiKey.slice(0, 16)}` : `ip:${clientIp(req)}`;
+    const key = `${scope}:${identity}`;
     const now = Date.now();
-    if (rateBuckets.size > 5000) {
-      for (const [bucketKey, entry] of rateBuckets) {
-        if (entry.resetAt <= now) rateBuckets.delete(bucketKey);
-      }
-    }
     const bucket = rateBuckets.get(key);
     if (!bucket || bucket.resetAt <= now) {
       rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
@@ -212,7 +236,7 @@ app.use((req, res, next) => {
       "connect-src 'self'",
       "img-src 'self' data: blob: https:",
       "media-src 'self' data: blob: https:",
-      "style-src 'self' https://fonts.googleapis.com",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "font-src 'self' https://fonts.gstatic.com data:",
     ].join('; ')
   );
@@ -563,9 +587,22 @@ const httpServer = app.listen(config.port, () => {
 async function gracefulShutdown(signal: string): Promise<void> {
   log.app.info(`${signal} recebido — iniciando graceful shutdown`);
 
-  // 1. Para de aceitar novas conexões HTTP
-  httpServer.close(() => {
-    log.app.info('Servidor HTTP fechado');
+  // 1. Para de aceitar novas conexões HTTP e aguarda requests em voo terminarem
+  await new Promise<void>((resolve) => {
+    httpServer.close(() => {
+      log.app.info('Servidor HTTP fechado');
+      resolve();
+    });
+    // Safety timeout: forçar resolução após 5s para não bloquear o shutdown indefinidamente
+    setTimeout(() => {
+      // closeAllConnections disponível em Node >= 18.2 — destrói keep-alive sockets
+      // que impediriam o processo de encerrar. Sem isso, clientes com keep-alive
+      // recebem TCP RST quando process.exit() é chamado em vez de 503 graceful.
+      if (typeof (httpServer as any).closeAllConnections === 'function') {
+        (httpServer as any).closeAllConnections();
+      }
+      resolve();
+    }, 5000);
   });
 
   // 2. Para job de cleanup de mensagens
@@ -585,7 +622,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
   }
 
   // 4. Aguarda um breve período para operações em voo finalizarem
-  await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+  await new Promise<void>((resolve) => setTimeout(resolve, 1000));
   log.app.info('Shutdown concluído');
   process.exit(0);
 }

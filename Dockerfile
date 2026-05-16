@@ -22,6 +22,11 @@ RUN mkdir -p /app/auth /app/data \
 COPY --chown=node:node package*.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
+# Aplica patches em node_modules/baileys (idempotente). Reaplicado a cada build
+# porque npm ci sempre reescreve o módulo. Veja scripts/patch-baileys.mjs.
+COPY --chown=node:node scripts ./scripts
+RUN node ./scripts/patch-baileys.mjs
+
 # Copia o restante do código
 COPY --chown=node:node dist ./dist
 COPY --chown=node:node public ./public
@@ -31,9 +36,9 @@ COPY --chown=node:node build.sh ./build.sh
 
 RUN bash ./build.sh \
   && find ./dist -type f \( -name "*.map" -o -name "*.d.ts" \) -delete \
-  && rm -rf ./dist/tests ./dist/dist ./src ./tsconfig.build.json ./build.sh
+  && rm -rf ./dist/tests ./dist/dist ./src ./tsconfig.build.json ./build.sh ./scripts
 
 USER node
 
 EXPOSE 8787
-CMD ["node", "dist/index.js"]
+CMD ["node", "--no-warnings=ExperimentalWarning", "dist/index.js"]

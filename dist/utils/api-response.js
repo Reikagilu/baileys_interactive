@@ -1,16 +1,21 @@
-function getRequestId(res) {
-    const value = res.locals?.requestId;
-    return typeof value === 'string' && value ? value : undefined;
+/**
+ * Envia uma resposta de sucesso padronizada.
+ * Status padrão: 200.
+ */
+export function sendOk(res, data, status = 200) {
+    return res.status(status).json({
+        ok: true,
+        ...data,
+    });
 }
-export function sendOk(res, data = {}, status = 200) {
-    return res.status(status).json({ ok: true, requestId: getRequestId(res), ...data });
-}
+/**
+ * Envia uma resposta de erro padronizada.
+ */
 export function sendError(res, status, error, message, details) {
-    const payload = { ok: false, error, requestId: getRequestId(res) };
+    const body = { ok: false, error };
     if (message)
-        payload.message = message;
+        body.message = message;
     if (details !== undefined)
-        payload.details = details;
-    return res.status(status).json(payload);
+        body.details = details;
+    return res.status(status).json(body);
 }
-//# sourceMappingURL=api-response.js.map

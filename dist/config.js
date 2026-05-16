@@ -23,6 +23,12 @@ export const config = {
     apiKey: process.env.API_KEY ?? '',
     apiKeysJson: process.env.API_KEYS_JSON ?? '',
     authFolder: process.env.AUTH_FOLDER ?? 'auth',
+    whatsapp: {
+        // Nunca apague a auth automaticamente por heurística, a menos que seja
+        // explicitamente habilitado. Isso evita logout por falso positivo em
+        // estados transitórios/corrupção parcial de arquivos.
+        autoResetCorruptAuth: parseBoolean(process.env.WHATSAPP_AUTO_RESET_CORRUPT_AUTH, false),
+    },
     audit: {
         logPath: process.env.AUDIT_LOG_PATH ?? 'data/audit.log',
         maxInMemoryEvents: parseNumber(process.env.AUDIT_MAX_IN_MEMORY_EVENTS, 500, 10),
@@ -130,4 +136,3 @@ export const config = {
         chatMediaRetentionMs: parseNumber(process.env.CHAT_MEDIA_RETENTION_MS ?? process.env.CHAT_MEDIA_TTL_MS, 90 * 24 * 60 * 60 * 1000, 60 * 1000),
     },
 };
-//# sourceMappingURL=config.js.map

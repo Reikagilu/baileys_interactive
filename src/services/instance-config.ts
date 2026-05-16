@@ -1,5 +1,40 @@
-export const INSTANCE_EVENT_NAMES = ["APPLICATION_STARTUP", "CALL", "CHATS_DELETE", "CHATS_SET", "CHATS_UPDATE", "CHATS_UPSERT", "CONNECTION_UPDATE", "CONTACTS_SET", "CONTACTS_UPDATE", "CONTACTS_UPSERT", "GROUP_PARTICIPANTS_UPDATE", "GROUP_UPDATE", "GROUPS_UPSERT", "LABELS_ASSOCIATION", "LABELS_EDIT", "LOGOUT_INSTANCE", "MESSAGES_DELETE", "MESSAGES_SET", "MESSAGES_UPDATE", "MESSAGES_UPSERT", "PRESENCE_UPDATE", "QRCODE_UPDATED", "REMOVE_INSTANCE", "SEND_MESSAGE", "TYPEBOT_CHANGE_STATUS", "TYPEBOT_START"] as const;
-export type InstanceEventName = (typeof INSTANCE_EVENT_NAMES)[number];
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { config } from '../config.js';
+import { validateOutboundUrl } from '../utils/url-security.js';
+
+export const INSTANCE_EVENT_NAMES = [
+    'APPLICATION_STARTUP',
+    'CALL',
+    'CHATS_DELETE',
+    'CHATS_SET',
+    'CHATS_UPDATE',
+    'CHATS_UPSERT',
+    'CONNECTION_UPDATE',
+    'CONTACTS_SET',
+    'CONTACTS_UPDATE',
+    'CONTACTS_UPSERT',
+    'GROUP_PARTICIPANTS_UPDATE',
+    'GROUP_UPDATE',
+    'GROUPS_UPSERT',
+    'LABELS_ASSOCIATION',
+    'LABELS_EDIT',
+    'LOGOUT_INSTANCE',
+    'MESSAGES_DELETE',
+    'MESSAGES_SET',
+    'MESSAGES_UPDATE',
+    'MESSAGES_UPSERT',
+    'PRESENCE_UPDATE',
+    'QRCODE_UPDATED',
+    'REMOVE_INSTANCE',
+    'SEND_MESSAGE',
+    'TYPEBOT_CHANGE_STATUS',
+    'TYPEBOT_START',
+] as const;
+
+export type InstanceEventName = typeof INSTANCE_EVENT_NAMES[number];
+
 export interface ProxyConfig {
     enabled: boolean;
     protocol: string;
@@ -8,6 +43,7 @@ export interface ProxyConfig {
     username: string;
     password: string;
 }
+
 export interface GeneralConfig {
     rejectCalls: boolean;
     ignoreGroups: boolean;
@@ -16,10 +52,12 @@ export interface GeneralConfig {
     syncFullHistory: boolean;
     readStatus: boolean;
 }
+
 export interface EventsConfig {
     webhookUrl: string;
     toggles: Record<InstanceEventName, boolean>;
 }
+
 export interface InstancePanelConfig {
     instance: string;
     proxy: ProxyConfig;
@@ -28,20 +66,227 @@ export interface InstancePanelConfig {
     createdAt: number;
     updatedAt: number;
 }
-export interface InstanceEventDispatchResult {
-    ok: boolean;
-    skipped: boolean;
-    status?: number;
-    error?: string;
+
+function defaultProxy(): ProxyConfig {
+    return { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' };
 }
-export function getInstancePanelConfig(instance: string): InstancePanelConfig { return undefined as any; }
-export function updateInstanceProxy(instance: string, patch: Partial<ProxyConfig>): InstancePanelConfig { return undefined as any; }
-export function updateInstanceGeneral(instance: string, patch: Partial<GeneralConfig>): InstancePanelConfig { return undefined as any; }
-export function updateInstanceEvents(instance: string, patch: {
-    webhookUrl?: string;
-    toggles?: Partial<Record<InstanceEventName, boolean>>;
-}): InstancePanelConfig { return undefined as any; }
-export function getInstanceGeneral(instance: string): GeneralConfig { return undefined as any; }
-export function emitInstanceEvent(instance: string, eventName: InstanceEventName, payload: unknown, options?: {
-    ignoreToggle?: boolean;
-}): Promise<InstanceEventDispatchResult> { return undefined as any; }
+
+function defaultGeneral(): GeneralConfig {
+    return { rejectCalls: false, ignoreGroups: false, alwaysOnline: false, autoReadMessages: false, syncFullHistory: false, readStatus: false };
+}
+
+function defaultEvents(): EventsConfig {
+    const toggles = Object.fromEntries(INSTANCE_EVENT_NAMES.map((name) => [name, false])) as Record<InstanceEventName, boolean>;
+    return { webhookUrl: '', toggles };
+}
+
+// ---------------------------------------------------------------------------
+// Lazy-init DB
+// ---------------------------------------------------------------------------
+let _db: DatabaseSync | null = null;
+
+function getDb(): DatabaseSync {
+    if (_db) return _db;
+    const resolved = path.resolve(process.cwd(), config.integrations.dbPath);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    const db = new DatabaseSync(resolved);
+    db.exec('PRAGMA busy_timeout = 5000;');
+    try { db.exec('PRAGMA journal_mode = WAL;'); } catch { /* can be locked */ }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS instance_panel_configs (
+        instance TEXT PRIMARY KEY,
+        proxy_json TEXT NOT NULL,
+        general_json TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    _db = db;
+    return _db;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function parseObject<T extends object>(raw: unknown, fallback: T): T {
+    if (typeof raw !== 'string') return fallback;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return fallback;
+        // Strict merge: só aceita campos presentes no fallback
+        const result = { ...fallback } as Record<string, unknown>;
+        for (const key of Object.keys(fallback)) {
+            if (key in (parsed as object)) result[key] = (parsed as Record<string, unknown>)[key];
+        }
+        return result as T;
+    } catch { return fallback; }
+}
+
+function parseEvents(raw: unknown): EventsConfig {
+    const base = defaultEvents();
+    if (typeof raw !== 'string') return base;
+    try {
+        const parsed = JSON.parse(raw);
+        const toggles = { ...base.toggles };
+        const source = parsed?.toggles && typeof parsed.toggles === 'object' ? parsed.toggles : {};
+        for (const eventName of INSTANCE_EVENT_NAMES) {
+            toggles[eventName] = Boolean(source[eventName]);
+        }
+        return {
+            webhookUrl: String(parsed?.webhookUrl ?? '').trim(),
+            toggles,
+        };
+    } catch { return base; }
+}
+
+function mapRow(row: Record<string, unknown>): InstancePanelConfig {
+    return {
+        instance: String(row.instance),
+        proxy: parseObject(row.proxy_json, defaultProxy()),
+        general: parseObject(row.general_json, defaultGeneral()),
+        events: parseEvents(row.events_json),
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at),
+    };
+}
+
+function persist(cfg: InstancePanelConfig): InstancePanelConfig {
+    const db = getDb();
+    const now = Date.now();
+    const existing = db.prepare('SELECT created_at FROM instance_panel_configs WHERE instance = ?').get(cfg.instance) as {created_at: number} | undefined;
+    const createdAt = existing ? Number(existing.created_at) : now;
+    db.prepare(`INSERT INTO instance_panel_configs (instance, proxy_json, general_json, events_json, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(instance) DO UPDATE SET
+       proxy_json = excluded.proxy_json,
+       general_json = excluded.general_json,
+       events_json = excluded.events_json,
+       updated_at = excluded.updated_at`).run(
+        cfg.instance,
+        JSON.stringify(cfg.proxy),
+        JSON.stringify(cfg.general),
+        JSON.stringify(cfg.events),
+        createdAt,
+        now,
+    );
+    return { ...cfg, createdAt, updatedAt: now };
+}
+
+// ---------------------------------------------------------------------------
+// Exports públicos
+// ---------------------------------------------------------------------------
+export function getInstancePanelConfig(instance: string): InstancePanelConfig {
+    const db = getDb();
+    const key = String(instance ?? '').trim();
+    const row = db.prepare('SELECT * FROM instance_panel_configs WHERE instance = ?').get(key) as Record<string, unknown> | undefined;
+    if (!row) {
+        const now = Date.now();
+        return { instance: key, proxy: defaultProxy(), general: defaultGeneral(), events: defaultEvents(), createdAt: now, updatedAt: now };
+    }
+    return mapRow(row);
+}
+
+const ALLOWED_PROXY_PROTOCOLS = new Set(['http', 'https', 'socks4', 'socks5']);
+
+export function updateInstanceProxy(instance: string, patch: Partial<ProxyConfig>): InstancePanelConfig {
+    const current = getInstancePanelConfig(instance);
+    const protocol = String(patch.protocol ?? current.proxy.protocol).trim().toLowerCase() || 'http';
+    if (!ALLOWED_PROXY_PROTOCOLS.has(protocol)) {
+        throw new Error(`Invalid proxy protocol: ${protocol}. Allowed: ${[...ALLOWED_PROXY_PROTOCOLS].join(', ')}`);
+    }
+    return persist({
+        ...current,
+        proxy: {
+            enabled: patch.enabled ?? current.proxy.enabled,
+            protocol,
+            host: String(patch.host ?? current.proxy.host).trim(),
+            port: String(patch.port ?? current.proxy.port).trim(),
+            username: String(patch.username ?? current.proxy.username).trim(),
+            password: String(patch.password ?? current.proxy.password).trim(),
+        },
+    });
+}
+
+export function updateInstanceGeneral(instance: string, patch: Partial<GeneralConfig>): InstancePanelConfig {
+    const current = getInstancePanelConfig(instance);
+    return persist({
+        ...current,
+        general: {
+            rejectCalls: patch.rejectCalls ?? current.general.rejectCalls,
+            ignoreGroups: patch.ignoreGroups ?? current.general.ignoreGroups,
+            alwaysOnline: patch.alwaysOnline ?? current.general.alwaysOnline,
+            autoReadMessages: patch.autoReadMessages ?? current.general.autoReadMessages,
+            syncFullHistory: patch.syncFullHistory ?? current.general.syncFullHistory,
+            readStatus: patch.readStatus ?? current.general.readStatus,
+        },
+    });
+}
+
+export function updateInstanceEvents(instance: string, patch: { webhookUrl?: string; toggles?: Partial<Record<InstanceEventName, boolean>> }): InstancePanelConfig {
+    const current = getInstancePanelConfig(instance);
+    const nextToggles = { ...current.events.toggles };
+    if (patch.toggles) {
+        for (const eventName of INSTANCE_EVENT_NAMES) {
+            if (typeof patch.toggles[eventName] === 'boolean') {
+                nextToggles[eventName] = Boolean(patch.toggles[eventName]);
+            }
+        }
+    }
+    return persist({
+        ...current,
+        events: {
+            webhookUrl: patch.webhookUrl !== undefined ? String(patch.webhookUrl).trim() : current.events.webhookUrl,
+            toggles: nextToggles,
+        },
+    });
+}
+
+export function getInstanceGeneral(instance: string): GeneralConfig {
+    return getInstancePanelConfig(instance).general;
+}
+
+export async function emitInstanceEvent(
+    instance: string,
+    eventName: InstanceEventName,
+    payload: unknown,
+    options?: { ignoreToggle?: boolean },
+): Promise<{ ok: boolean; skipped: boolean; status?: number; error?: string }> {
+    const cfg = getInstancePanelConfig(instance);
+
+    if (!cfg.events.webhookUrl) {
+        return { ok: false, skipped: true, error: 'webhook_url_not_configured' };
+    }
+    if (!options?.ignoreToggle && !cfg.events.toggles[eventName]) {
+        return { ok: false, skipped: true, error: 'event_toggle_disabled' };
+    }
+
+    const urlValidation = validateOutboundUrl(cfg.events.webhookUrl, {
+        allowPrivateNetwork: config.security.allowPrivateNetworkWebhooks,
+    });
+    if (!urlValidation.ok) {
+        return { ok: false, skipped: false, error: 'webhook_url_blocked' };
+    }
+
+    const targetUrl = urlValidation.normalizedUrl ?? cfg.events.webhookUrl;
+    const body = JSON.stringify({ event: eventName, instance, emittedAt: new Date().toISOString(), payload });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.integrations.requestTimeoutMs);
+    try {
+        const response = await fetch(targetUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            return { ok: false, skipped: false, status: response.status, error: `webhook_http_${response.status}` };
+        }
+        return { ok: true, skipped: false, status: response.status };
+    } catch (error) {
+        return { ok: false, skipped: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+        clearTimeout(timeout);
+    }
+}

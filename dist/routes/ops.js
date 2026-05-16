@@ -8,7 +8,7 @@ const router = Router();
 router.get('/alerts', (_req, res) => {
     const webhook = getWebhookMetrics();
     const instances = getAllInstances();
-    const connected = instances.filter((instance) => instance.status === 'connected').length;
+    const connected = instances.filter((i) => i.status === 'connected').length;
     const alerts = [];
     if (webhook.deliveriesPending > config.alerts.maxPendingDeliveries) {
         alerts.push({
@@ -57,19 +57,12 @@ router.get('/alerts', (_req, res) => {
     return sendOk(res, {
         status: alerts.length ? 'degraded' : 'healthy',
         alerts,
-        snapshot: {
-            connectedInstances: connected,
-            totalInstances: instances.length,
-            webhook,
-        },
+        snapshot: { connectedInstances: connected, totalInstances: instances.length, webhook },
     });
 });
 router.get('/audit', (req, res) => {
     const limitRaw = Number.parseInt(String(req.query.limit ?? ''), 10);
-    const limit = Number.isFinite(limitRaw) ? limitRaw : 100;
-    return sendOk(res, {
-        events: listRecentAuditEvents(limit),
-    });
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
+    return sendOk(res, { events: listRecentAuditEvents(limit) });
 });
 export default router;
-//# sourceMappingURL=ops.js.map

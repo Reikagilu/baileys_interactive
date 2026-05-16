@@ -384,19 +384,39 @@ export function isSyncRunning(instance: string): boolean {
 // ─── In-Flight Persistente (sobrevivência a crashes) ────────────────────────
 
 /** Carrega in-flight do SQLite para memória ao iniciar. Garante que mensagens
- * que estavam sendo enviadas quando o processo caiu serão detectadas no restart. */
+ * que estavam sendo enviadas quando o processo caiu serão detectadas no restart.
+ * Filtra mensagens que já foram marcadas como sincronizadas para evitar que
+ * bloqueiem futuras tentativas de envio. */
 function loadInflightFromDb(): void {
   if (!_db) return;
   try {
-    const rows = _db!.prepare(
-      'SELECT instance, msg_id FROM chatwoot_inflight'
-    ).all() as Array<{ instance: string; msg_id: string }>;
+    // Busca apenas in-flight que NÃO já foram sincronizadas.
+    // Sem este filtro, mensagens que foram dispatched com sucesso mas cujo
+    // finishMessageSyncWithPersistence() não chegou a remover a entrada antes
+    // do crash ficariam bloqueando futuros beginMessageSync() para o mesmo ID.
+    const rows = _db!.prepare(`
+      SELECT i.instance, i.msg_id
+      FROM chatwoot_inflight i
+      LEFT JOIN chatwoot_synced s ON s.instance = i.instance AND s.msg_id = i.msg_id
+      WHERE s.msg_id IS NULL
+    `).all() as Array<{ instance: string; msg_id: string }>;
+
+    // Limpa entradas que já estão em chatwoot_synced (foram sincronizadas antes do crash)
+    _db!.prepare(`
+      DELETE FROM chatwoot_inflight
+      WHERE (instance, msg_id) IN (
+        SELECT i.instance, i.msg_id
+        FROM chatwoot_inflight i
+        INNER JOIN chatwoot_synced s ON s.instance = i.instance AND s.msg_id = i.msg_id
+      )
+    `).run();
+
     for (const row of rows) {
       const key = messageSyncKey(row.instance, row.msg_id);
       _messageSyncInFlight.add(key);
     }
     if (rows.length > 0) {
-      log.chatwoot.info(`In-flight recovery: ${rows.length} mensagens serão verificadas contra synced`);
+      log.chatwoot.info(`In-flight recovery: ${rows.length} mensagem(ns) em voo serão reprocessadas`);
     }
   } catch (err) {
     log.chatwoot.error('Falha ao carregar in-flight do SQLite', err);
@@ -468,10 +488,12 @@ export function addPendingMessage(
   payload: string,
   error?: string
 ): void {
-  if (!_db) return;
+  // msg_id ou instance vazios causariam INSERT com NULL violando NOT NULL constraint
+  if (!instance || !msgId) return;
+  const db = getDb();
   const now = Date.now();
   try {
-    _db!.prepare(`
+    db.prepare(`
       INSERT OR REPLACE INTO chatwoot_pending
         (instance, msg_id, payload, attempt, next_attempt, last_error, created_at)
       VALUES (?, ?, ?, 1, ?, ?, ?)
@@ -493,13 +515,14 @@ type PendingMsg = {
 };
 
 export function getPendingMessages(limit = 50): PendingMsg[] {
-  if (!_db) return [];
+  const db = getDb();
   const now = Date.now();
   try {
-    const rows = _db!.prepare(`
+    const rows = db.prepare(`
       SELECT id, instance, msg_id AS msgId, payload, attempt, last_error AS lastError
       FROM chatwoot_pending
       WHERE next_attempt <= ?
+        AND attempt <= 10
       ORDER BY next_attempt ASC
       LIMIT ?
     `).all(now, limit) as PendingMsg[];
@@ -512,9 +535,9 @@ export function getPendingMessages(limit = 50): PendingMsg[] {
 
 /** Remove mensagem da fila de retry após sucesso. */
 export function removePendingMessage(id: number): void {
-  if (!_db) return;
+  const db = getDb();
   try {
-    _db!.prepare('DELETE FROM chatwoot_pending WHERE id = ?').run(id);
+    db.prepare('DELETE FROM chatwoot_pending WHERE id = ?').run(id);
   } catch {
     /* ignore */
   }
@@ -522,11 +545,11 @@ export function removePendingMessage(id: number): void {
 
 /** Incrementa tentativa de retry com backoff exponencial. */
 export function updatePendingMessageRetry(id: number, attempt: number, error: string): void {
-  if (!_db) return;
+  const db = getDb();
   const nextDelay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
   const nextAttempt = Date.now() + nextDelay;
   try {
-    _db!.prepare(`
+    db.prepare(`
       UPDATE chatwoot_pending
       SET attempt = ?, next_attempt = ?, last_error = ?
       WHERE id = ?
@@ -538,12 +561,12 @@ export function updatePendingMessageRetry(id: number, attempt: number, error: st
 
 /** Remove mensagens pendentes antigas (após muitas tentativas ou muito tempo). */
 export function prunePendingMessages(): number {
-  if (!_db) return 0;
+  const db = getDb();
   const now = Date.now();
   const maxAge = 24 * 60 * 60 * 1000; // 24 horas
-  const maxAttempts = 5;
+  const maxAttempts = 10;
   try {
-    const result = _db!.prepare(`
+    const result = db.prepare(`
       DELETE FROM chatwoot_pending
       WHERE next_attempt < ? OR attempt > ?
     `).run(now - maxAge, maxAttempts);
@@ -555,15 +578,15 @@ export function prunePendingMessages(): number {
 
 /** Retorna count de mensagens pendentes. */
 export function countPendingMessages(instance?: string): number {
-  if (!_db) return 0;
+  const db = getDb();
   try {
     if (instance) {
-      const row = _db!.prepare(
+      const row = db.prepare(
         'SELECT COUNT(*) AS c FROM chatwoot_pending WHERE instance = ?'
       ).get(instance) as { c: number } | undefined;
       return row?.c ?? 0;
     }
-    const row = _db!.prepare('SELECT COUNT(*) AS c FROM chatwoot_pending').get() as { c: number } | undefined;
+    const row = db.prepare('SELECT COUNT(*) AS c FROM chatwoot_pending').get() as { c: number } | undefined;
     return row?.c ?? 0;
   } catch {
     return 0;

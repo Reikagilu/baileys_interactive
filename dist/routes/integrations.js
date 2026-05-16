@@ -4,7 +4,7 @@ import { sendError, sendOk } from '../utils/api-response.js';
 import { writeAuditEvent } from '../services/audit-log.js';
 import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
-import { getInstanceIntegrations, listIntegrationInstances, testChatwoot, testN8n, updateChatwootConfig, updateN8nConfig, } from '../services/integrations.js';
+import { getInstanceIntegrations, listIntegrationInstances, redactIntegrations, testChatwoot, testN8n, updateChatwootConfig, updateN8nConfig, } from '../services/integrations.js';
 import { syncContactNamesToChatwoot, buildChatwootWebhookUrl, normalizeChatwootWebhookSlug, invalidateConversationCache, } from '../services/chatwoot-bridge.js';
 const router = Router();
 const NUMERIC_ID_PATTERN = /^\d{1,20}$/;
@@ -12,7 +12,10 @@ const HEADER_NAME_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 function isOptionalNumericId(value) {
     if (value === undefined)
         return true;
-    return NUMERIC_ID_PATTERN.test(String(value).trim());
+    const s = String(value).trim();
+    if (s === '')
+        return true; // string vazia = limpar o campo (aceita)
+    return NUMERIC_ID_PATTERN.test(s);
 }
 function isOptionalMaxLength(value, max) {
     if (value === undefined)
@@ -21,8 +24,11 @@ function isOptionalMaxLength(value, max) {
 }
 function buildWebhookPayload(instance, integration = getInstanceIntegrations(instance)) {
     const slug = integration.chatwoot.webhookSlug?.trim() || instance;
+    // Mascara tokens sensíveis antes de retornar ao cliente. getInstanceIntegrations
+    // retorna os tokens em texto claro (necessário para uso interno). redactIntegrations
+    // substitui apiAccessToken e authHeaderValue por '***'.
     return {
-        integration,
+        integration: redactIntegrations(integration),
         chatwootWebhookUrl: buildChatwootWebhookUrl(slug),
     };
 }
@@ -253,4 +259,3 @@ router.post('/:instance/n8n/test', async (req, res) => {
     return sendOk(res, { tested: true, status: result.status ?? 200 });
 });
 export default router;
-//# sourceMappingURL=integrations.js.map

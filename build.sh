@@ -28,43 +28,41 @@ npx --yes -p typescript -p @types/node -p @types/express -p @types/qrcode tsc -p
 
 echo "[build] Restaurando módulos reais preservados do dist base..."
 
-# Routes reais (exceto integrations.js que é nosso)
-for f in chats instances messages ops webhooks; do
-  if [ -f "$BACKUP_DIR/routes/${f}.js" ]; then
-    cp "$BACKUP_DIR/routes/${f}.js" "$SCRIPT_DIR/dist/routes/${f}.js"
-  fi
-done
+# Todos os routes agora têm implementação real em src/routes/ — nenhum precisa ser restaurado do backup.
+# O tsc compila tudo corretamente.
 
-# Services reais (os que não modificamos)
-for f in audit-log webhooks instance-config idempotency; do
-  if [ -f "$BACKUP_DIR/services/${f}.js" ]; then
-    cp "$BACKUP_DIR/services/${f}.js" "$SCRIPT_DIR/dist/services/${f}.js"
-  fi
-done
+# Services: todos agora têm implementação real em src/ — nenhum precisa ser restaurado do backup.
+# audit-log, webhooks, instance-config, idempotency, webhook-delivery-worker estão em src/.
 
-# Utils, workers, docs e types reais (preservar do backup)
+# Utils, workers, docs e types reais (preservar do backup).
+# Os seguintes arquivos têm implementação real em src/ e NÃO devem ser restaurados do backup:
+#   helpers.js, api-response.js, media-signature.js, url-security.js
+# Os demais utils do backup são restaurados para preservar implementações que não estão em src/.
 for dir in utils workers docs types; do
   if [ -d "$BACKUP_DIR/${dir}" ]; then
     mkdir -p "$SCRIPT_DIR/dist/${dir}"
-    cp "$BACKUP_DIR/${dir}/"*.js "$SCRIPT_DIR/dist/${dir}/" 2>/dev/null || true
+    if [ "$dir" = "utils" ]; then
+      for file in "$BACKUP_DIR/${dir}/"*.js; do
+        [ -e "$file" ] || continue
+        base="$(basename "$file")"
+        # Não restaurar arquivos que agora têm implementação real em src/
+        if [ "$base" = "helpers.js" ] || [ "$base" = "api-response.js" ] || \
+           [ "$base" = "media-signature.js" ] || [ "$base" = "url-security.js" ]; then
+          continue
+        fi
+        cp "$file" "$SCRIPT_DIR/dist/${dir}/$base"
+      done
+    else
+      cp "$BACKUP_DIR/${dir}/"*.js "$SCRIPT_DIR/dist/${dir}/" 2>/dev/null || true
+    fi
     cp "$BACKUP_DIR/${dir}/"*.d.ts "$SCRIPT_DIR/dist/${dir}/" 2>/dev/null || true
     cp "$BACKUP_DIR/${dir}/"*.js.map "$SCRIPT_DIR/dist/${dir}/" 2>/dev/null || true
   fi
 done
 
-# middleware: preservar request-context do backup; api-auth vem do tsc (implementação real em src/)
-if [ -d "$BACKUP_DIR/middleware" ]; then
-  mkdir -p "$SCRIPT_DIR/dist/middleware"
-  if [ -f "$BACKUP_DIR/middleware/request-context.js" ]; then
-    cp "$BACKUP_DIR/middleware/request-context.js" "$SCRIPT_DIR/dist/middleware/request-context.js"
-  fi
-fi
+# middleware: api-auth e request-context vêm do tsc (implementação real em src/)
+# Nenhum middleware precisa ser restaurado do backup.
 
-# Patch: substituir Atomics.wait (bloqueia main thread) por busy-wait simples em webhooks.js
-if [ -f "$SCRIPT_DIR/dist/services/webhooks.js" ]; then
-  sed -i 's/const shared = new SharedArrayBuffer(4);.*//; s/const view = new Int32Array(shared);.*//; s/Atomics\.wait(view, 0, 0, ms);/const end = Date.now() + ms; while (Date.now() < end) {}/' \
-    "$SCRIPT_DIR/dist/services/webhooks.js" 2>/dev/null || true
-fi
 
 echo "[build] Verificando tamanhos críticos (stub < 500 bytes = FALHA)..."
 check_size() {
