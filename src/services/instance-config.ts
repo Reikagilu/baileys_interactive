@@ -81,6 +81,18 @@ function defaultEvents(): EventsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// In-memory cache for panel config reads (TTL 5s).
+// getInstancePanelConfig is called on every socket event handler (messages,
+// chats, contacts) — caching eliminates the SQLite SELECT hot-path.
+// ---------------------------------------------------------------------------
+const _configCache = new Map<string, { value: InstancePanelConfig; exp: number }>();
+const CONFIG_CACHE_TTL_MS = 5_000;
+
+function invalidatePanelConfigCache(instance: string): void {
+    _configCache.delete(instance);
+}
+
+// ---------------------------------------------------------------------------
 // Lazy-init DB
 // ---------------------------------------------------------------------------
 let _db: DatabaseSync | null = null;
@@ -170,21 +182,29 @@ function persist(cfg: InstancePanelConfig): InstancePanelConfig {
         createdAt,
         now,
     );
-    return { ...cfg, createdAt, updatedAt: now };
+    const updated = { ...cfg, createdAt, updatedAt: now };
+    // Invalidate the read cache so the next getInstancePanelConfig reflects the write.
+    invalidatePanelConfigCache(cfg.instance);
+    return updated;
 }
 
 // ---------------------------------------------------------------------------
 // Exports públicos
 // ---------------------------------------------------------------------------
 export function getInstancePanelConfig(instance: string): InstancePanelConfig {
-    const db = getDb();
     const key = String(instance ?? '').trim();
+    const now = Date.now();
+    const cached = _configCache.get(key);
+    if (cached && cached.exp > now) return cached.value;
+
+    const db = getDb();
     const row = db.prepare('SELECT * FROM instance_panel_configs WHERE instance = ?').get(key) as Record<string, unknown> | undefined;
-    if (!row) {
-        const now = Date.now();
-        return { instance: key, proxy: defaultProxy(), general: defaultGeneral(), events: defaultEvents(), createdAt: now, updatedAt: now };
-    }
-    return mapRow(row);
+    const value = row
+        ? mapRow(row)
+        : { instance: key, proxy: defaultProxy(), general: defaultGeneral(), events: defaultEvents(), createdAt: now, updatedAt: now };
+
+    _configCache.set(key, { value, exp: now + CONFIG_CACHE_TTL_MS });
+    return value;
 }
 
 const ALLOWED_PROXY_PROTOCOLS = new Set(['http', 'https', 'socks4', 'socks5']);

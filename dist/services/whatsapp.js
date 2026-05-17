@@ -59,6 +59,21 @@ function isRecord(value) {
 const chatCache = new Map();
 const chatMediaBinaryStore = new Map();
 const chatMediaEnsureInFlight = new Map();
+// Cached dynamic import promises — Node caches modules internally but each
+// `await import(...)` still creates a Promise microtask. Caching the Promise
+// itself eliminates that overhead in the high-frequency media paths.
+let _baileysModulePromise = null;
+let _baileysMediaModulePromise = null;
+function getBaileysModule() {
+    if (!_baileysModulePromise)
+        _baileysModulePromise = import('baileys');
+    return _baileysModulePromise;
+}
+function getBaileysMediaModule() {
+    if (!_baileysMediaModulePromise)
+        _baileysMediaModulePromise = import('baileys/lib/Utils/messages-media.js');
+    return _baileysMediaModulePromise;
+}
 function buildMediaUrl(instance, mediaId) {
     const exp = Math.floor(Date.now() / 1000) + config.media.signedUrlTtlSeconds;
     const sig = signMediaUrlToken(config.media.signedUrlSecret, instance, mediaId, exp);
@@ -1150,7 +1165,7 @@ async function downloadMediaBase64(node, kind, scope = 'webhook') {
     if (scope === 'webhook' && !shouldIncludeMediaBase64(kind))
         return null;
     try {
-        const module = (await import('baileys'));
+        const module = (await getBaileysModule());
         if (typeof module.downloadContentFromMessage !== 'function')
             return { omittedReason: 'download_failed' };
         const DOWNLOAD_TIMEOUT_MS = 30_000;
@@ -1378,7 +1393,7 @@ async function enrichSingleMessageForChatwoot(current, limit) {
         try {
             // downloadContentFromMessage não é re-exportado pelo index do baileys;
             // importar direto do módulo utilitário onde está definido.
-            const mediaModule = (await import('baileys/lib/Utils/messages-media.js'));
+            const mediaModule = (await getBaileysMediaModule());
             if (typeof mediaModule.downloadContentFromMessage !== 'function') {
                 lastDownloadError = 'downloadContentFromMessage não disponível';
                 break;
@@ -2334,9 +2349,9 @@ export async function createInstance(name, authFolder) {
                         log.whatsapp.child(name).error('Erro ao criar inbox no Chatwoot automaticamente (autoCreateChatwootInbox)', err);
                     }
                     try {
-                        const { getInstanceIntegrations: getInteg } = await import('./integrations.js');
+                        // Use the already-imported static reference — no dynamic import needed.
                         const { syncHistoryToChatwoot: syncHist } = await import('./chatwoot-bridge.js');
-                        const cfg = getInteg(name).chatwoot;
+                        const cfg = getInstanceIntegrations(name).chatwoot;
                         if (cfg.enabled && cfg.importMessages === true && cfg.baseUrl && cfg.accountId && cfg.apiAccessToken) {
                             // Wait 8s after connect for initial Baileys history sync to populate SQLite
                             await new Promise(r => setTimeout(r, 8000));
@@ -2799,12 +2814,27 @@ export async function createInstance(name, authFolder) {
             void emitInstanceEvent(name, 'GROUP_UPDATE', { payload });
             // Persistir subject atualizado no chat_meta quando o nome do grupo muda
             const updates = Array.isArray(payload) ? payload : [];
-            for (const item of updates) {
-                const jid = String(item.id ?? '').trim();
-                const subject = String(item.subject ?? '').trim();
-                if (jid && subject) {
-                    upsertCachedChatMeta(name, { jid, title: subject });
+            if (updates.length === 0)
+                return;
+            const doUpdate = () => {
+                for (const item of updates) {
+                    const jid = String(item.id ?? '').trim();
+                    const subject = String(item.subject ?? '').trim();
+                    if (jid && subject) {
+                        upsertCachedChatMeta(name, { jid, title: subject });
+                    }
                 }
+            };
+            if (updates.length >= 5) {
+                try {
+                    msRunInTransaction(doUpdate);
+                }
+                catch {
+                    doUpdate();
+                }
+            }
+            else {
+                doUpdate();
             }
         });
         sock.ev.on('chats.set', (payload) => {
@@ -2900,14 +2930,29 @@ export async function createInstance(name, authFolder) {
             if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
                 return;
             const updates = Array.isArray(payload) ? payload : [];
-            for (const c of updates) {
-                const jid = String(c.id ?? '').trim();
-                if (!jid)
-                    continue;
-                const title = extractChatTitleFromPayload(c);
-                if (title && title !== jid.split('@')[0]) {
-                    upsertCachedChatMeta(name, { jid, title });
+            if (updates.length === 0)
+                return;
+            const doUpdate = () => {
+                for (const c of updates) {
+                    const jid = String(c.id ?? '').trim();
+                    if (!jid)
+                        continue;
+                    const title = extractChatTitleFromPayload(c);
+                    if (title && title !== jid.split('@')[0]) {
+                        upsertCachedChatMeta(name, { jid, title });
+                    }
                 }
+            };
+            if (updates.length >= 5) {
+                try {
+                    msRunInTransaction(doUpdate);
+                }
+                catch {
+                    doUpdate();
+                }
+            }
+            else {
+                doUpdate();
             }
         });
         sock.ev.on('contacts.upsert', (payload) => {
@@ -3225,6 +3270,14 @@ export function removeInstance(name) {
     clearInstanceMediaBinaries(normalizedName, true);
     return true;
 }
+/** Checks if a list is already sorted by lastTimestamp descending (avoids redundant sort). */
+function isLastTimestampSortedDesc(list) {
+    for (let i = 1; i < list.length; i += 1) {
+        if ((list[i - 1]?.lastTimestamp ?? 0) < (list[i]?.lastTimestamp ?? 0))
+            return false;
+    }
+    return true;
+}
 export function getInstanceChatList(name) {
     // Combina cache em memória com dados persistidos no SQLite
     // Chats do SQLite que não estão em memória ainda aparecem na lista
@@ -3235,13 +3288,6 @@ export function getInstanceChatList(name) {
     catch {
         return [];
     } })();
-    const isLastTimestampSortedDesc = (list) => {
-        for (let i = 1; i < list.length; i += 1) {
-            if ((list[i - 1]?.lastTimestamp ?? 0) < (list[i]?.lastTimestamp ?? 0))
-                return false;
-        }
-        return true;
-    };
     // Fast path: sem chats em memória, o SQLite já entrega a lista ordenada.
     if (!memChats || memChats.size === 0) {
         return dbChats.map((c) => ({
@@ -3361,36 +3407,38 @@ async function ensureCachedMessageMedia(instance, message) {
         chatMediaEnsureInFlight.delete(lockKey);
     }
 }
+/** Returns true if list is sorted ascending by timestamp (avoids redundant re-sort). */
+function isCachedMessageTimestampSorted(list) {
+    for (let i = 1; i < list.length; i += 1) {
+        if ((list[i - 1]?.timestamp ?? 0) > (list[i]?.timestamp ?? 0))
+            return false;
+    }
+    return true;
+}
+/** Merges two ascending-sorted arrays into a single ascending-sorted array (O(n+m)). */
+function mergeSortedCachedMessages(left, right) {
+    if (left.length === 0)
+        return right;
+    if (right.length === 0)
+        return left;
+    const merged = [];
+    let i = 0;
+    let j = 0;
+    while (i < left.length && j < right.length) {
+        if ((left[i]?.timestamp ?? 0) <= (right[j]?.timestamp ?? 0))
+            merged.push(left[i++]);
+        else
+            merged.push(right[j++]);
+    }
+    while (i < left.length)
+        merged.push(left[i++]);
+    while (j < right.length)
+        merged.push(right[j++]);
+    return merged;
+}
 function getInstanceChatMessagesInternal(name, jid) {
     const chats = chatCache.get(name);
     const memMessages = chats?.get(jid)?.messages ?? [];
-    const isTimestampSorted = (list) => {
-        for (let i = 1; i < list.length; i += 1) {
-            if ((list[i - 1]?.timestamp ?? 0) > (list[i]?.timestamp ?? 0))
-                return false;
-        }
-        return true;
-    };
-    const mergeSortedMessages = (left, right) => {
-        if (left.length === 0)
-            return right;
-        if (right.length === 0)
-            return left;
-        const merged = [];
-        let i = 0;
-        let j = 0;
-        while (i < left.length && j < right.length) {
-            if ((left[i]?.timestamp ?? 0) <= (right[j]?.timestamp ?? 0))
-                merged.push(left[i++]);
-            else
-                merged.push(right[j++]);
-        }
-        while (i < left.length)
-            merged.push(left[i++]);
-        while (j < right.length)
-            merged.push(right[j++]);
-        return merged;
-    };
     const mapStoredMessage = (m) => ({
         id: m.id,
         fromMe: m.fromMe,
@@ -3428,7 +3476,7 @@ function getInstanceChatMessagesInternal(name, jid) {
         catch {
             // best-effort
         }
-        return isTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
+        return isCachedMessageTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
     }
     // Mescla memória + SQLite para garantir mensagens históricas não em memória
     try {
@@ -3439,17 +3487,17 @@ function getInstanceChatMessagesInternal(name, jid) {
             const extra = stored.filter((m) => !memIds.has(m.id));
             if (extra.length > 0) {
                 const mappedExtra = extra.map(mapStoredMessage);
-                const baseMessages = isTimestampSorted(memMessages)
+                const baseMessages = isCachedMessageTimestampSorted(memMessages)
                     ? memMessages
                     : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
-                return mergeSortedMessages(baseMessages, mappedExtra);
+                return mergeSortedCachedMessages(baseMessages, mappedExtra);
             }
         }
     }
     catch {
         // best-effort
     }
-    return isTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
+    return isCachedMessageTimestampSorted(memMessages) ? memMessages : [...memMessages].sort((a, b) => a.timestamp - b.timestamp);
 }
 function buildQuotedMessage(name, jid, replyToId) {
     // Only quote messages that are already present in the live in-memory chat cache.

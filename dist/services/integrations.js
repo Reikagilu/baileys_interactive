@@ -125,10 +125,15 @@ export function toPublicRow(row) {
 }
 export function getInstanceIntegrations(instance) {
     const normalized = String(instance || '').trim();
+    // Fast path: serve from cache when fresh.
+    const cached = _integrationsCache.get(normalized);
+    if (cached && cached.exp > Date.now())
+        return cached.value;
     const row = db.prepare('SELECT * FROM integration_configs WHERE instance = ?').get(normalized);
+    let value;
     if (!row) {
         const now = Date.now();
-        return {
+        value = {
             instance: normalized,
             chatwoot: defaultChatwoot(),
             n8n: defaultN8n(),
@@ -136,9 +141,24 @@ export function getInstanceIntegrations(instance) {
             updatedAt: now,
         };
     }
-    return toRow(row);
+    else {
+        value = toRow(row);
+    }
+    _integrationsCache.set(normalized, { value, exp: Date.now() + INTEGRATIONS_CACHE_TTL_MS });
+    return value;
 }
-// Cache for slug→instance lookups. Invalidated on every config update.
+// ─── Cache for getInstanceIntegrations ───────────────────────────────────────
+// getInstanceIntegrations is called on every messages.upsert (via dispatchToChatwoot),
+// contacts.update, chats.update, etc. Without a cache each call does a SQLite
+// SELECT. A short TTL of 5s keeps the data fresh while eliminating most DB reads
+// under sustained message load.
+const _integrationsCache = new Map();
+const INTEGRATIONS_CACHE_TTL_MS = 5_000;
+function invalidateIntegrationsCache(instance) {
+    _integrationsCache.delete(instance);
+}
+// ─── Cache for slug→instance lookups ─────────────────────────────────────────
+// Invalidated on every config update.
 // TTL of 60s as safety net in case invalidation is missed.
 // MAX_SLUG_CACHE_SIZE caps memory usage against slug-spray attacks.
 const _slugCache = new Map();
@@ -197,9 +217,9 @@ function saveInstanceIntegrations(next) {
        chatwoot_json = excluded.chatwoot_json,
        n8n_json = excluded.n8n_json,
        updated_at = excluded.updated_at`).run(next.instance, JSON.stringify(next.chatwoot), JSON.stringify(next.n8n), createdAt, now);
-    // Invalidate slug cache whenever config changes — ensures findInstanceByWebhookSlug
-    // picks up new/changed webhookSlug values immediately.
+    // Invalidate caches whenever config changes.
     invalidateSlugCache();
+    invalidateIntegrationsCache(next.instance);
     return {
         ...next,
         createdAt,

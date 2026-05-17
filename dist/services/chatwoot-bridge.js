@@ -12,7 +12,7 @@
  *   POST /v1/integrations/:instance/chatwoot/webhook receives Chatwoot events
  *   and dispatches messages to WhatsApp via sendMessage
  */
-import { getInstanceIntegrations } from './integrations.js';
+import { getInstanceIntegrations, updateChatwootConfig } from './integrations.js';
 import { listChats, listUnsyncedSyncMessages, getChatTitle, upsertChatMeta as msUpsertMeta } from './message-store.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
 import { config } from '../config.js';
@@ -1163,14 +1163,7 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     else if (media?.kind && media.kind !== 'text') {
         // Mídia existe mas não tem base64 (expirou no WhatsApp ou não foi possível baixar).
         // Substitui o placeholder genérico por aviso legível com a legenda original, se houver.
-        const MEDIA_LABELS = {
-            image: '🖼️ Imagem',
-            video: '🎥 Vídeo',
-            audio: '🎤 Áudio',
-            document: '📄 Documento',
-            sticker: '🪄 Sticker',
-        };
-        const label = MEDIA_LABELS[media.kind] ?? `📎 ${media.kind}`;
+        const label = MEDIA_KIND_LABELS[media.kind] ?? `📎 ${media.kind}`;
         const caption = media.caption ? `\n${media.caption}` : '';
         const filename = media.fileName ? ` (${media.fileName})` : '';
         content = `_${label}${filename} não disponível — mídia expirada ou não foi possível baixar._${caption}`;
@@ -1365,6 +1358,13 @@ function buildAgentNameFromPayload(payload) {
     return fallback;
 }
 // Module-level constants — allocated once, not per call.
+const MEDIA_KIND_LABELS = {
+    image: '🖼️ Imagem',
+    video: '🎥 Vídeo',
+    audio: '🎤 Áudio',
+    document: '📄 Documento',
+    sticker: '🪄 Sticker',
+};
 const FILE_EXT_TO_MIME = {
     mp3: 'audio/mpeg', ogg: 'audio/ogg; codecs=opus', oga: 'audio/ogg; codecs=opus', opus: 'audio/ogg; codecs=opus',
     m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', flac: 'audio/flac',
@@ -1662,8 +1662,7 @@ export async function autoCreateChatwootInbox(instanceName, linkedNumber = null,
             // Non-fatal: log but continue
             log.chatwoot.child(instanceName).warn('autoCreate: não foi possível atualizar webhook_url', err);
         }
-        // Save inboxId and webhookSlug back to config
-        const { updateChatwootConfig } = await import('./integrations.js');
+        // Save inboxId and webhookSlug back to config (use static import — already imported at top).
         updateChatwootConfig(instanceName, {
             inboxId: String(inbox.id),
             webhookSlug: slug,
