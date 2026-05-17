@@ -297,8 +297,10 @@ export function appendSyncError(instance: string, entry: Omit<SyncErrorEntry, 'a
     error: entry.error,
     scope: entry.scope,
   };
-  const errors = cur.errors ? [...cur.errors, full] : [full];
-  // Mantém só os mais recentes — trim do início.
+  // Reutiliza o array existente para evitar alocações intermediárias.
+  const errors = cur.errors ? cur.errors.slice() : [];
+  errors.push(full);
+  // Mantém só os mais recentes — trim do início (in-place).
   if (errors.length > MAX_TRACKED_ERRORS) errors.splice(0, errors.length - MAX_TRACKED_ERRORS);
   _progress.set(instance, {
     ...cur,

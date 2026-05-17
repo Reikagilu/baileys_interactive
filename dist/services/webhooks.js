@@ -22,10 +22,6 @@ function getDb() {
     setupSchema(_db);
     return _db;
 }
-// ---------------------------------------------------------------------------
-// Cache em memória de webhooks habilitados (invalidado em write)
-// Evita LIKE-scan O(N) a cada emitWebhookEvent no hot-path
-// ---------------------------------------------------------------------------
 let _webhooksCache = null;
 let _cleanupTimer = null;
 function invalidateWebhooksCache() {
@@ -35,7 +31,12 @@ function getCachedWebhooks() {
     if (_webhooksCache !== null)
         return _webhooksCache;
     const db = getDb();
-    _webhooksCache = db.prepare('SELECT * FROM webhooks WHERE enabled = 1 ORDER BY created_at DESC').all();
+    const rows = db.prepare('SELECT * FROM webhooks WHERE enabled = 1 ORDER BY created_at DESC').all();
+    // Pre-parse events once and store as Set for O(1) per-event checks during emit.
+    _webhooksCache = rows.map((row) => ({
+        row,
+        events: new Set(parseEvents(String(row.events ?? '[]'))),
+    }));
     return _webhooksCache;
 }
 // ---------------------------------------------------------------------------
@@ -285,19 +286,25 @@ export function deleteWebhook(id) {
 export function listSupportedWebhookEvents() {
     return [...allowedEventSet.values()];
 }
-// Filtro em JS a partir de cache: elimina LIKE-scan a cada emitWebhookEvent
+// Filtro em JS a partir de cache: elimina LIKE-scan a cada emitWebhookEvent.
+// Events pre-parsed as Set during cache build → O(1) per event lookup instead of O(events) includes.
 function selectEligibleWebhooks(event, instance) {
     const all = getCachedWebhooks();
-    return all
-        .filter((row) => {
-        const events = parseEvents(String(row.events ?? '[]'));
-        if (!events.includes(event))
-            return false;
-        if (instance)
-            return row.instance == null || row.instance === instance;
-        return row.instance == null;
-    })
-        .map(toWebhook);
+    const result = [];
+    for (const entry of all) {
+        if (!entry.events.has(event))
+            continue;
+        if (instance) {
+            if (entry.row.instance != null && entry.row.instance !== instance)
+                continue;
+        }
+        else {
+            if (entry.row.instance != null)
+                continue;
+        }
+        result.push(toWebhook(entry.row));
+    }
+    return result;
 }
 function enqueueDelivery(db, webhook, event, payload, instance) {
     const now = Date.now();
