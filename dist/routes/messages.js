@@ -398,6 +398,9 @@ router.post('/media', async (req, res) => {
                     fileName: fileName || undefined,
                     caption: caption || undefined,
                     replyToId: body.replyToId ? String(body.replyToId) : undefined,
+                    // Propaga flag explícita de nota de voz. Caller assume
+                    // responsabilidade: o backend força mime audio/ogg;codecs=opus.
+                    ptt: body.ptt === true,
                 }),
                 sendTimeout,
             ]);

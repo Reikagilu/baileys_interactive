@@ -7,7 +7,7 @@ import { isValidInstanceName } from '../utils/helpers.js';
 import { signMediaUrlToken } from '../utils/media-signature.js';
 import { emitWebhookEvent } from './webhooks.js';
 import { emitInstanceEvent, getInstanceGeneral, getInstancePanelConfig } from './instance-config.js';
-import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, runInTransaction as msRunInTransaction, } from './message-store.js';
+import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, runInTransaction as msRunInTransaction, bulkUpsertContacts as msBulkUpsertContacts, upsertContact as msUpsertContact, } from './message-store.js';
 import { markMessageSynced } from './chatwoot-sync-store.js';
 import { getInstanceIntegrations } from './integrations.js';
 import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
@@ -1362,10 +1362,65 @@ function classifyChatwootMediaDownloadFailure(errorMessage) {
  * Não modifica mensagens sem mídia. Retorna sempre o mesmo array de tamanho.
  */
 /**
+ * Resume um node de mídia para logging diagnóstico: marca presença e tamanho
+ * de cada campo crítico de download, sem expor bytes secretos.
+ */
+function summarizeMediaNodeForLog(node) {
+    const FIELDS = ['url', 'directPath', 'mediaKey', 'fileEncSha256', 'fileSha256', 'fileLength', 'mediaKeyTimestamp'];
+    const out = {};
+    for (const field of FIELDS) {
+        const val = node[field];
+        if (val === undefined || val === null) {
+            out[field] = false;
+            continue;
+        }
+        if (Buffer.isBuffer(val)) {
+            out[field] = `buf(${val.length})`;
+        }
+        else if (val instanceof Uint8Array) {
+            out[field] = `u8a(${val.length})`;
+        }
+        else if (typeof val === 'string') {
+            // url/directPath são strings reveláveis; mediaKey base64-encoded é segredo,
+            // então marcamos apenas o tamanho para chaves cripto.
+            if (field === 'url' || field === 'directPath') {
+                out[field] = val.length > 80 ? `${val.slice(0, 80)}…(${val.length})` : val;
+            }
+            else {
+                out[field] = `str(${val.length})`;
+            }
+        }
+        else if (typeof val === 'number' || typeof val === 'bigint') {
+            out[field] = String(val);
+        }
+        else if (val && typeof val === 'object') {
+            // Pode ser um plain object com chaves numéricas ('{ "0": 12, "1": 34, ... }')
+            // que aconteceu se um Buffer foi serializado via JSON.stringify e deserializado.
+            const obj = val;
+            const ctorName = obj.constructor?.name ?? 'Object';
+            const numericKeys = Object.keys(obj).filter((k) => /^\d+$/.test(k));
+            if (numericKeys.length > 0) {
+                out[field] = `bufLike(ctor=${ctorName}, numericKeys=${numericKeys.length})`;
+            }
+            else if ('type' in obj && obj.type === 'Buffer' && Array.isArray(obj.data)) {
+                out[field] = `bufJSON(${(obj.data).length})`;
+            }
+            else {
+                out[field] = `object(ctor=${ctorName}, keys=${Object.keys(obj).slice(0, 5).join(',')})`;
+            }
+        }
+        else {
+            out[field] = typeof val;
+        }
+    }
+    out.mimetype = typeof node.mimetype === 'string' ? node.mimetype : false;
+    return out;
+}
+/**
  * Processa uma única mensagem para enrichMediaForChatwoot.
  * Extraída para permitir paralelismo via Promise.all.
  */
-async function enrichSingleMessageForChatwoot(current, limit) {
+async function enrichSingleMessageForChatwoot(current, limit, instanceName) {
     const message = isRecord(current.message) ? current.message : null;
     if (!message)
         return current;
@@ -1383,8 +1438,10 @@ async function enrichSingleMessageForChatwoot(current, limit) {
     // usar o _src persistido no media (salvo durante ingestão da mensagem).
     const persistedSrc = isRecord(currentMedia?._src) ? currentMedia._src : null;
     const hasDownloadKeys = typeof found.node.url === 'string' || typeof found.node.directPath === 'string';
+    let usedPersistedSrc = false;
     if (!hasDownloadKeys && persistedSrc) {
         found = { kind: found.kind, node: { ...found.node, ...rehydrateMediaSourceNode(persistedSrc) } };
+        usedPersistedSrc = true;
     }
     // Retry para download de mídia (máximo 3 tentativas)
     const maxRetries = 3;
@@ -1437,20 +1494,32 @@ async function enrichSingleMessageForChatwoot(current, limit) {
         }
     }
     // Download falhou - marcar omittedReason.
-    log.whatsapp.warn('enrichMediaForChatwoot_failed', { kind: found.kind, error: lastDownloadError });
+    const classification = classifyChatwootMediaDownloadFailure(lastDownloadError);
+    const key = isRecord(current.key) ? current.key : {};
+    const remoteJid = typeof key.remoteJid === 'string' ? key.remoteJid : undefined;
+    const msgId = typeof key.id === 'string' ? key.id : undefined;
+    const fromMe = key.fromMe === true;
+    const participant = typeof key.participant === 'string' ? key.participant : undefined;
+    const logger = instanceName ? log.whatsapp.child(instanceName) : log.whatsapp;
+    logger.warn(`enrichMediaForChatwoot_failed kind=${found.kind} classification=${classification} jid=${remoteJid ?? '?'} id=${msgId ?? '?'} fromMe=${fromMe} usedPersistedSrc=${usedPersistedSrc} hasDownloadKeys=${hasDownloadKeys} attempts=${maxRetries}`, {
+        error: lastDownloadError,
+        participant,
+        node: summarizeMediaNodeForLog(found.node),
+        persistedSrcKeys: persistedSrc ? Object.keys(persistedSrc) : null,
+    });
     const existingMedia = isRecord(current.media) ? current.media : null;
     if (existingMedia && !existingMedia.base64) {
         return {
             ...current,
             media: {
                 ...existingMedia,
-                omittedReason: classifyChatwootMediaDownloadFailure(lastDownloadError),
+                omittedReason: classification,
             },
         };
     }
     return current;
 }
-export async function enrichMediaForChatwoot(messages) {
+export async function enrichMediaForChatwoot(messages, instanceName) {
     if (messages.length === 0)
         return messages;
     const limit = config.chatwoot.mediaMaxBytes;
@@ -1459,7 +1528,7 @@ export async function enrichMediaForChatwoot(messages) {
     const CONCURRENCY = 4;
     const enriched = new Array(messages.length);
     const tasks = messages.map((msg, i) => async () => {
-        enriched[i] = await enrichSingleMessageForChatwoot(msg, limit);
+        enriched[i] = await enrichSingleMessageForChatwoot(msg, limit, instanceName);
     });
     const queue = [...tasks];
     const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
@@ -1472,10 +1541,34 @@ export async function enrichMediaForChatwoot(messages) {
     return enriched;
 }
 function stripMessageNoise(value, depth = 0) {
+    // Preserve Buffer/TypedArray instances as-is — these carry binary payloads
+    // (mediaKey, fileEncSha256, sha256 hashes, etc.) that MUST remain typed for
+    // downstream crypto ops. Treating them as plain records via Object.entries
+    // would copy numeric indices into a plain `{ '0': N, ... }` object,
+    // corrupting the bytes and breaking AES decryption.
     if (Buffer.isBuffer(value))
+        return value;
+    if (value instanceof Uint8Array)
+        return value;
+    if (ArrayBuffer.isView(value))
+        return value;
+    if (value instanceof ArrayBuffer)
         return value;
     if (!isRecord(value) || depth > 8)
         return value;
+    // Preserve protobufjs Long objects (`{ low, high, unsigned }`) — they have
+    // prototype methods (toNumber/toString) that get lost if rebuilt as plain.
+    // Detect by shape since `instanceof Long` is unreliable across module copies.
+    const proto = Object.getPrototypeOf(value);
+    if (proto &&
+        proto.constructor &&
+        typeof proto.constructor === 'function' &&
+        proto.constructor.name === 'Long' &&
+        'low' in value &&
+        'high' in value &&
+        'unsigned' in value) {
+        return value;
+    }
     const output = {};
     for (const [key, entry] of Object.entries(value)) {
         if (EXTERNAL_MESSAGE_STRIP_KEYS.has(key))
@@ -1806,16 +1899,26 @@ function updateCachedMessage(instance, payload) {
         chat.lastMessage = payload.text;
         chat.lastTimestamp = payload.timestamp;
     }
-    // Atualizar title com pushName quando o título atual é apenas o número de telefone.
-    // Só atualiza se a integração Chatwoot da instância tiver importContacts=true.
+    // Atualizar contato em `contacts` (fonte de verdade) com o pushName recebido
+    // quando a flag general.importContacts está ativa. Também alimenta chat_meta.title
+    // como cache/fallback quando o título atual ainda é vazio ou apenas o número.
     // Nunca usa o pushName de mensagens fromMe (que seria o nome da própria instância).
     if (payload.senderName &&
         !payload.fromMe && // pushName de fromMe é o nome da própria instância, não do contato
         !payload.participant && // não é grupo (participant seria o JID do membro)
         !payload.jid.endsWith('@g.us') &&
         !payload.jid.endsWith('@newsletter')) {
-        const _importContactsCfg = getInstanceIntegrations(instance).chatwoot;
-        if (_importContactsCfg?.importContacts === true) {
+        if (getInstanceGeneral(instance).importContacts === true) {
+            // Grava na tabela contacts (fonte de verdade canônica para nome).
+            try {
+                msUpsertContact(instance, {
+                    jid: payload.jid,
+                    notify: payload.senderName,
+                });
+            }
+            catch { /* best-effort */ }
+            // Mantém chat_meta.title como cache para listagens existentes — apenas
+            // sobrescreve quando atual é vazio ou só dígitos (não sobrescreve nome real).
             const currentTitle = chat.title || '';
             const isPhoneOnlyTitle = /^\d+$/.test(currentTitle);
             if (isPhoneOnlyTitle || !currentTitle) {
@@ -2610,17 +2713,17 @@ export async function createInstance(name, authFolder) {
             void handleCorruptedSelfSessions(name, ctx, list).catch((err) => {
                 log.whatsapp.child(name).warn('handleCorruptedSelfSessions_failed', err);
             });
-            // Resolver títulos de JIDs @lid via lidMapping → nome do contato, quando importContacts=true
+            // Resolver títulos de JIDs @lid via lidMapping → nome do contato, quando importContacts=true.
+            // Em Baileys 7.x não existe mais `sock.store`, então a única fonte de nome
+            // disponível na hora de uma mensagem é `msg.senderName` (pushName).
             void (async () => {
                 try {
                     const lidMapping = ctx.sock?.signalRepository?.lidMapping;
                     if (!lidMapping?.getPNForLID)
                         return;
-                    const importContactsEnabled = getInstanceIntegrations(name).chatwoot?.importContacts === true;
+                    const importContactsEnabled = getInstanceGeneral(name).importContacts === true;
                     if (!importContactsEnabled)
                         return;
-                    const store = ctx.sock?.store?.contacts;
-                    // Cachear fora do loop para evitar O(N_chats × N_msgs) por upsert
                     const chatList = getInstanceChatList(name);
                     const chatListByJid = new Map(chatList.map((c) => [c.jid, c]));
                     for (const msg of list) {
@@ -2637,13 +2740,70 @@ export async function createInstance(name, authFolder) {
                         if (!pnUser || !/^\d+$/.test(pnUser))
                             continue;
                         const pnJid = `${pnUser}@s.whatsapp.net`;
-                        const contact = store?.[pnJid] ?? store?.[msgJid];
-                        const name_ = String(contact?.verifiedName || contact?.name || contact?.notify || msg.senderName || '').trim();
+                        const name_ = String(msg.senderName || '').trim();
                         if (name_ && !/^\d+$/.test(name_) && name_ !== pnUser) {
+                            // Grava em contacts (fonte de verdade) com lid + phoneNumber.
+                            // sender_name vem do pushName → mapeado como "notify" (fraco), preservando
+                            // qualquer "name" forte já gravado por eventos contacts.*.
+                            try {
+                                msUpsertContact(name, {
+                                    jid: pnJid,
+                                    lid: msgJid,
+                                    phoneNumber: pnJid,
+                                    notify: name_,
+                                });
+                            }
+                            catch { /* best-effort */ }
                             upsertCachedChatMeta(name, { jid: msgJid, title: name_ });
-                            // Atualizar também o JID PN se existir no cache
                             upsertCachedChatMeta(name, { jid: pnJid, title: name_ });
                         }
+                    }
+                }
+                catch { /* best-effort */ }
+            })();
+            // Promoção ativa de contatos a partir de pushName: a cada `messages.upsert`,
+            // para mensagens recebidas de JIDs PN (@s.whatsapp.net), grava o pushName
+            // (msg.senderName) na tabela `contacts` como `notify` (campo fraco).
+            // Em Baileys 7.x não existe mais `sock.store`, então pushName é a única
+            // fonte de nome obtida em runtime sem depender de eventos `contacts.*`.
+            // upsertContact preserva qualquer `name`/`verifiedName` forte já existente
+            // graças ao CASE WHEN baseado em isMeaningfulName.
+            void (async () => {
+                try {
+                    if (getInstanceGeneral(name).importContacts !== true)
+                        return;
+                    // Coleta de pares (jid, pushName) únicos para gravar.
+                    const candidates = new Map();
+                    for (const msg of list) {
+                        if (msg.fromMe)
+                            continue;
+                        const pushName = String(msg.senderName ?? '').trim();
+                        if (!pushName)
+                            continue;
+                        if (/^\d+$/.test(pushName))
+                            continue; // só números, ignora
+                        // JID principal da conversa (chat).
+                        const jid = String(msg.jid ?? '');
+                        if (jid.endsWith('@s.whatsapp.net')) {
+                            candidates.set(jid, pushName);
+                        }
+                        // Participante: em mensagens de grupo, é o PN do remetente real.
+                        const participant = String(msg.participant ?? '');
+                        if (participant.endsWith('@s.whatsapp.net')) {
+                            candidates.set(participant, pushName);
+                        }
+                    }
+                    if (candidates.size === 0)
+                        return;
+                    for (const [jid, pushName] of candidates) {
+                        try {
+                            msUpsertContact(name, {
+                                jid,
+                                phoneNumber: jid,
+                                notify: pushName,
+                            });
+                        }
+                        catch { /* best-effort */ }
                     }
                 }
                 catch { /* best-effort */ }
@@ -2675,7 +2835,7 @@ export async function createInstance(name, authFolder) {
                         // Garante que mídias tenham base64 inline para o Chatwoot,
                         // independentemente da flag de webhooks externos. Sem isso, áudios,
                         // vídeos e imagens chegam vazios no Chatwoot.
-                        const messagesForChatwoot = await enrichMediaForChatwoot(realMessages);
+                        const messagesForChatwoot = await enrichMediaForChatwoot(realMessages, name);
                         void dispatchToChatwoot(name, messagesForChatwoot);
                     }
                 })().catch((err) => {
@@ -2732,6 +2892,20 @@ export async function createInstance(name, authFolder) {
         sock.ev.on('messaging-history.set', (payload) => {
             const data = (payload ?? {});
             const settings = getInstanceGeneral(name);
+            // Persistir contatos do app-state sync inicial. Este é o canal mais
+            // importante: o Baileys entrega aqui a snapshot completa dos contatos
+            // da agenda do usuário. Ignorávamos o array antes — esse era o bug
+            // principal de "não consigo importar contatos".
+            const incomingContacts = Array.isArray(data.contacts) ? data.contacts : [];
+            let ingestedContacts = 0;
+            if (incomingContacts.length > 0 && settings.importContacts === true) {
+                try {
+                    ingestedContacts = msBulkUpsertContacts(name, incomingContacts);
+                }
+                catch (err) {
+                    log.whatsapp.child(name).warn('history_contacts_ingest_failed', err);
+                }
+            }
             const chats = Array.isArray(data.chats) ? data.chats : [];
             // Agrupa upsert de chat_meta em uma única transação (mesmo problema:
             // sem isso cada chat vira um fsync em série).
@@ -2757,6 +2931,9 @@ export async function createInstance(name, authFolder) {
                 }
             }
             const originalList = Array.isArray(data.messages) ? data.messages : [];
+            // Log de visibilidade: o evento mais relevante para popular contatos é
+            // emitido só uma vez por conexão. Importante saber em INFO o que veio.
+            log.whatsapp.child(name).info(`messaging_history_set chats=${chats.length} contacts=${incomingContacts.length} contactsIngested=${ingestedContacts} messages=${originalList.length} importContacts=${settings.importContacts === true}`);
             // Ingest chunked + async para não bloquear o event loop. Esse handler
             // tipicamente recebe centenas/milhares de mensagens — sem o chunking,
             // o keepalive estoura e a conexão cai (408), reiniciando a sync em loop.
@@ -2898,87 +3075,37 @@ export async function createInstance(name, authFolder) {
                 doChatsUpsert();
             }
         });
-        sock.ev.on('contacts.set', (payload) => {
-            void emitInstanceEvent(name, 'CONTACTS_SET', { payload });
-            // Persistir nomes dos contatos no chat_meta apenas se importContacts=true
-            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
+        // Handler unificado para todos os eventos contacts.*. Persiste em
+        // contacts (fonte de verdade) usando bulkUpsertContacts. Não escreve
+        // em chat_meta.title — esse canal é só para metadados de chat.
+        // O guard usa general.importContacts (não mais chatwoot.importContacts).
+        const handleContactsBatch = (origin, raw) => {
+            if (getInstanceGeneral(name).importContacts !== true)
                 return;
-            const data = (payload ?? {});
-            const contacts = Array.isArray(data.contacts) ? data.contacts : [];
-            if (contacts.length > 0) {
-                try {
-                    msRunInTransaction(() => {
-                        for (const c of contacts) {
-                            const jid = String(c.id ?? '').trim();
-                            if (!jid)
-                                continue;
-                            const title = extractChatTitleFromPayload(c);
-                            if (title && title !== jid.split('@')[0]) {
-                                upsertCachedChatMeta(name, { jid, title });
-                            }
-                        }
-                    });
-                }
-                catch (err) {
-                    log.whatsapp.child(name).warn('contacts_set_meta_failed', err);
+            if (!raw || raw.length === 0)
+                return;
+            try {
+                const ingested = msBulkUpsertContacts(name, raw);
+                if (ingested > 0) {
+                    log.whatsapp.child(name).debug(`${origin}_ingested count=${ingested}`);
                 }
             }
+            catch (err) {
+                log.whatsapp.child(name).warn(`${origin}_ingest_failed`, err);
+            }
+        };
+        sock.ev.on('contacts.set', (payload) => {
+            void emitInstanceEvent(name, 'CONTACTS_SET', { payload });
+            const data = (payload ?? {});
+            handleContactsBatch('contacts.set', Array.isArray(data.contacts) ? data.contacts : []);
         });
         sock.ev.on('contacts.update', (payload) => {
             void emitInstanceEvent(name, 'CONTACTS_UPDATE', { payload });
-            // Atualizar nomes dos contatos no chat_meta apenas se importContacts=true
-            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
-                return;
-            const updates = Array.isArray(payload) ? payload : [];
-            if (updates.length === 0)
-                return;
-            const doUpdate = () => {
-                for (const c of updates) {
-                    const jid = String(c.id ?? '').trim();
-                    if (!jid)
-                        continue;
-                    const title = extractChatTitleFromPayload(c);
-                    if (title && title !== jid.split('@')[0]) {
-                        upsertCachedChatMeta(name, { jid, title });
-                    }
-                }
-            };
-            if (updates.length >= 5) {
-                try {
-                    msRunInTransaction(doUpdate);
-                }
-                catch {
-                    doUpdate();
-                }
-            }
-            else {
-                doUpdate();
-            }
+            handleContactsBatch('contacts.update', Array.isArray(payload) ? payload : []);
         });
         sock.ev.on('contacts.upsert', (payload) => {
             void emitInstanceEvent(name, 'CONTACTS_UPSERT', { payload });
-            // Persistir nomes dos contatos no chat_meta apenas se importContacts=true
-            if (getInstanceIntegrations(name).chatwoot?.importContacts !== true)
-                return;
-            const contacts = Array.isArray(payload) ? payload : [];
-            if (contacts.length > 0) {
-                try {
-                    msRunInTransaction(() => {
-                        for (const c of contacts) {
-                            const jid = String(c.id ?? '').trim();
-                            if (!jid)
-                                continue;
-                            const title = extractChatTitleFromPayload(c);
-                            if (title && title !== jid.split('@')[0]) {
-                                upsertCachedChatMeta(name, { jid, title });
-                            }
-                        }
-                    });
-                }
-                catch (err) {
-                    log.whatsapp.child(name).warn('contacts_upsert_meta_failed', err);
-                }
-            }
+            handleContactsBatch('contacts.upsert', Array.isArray(payload) ? payload : []);
         });
         sock.ev.on('groups.upsert', (payload) => {
             void emitInstanceEvent(name, 'GROUPS_UPSERT', { payload });
@@ -3855,11 +3982,20 @@ export async function sendInstanceMediaMessage(name, jid, params) {
             return { ok: false, error: fetched.error };
         }
         // 2) Resolve mimeType final (prioriza o que veio no payload do Chatwoot).
-        const mime = (params.mimeType?.trim() || fetched.mimeType || 'application/octet-stream').toLowerCase();
+        let mime = (params.mimeType?.trim() || fetched.mimeType || 'application/octet-stream').toLowerCase();
         const delimiter = normalizeSignDelimiter(params.signDelimiter);
         const rawCaption = params.caption ?? '';
         const signedCaption = formatChatwootOutboundLabel(rawCaption, delimiter, params.agentName).trim();
-        const sendAsVoiceNote = shouldSendAsVoiceNote(mime, params.fileName);
+        // Caller pode forçar PTT explicitamente (ex.: gravação de voz vinda do
+        // Chatwoot ou body.ptt:true no endpoint REST). Caso contrário, cai na
+        // heurística por mimetype/extensão.
+        const sendAsVoiceNote = params.ptt === true || shouldSendAsVoiceNote(mime, params.fileName);
+        // Quando PTT for explícito, normaliza o mime para o container que o
+        // WhatsApp reconhece como nota de voz. Sem isso, o Baileys empacota
+        // como anexo mesmo com ptt:true.
+        if (params.ptt === true && mime.startsWith('audio/')) {
+            mime = 'audio/ogg; codecs=opus';
+        }
         let content;
         let needsAudioCaptionFallback = false;
         if (mime === 'image/webp') {

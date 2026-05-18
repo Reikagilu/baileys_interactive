@@ -51,6 +51,16 @@ export interface GeneralConfig {
     autoReadMessages: boolean;
     syncFullHistory: boolean;
     readStatus: boolean;
+    /**
+     * Importa contatos do WhatsApp para a tabela `contacts` local e habilita
+     * uso de pushNames/agenda real ao montar nomes em integrações (Chatwoot,
+     * listagens). Padrão false para preservar privacidade — exige opt-in.
+     *
+     * Esta flag substitui a antiga `chatwoot.importContacts`. Para instâncias
+     * legadas, `migrateLegacyImportContactsFlag` (em integrations.ts) copia
+     * o valor antigo para cá no startup.
+     */
+    importContacts: boolean;
 }
 
 export interface EventsConfig {
@@ -72,7 +82,15 @@ function defaultProxy(): ProxyConfig {
 }
 
 function defaultGeneral(): GeneralConfig {
-    return { rejectCalls: false, ignoreGroups: false, alwaysOnline: false, autoReadMessages: false, syncFullHistory: false, readStatus: false };
+    return {
+        rejectCalls: false,
+        ignoreGroups: false,
+        alwaysOnline: false,
+        autoReadMessages: false,
+        syncFullHistory: false,
+        readStatus: false,
+        importContacts: false,
+    };
 }
 
 function defaultEvents(): EventsConfig {
@@ -239,6 +257,7 @@ export function updateInstanceGeneral(instance: string, patch: Partial<GeneralCo
             autoReadMessages: patch.autoReadMessages ?? current.general.autoReadMessages,
             syncFullHistory: patch.syncFullHistory ?? current.general.syncFullHistory,
             readStatus: patch.readStatus ?? current.general.readStatus,
+            importContacts: patch.importContacts ?? current.general.importContacts,
         },
     });
 }

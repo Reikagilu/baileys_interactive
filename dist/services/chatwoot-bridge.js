@@ -13,7 +13,8 @@
  *   and dispatches messages to WhatsApp via sendMessage
  */
 import { getInstanceIntegrations, updateChatwootConfig } from './integrations.js';
-import { listChats, listUnsyncedSyncMessages, getChatTitle, upsertChatMeta as msUpsertMeta } from './message-store.js';
+import { listChats, listUnsyncedSyncMessages, getChatTitle, upsertChatMeta as msUpsertMeta, getContactName as msGetContactName, upsertContact as msUpsertContact, } from './message-store.js';
+import { getInstanceGeneral } from './instance-config.js';
 import { isChatwootOriginated } from './chatwoot-tracking.js';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
@@ -189,7 +190,22 @@ async function resolveContactName(instanceName, jid, fallback) {
             return false;
         return true;
     };
-    // 1) Baileys store — the actual WhatsApp address book
+    // 0) Tabela `contacts` (fonte de verdade canônica para nomes).
+    //    Persistida por messaging-history.set / contacts.* / @lid resolver.
+    //    Tenta tanto pelo JID original quanto pelo canônico (cobre @lid↔PN).
+    try {
+        const nameFromTable = msGetContactName(instanceName, canonicalJid)
+            ?? (canonicalJid !== jid ? msGetContactName(instanceName, jid) : null);
+        if (isUsableName(nameFromTable)) {
+            const resolved = nameFromTable.trim();
+            contactNameCache.set(cacheKey, { name: resolved, expires: Date.now() + CONTACT_NAME_CACHE_MS });
+            return resolved;
+        }
+    }
+    catch {
+        // best-effort — tabela contacts pode estar vazia em instâncias novas
+    }
+    // 1) Baileys store — the actual WhatsApp address book (volátil em memória)
     // Tenta pelo JID canônico (PN) e também pelo LID original
     try {
         const wa = await import('./whatsapp.js');
@@ -201,6 +217,18 @@ async function resolveContactName(instanceName, jid, fallback) {
             const candidate = contact.verifiedName || contact.name || contact.notify;
             if (isUsableName(candidate)) {
                 const resolved = candidate.trim();
+                // Persiste no SQLite para sobreviver a restarts e ser fonte de verdade.
+                try {
+                    msUpsertContact(instanceName, {
+                        jid: canonicalJid,
+                        lid: isLid ? jid : null,
+                        phoneNumber: canonicalJid.endsWith('@s.whatsapp.net') ? canonicalJid : null,
+                        verifiedName: contact.verifiedName ?? null,
+                        name: contact.name ?? null,
+                        notify: contact.notify ?? null,
+                    });
+                }
+                catch { /* best-effort */ }
                 contactNameCache.set(cacheKey, { name: resolved, expires: Date.now() + CONTACT_NAME_CACHE_MS });
                 return resolved;
             }
@@ -1047,7 +1075,11 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     // For groups: name/number of whoever actually sent the message (for content prefix)
     let senderLabel;
     // Flag importContacts: quando true, prioriza nomes reais (pushName/subject); quando false, usa o número/JID puro.
-    const useRealNames = cfg.importContacts !== false;
+    // Fonte primária é `GeneralConfig.importContacts` (mais novo). `cfg.importContacts`
+    // (legacy ChatwootConfig) é mantido como fallback para instâncias ainda não migradas
+    // — embora `migrateLegacyImportContactsFlag` no startup já copie para o General.
+    const useRealNames = getInstanceGeneral(instanceName).importContacts === true
+        || cfg.importContacts === true;
     if (isGroup) {
         // Group: one conversation per group, contact = the group itself
         conversationJid = remoteJid;
@@ -1106,7 +1138,16 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
             const incomingName = (!isFromMe && (sender?.name || pushName)) || undefined;
             const storedTitle = getChatTitle(instanceName, remoteJid);
             if (incomingName && /[a-zA-ZÀ-ÿ]/.test(incomingName)) {
-                // pushName ou sender.name tem letras: persistir no chat_meta e usar como nome
+                // pushName ou sender.name tem letras: persistir tanto na tabela `contacts`
+                // (fonte de verdade) quanto em chat_meta.title (cache para listagens existentes).
+                try {
+                    msUpsertContact(instanceName, {
+                        jid: remoteJid,
+                        phoneNumber: remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : null,
+                        notify: incomingName,
+                    });
+                }
+                catch { /* best-effort */ }
                 msUpsertMeta(instanceName, remoteJid, { title: incomingName });
                 contactName = incomingName;
             }
@@ -1382,13 +1423,56 @@ const FILE_EXT_TO_MIME = {
     txt: 'text/plain', csv: 'text/csv',
 };
 const CHATWOOT_CATEGORY_TO_MIME = {
-    audio: 'audio/mpeg',
+    // Quando o Chatwoot envia `file_type: "audio"` (categoria), o conteúdo é
+    // tipicamente uma gravação produzida pelo MediaRecorder do navegador no
+    // próprio Chatwoot. Mapeamos para `audio/ogg; codecs=opus` para que o
+    // Baileys reconheça como PTT (nota de voz) ao invés de anexo de áudio.
+    audio: 'audio/ogg; codecs=opus',
     video: 'video/mp4',
     image: 'image/jpeg',
     sticker: 'image/webp',
     document: 'application/octet-stream',
     file: 'application/octet-stream',
 };
+/**
+ * Extensões de arquivo cujo conteúdo, quando vem do webhook do Chatwoot,
+ * é tipicamente uma gravação ao vivo feita pela UI do agente (MediaRecorder
+ * do navegador). Tratadas como nota de voz (PTT) por padrão.
+ */
+const CHATWOOT_VOICE_NOTE_EXTS = new Set(['ogg', 'oga', 'opus', 'webm', 'm4a', 'mp4', 'mp3']);
+/**
+ * Retorna true se o attachment do Chatwoot deve ser enviado como nota de voz
+ * (PTT) ao WhatsApp. Heurística:
+ *   - `file_type` é a categoria genérica `"audio"` (caminho mais comum), OU
+ *   - extensão do filename/URL está em `CHATWOOT_VOICE_NOTE_EXTS`.
+ */
+function shouldChatwootAttachmentBePtt(fileType, fileName, mediaUrl) {
+    const ft = fileType.trim().toLowerCase();
+    if (ft === 'audio')
+        return true;
+    // Quando o fileType já vem como mimetype explícito de áudio, considera PTT
+    // apenas se for um codec compatível com nota de voz no WhatsApp.
+    if (ft.startsWith('audio/')) {
+        if (ft.includes('codecs=opus') || ft === 'audio/ogg')
+            return true;
+        // outros mimetypes de áudio (ex: audio/wav puro) NÃO são tratados como PTT
+        // automaticamente; respeita a heurística do downstream.
+    }
+    const ext = (() => {
+        const fromFileName = fileName?.split('.').pop()?.toLowerCase() ?? '';
+        if (fromFileName)
+            return fromFileName;
+        if (!mediaUrl)
+            return '';
+        try {
+            return new URL(mediaUrl).pathname.split('.').pop()?.toLowerCase() ?? '';
+        }
+        catch {
+            return mediaUrl.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase() ?? '';
+        }
+    })();
+    return ext ? CHATWOOT_VOICE_NOTE_EXTS.has(ext) && (ft === 'audio' || ft === '' || ft.startsWith('audio')) : false;
+}
 /**
  * Chatwoot's attachment `file_type` field can be a bare category name
  * ("audio", "video", "image", "document", "sticker") rather than a full
@@ -1486,8 +1570,14 @@ export function parseChatwootWebhook(payload) {
         .map(({ attachment, mediaUrl }) => {
         const fileName = typeof attachment.file_name === 'string' ? attachment.file_name : undefined;
         const rawType = typeof attachment.file_type === 'string' ? attachment.file_type : '';
-        const mimeType = normalizeChatwootFileType(rawType, fileName, mediaUrl);
-        return { mediaUrl: mediaUrl, mimeType, fileName };
+        const voiceNote = shouldChatwootAttachmentBePtt(rawType, fileName, mediaUrl);
+        // Se for nota de voz, força o mimetype para o codec aceito pelo WhatsApp,
+        // mesmo se a extensão (ex: .webm/.m4a do MediaRecorder) sugerisse outra coisa.
+        // Caso contrário, segue a normalização padrão.
+        const mimeType = voiceNote
+            ? 'audio/ogg; codecs=opus'
+            : normalizeChatwootFileType(rawType, fileName, mediaUrl);
+        return { mediaUrl: mediaUrl, mimeType, fileName, voiceNote };
     });
     if (attachments.length > 0) {
         return {

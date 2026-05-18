@@ -226,6 +226,7 @@
               <label class="switch-row"><div class="switch-row-info"><span class="switch-row-label">Sempre online</span></div><label class="switch"><input type="checkbox" id="settingAlwaysOnline"></label></label>
               <label class="switch-row"><div class="switch-row-info"><span class="switch-row-label">Ler mensagens automaticamente</span></div><label class="switch"><input type="checkbox" id="settingAutoReadMessages"></label></label>
               <label class="switch-row"><div class="switch-row-info"><span class="switch-row-label">Sincronizar histórico completo ao conectar</span></div><label class="switch"><input type="checkbox" id="settingSyncFullHistory"></label></label>
+              <label class="switch-row"><div class="switch-row-info"><span class="switch-row-label">Importar contatos</span><span class="switch-row-hint">Persiste contatos do WhatsApp (agenda, pushNames) na base local. Usado para mostrar nomes reais nas listagens e em integrações como Chatwoot.</span></div><label class="switch"><input type="checkbox" id="settingImportContacts"></label></label>
               <label class="switch-row"><div class="switch-row-info"><span class="switch-row-label">Ler status automaticamente</span></div><label class="switch"><input type="checkbox" id="settingReadStatus"></label></label>
             </div>
             <div class="form-actions"><button type="button" id="btnSaveGeneral" class="btn btn-primary">Salvar</button></div>
@@ -329,10 +330,7 @@
                 <div class="switch-row-info"><span class="switch-row-label">Conversation Pending</span><p class="switch-row-hint">Conversas iniciam como pending.</p></div>
                 <label class="switch"><input type="checkbox" id="intChatwootConversationPending"></label>
               </div>
-              <div class="switch-row">
-                <div class="switch-row-info"><span class="switch-row-label">Import Contacts</span><p class="switch-row-hint">Usa nomes reais (pushName) ao criar contatos.</p></div>
-                <label class="switch"><input type="checkbox" id="intChatwootImportContacts"></label>
-              </div>
+              <!-- Import Contacts foi movido para a seção "Configurações gerais" (settingImportContacts). -->
               <div class="switch-row">
                 <div class="switch-row-info"><span class="switch-row-label">Import Messages</span><p class="switch-row-hint">Sincroniza histórico ao conectar (respeita Days Limit).</p></div>
                 <label class="switch"><input type="checkbox" id="intChatwootImportMessages" checked></label>

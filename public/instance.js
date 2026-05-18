@@ -180,6 +180,7 @@
       autoReadMessages: document.getElementById('settingAutoReadMessages'),
       syncFullHistory: document.getElementById('settingSyncFullHistory'),
       readStatus: document.getElementById('settingReadStatus'),
+      importContacts: document.getElementById('settingImportContacts'),
     },
     proxy: {
       enabled: document.getElementById('proxyEnabled'),
@@ -217,7 +218,7 @@
       logoUrl: document.getElementById('intChatwootLogoUrl'),
       conversationPending: document.getElementById('intChatwootConversationPending'),
       reopenConversation: document.getElementById('intChatwootReopenConversation'),
-      importContacts: document.getElementById('intChatwootImportContacts'),
+      // importContacts: movido para settings.importContacts (Configurações gerais).
       importMessages: document.getElementById('intChatwootImportMessages'),
       daysLimit: document.getElementById('intChatwootDaysLimit'),
       ignoreJids: document.getElementById('intChatwootIgnoreJids'),
@@ -1005,12 +1006,14 @@
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/settings`);
       if (!response.ok) return;
       const g = data.general || {};
-      el.settings.rejectCalls.checked = !!g.rejectCalls;
-      el.settings.ignoreGroups.checked = !!g.ignoreGroups;
-      el.settings.alwaysOnline.checked = !!g.alwaysOnline;
-      el.settings.autoReadMessages.checked = !!g.autoReadMessages;
-      el.settings.syncFullHistory.checked = !!g.syncFullHistory;
-      el.settings.readStatus.checked = !!g.readStatus;
+      const setChk = (node, val) => { if (node) node.checked = !!val; };
+      setChk(el.settings.rejectCalls, g.rejectCalls);
+      setChk(el.settings.ignoreGroups, g.ignoreGroups);
+      setChk(el.settings.alwaysOnline, g.alwaysOnline);
+      setChk(el.settings.autoReadMessages, g.autoReadMessages);
+      setChk(el.settings.syncFullHistory, g.syncFullHistory);
+      setChk(el.settings.importContacts, g.importContacts);
+      setChk(el.settings.readStatus, g.readStatus);
       const p = data.proxy || {};
       el.proxy.enabled.checked = !!p.enabled;
       el.proxy.protocol.value = p.protocol || '';
@@ -1023,13 +1026,15 @@
 
   async function saveGeneral() {
     try {
+      const chk = (node) => (node ? !!node.checked : undefined);
       const body = {
-        rejectCalls: el.settings.rejectCalls.checked,
-        ignoreGroups: el.settings.ignoreGroups.checked,
-        alwaysOnline: el.settings.alwaysOnline.checked,
-        autoReadMessages: el.settings.autoReadMessages.checked,
-        syncFullHistory: el.settings.syncFullHistory.checked,
-        readStatus: el.settings.readStatus.checked,
+        rejectCalls: chk(el.settings.rejectCalls),
+        ignoreGroups: chk(el.settings.ignoreGroups),
+        alwaysOnline: chk(el.settings.alwaysOnline),
+        autoReadMessages: chk(el.settings.autoReadMessages),
+        syncFullHistory: chk(el.settings.syncFullHistory),
+        importContacts: chk(el.settings.importContacts),
+        readStatus: chk(el.settings.readStatus),
       };
       const { response, data } = await api(`/v1/instances/${encodeURIComponent(instance)}/settings/general`, {
         method: 'PATCH', body: JSON.stringify(body)
@@ -1146,7 +1151,7 @@
     el.intChatwoot.logoUrl.value = cw.logoUrl || '';
     el.intChatwoot.conversationPending.checked = !!cw.conversationPending;
     el.intChatwoot.reopenConversation.checked = cw.reopenConversation !== false;
-    el.intChatwoot.importContacts.checked = !!cw.importContacts;
+    // importContacts foi movido para Configurações gerais; valor é populado em loadSettings().
     el.intChatwoot.importMessages.checked = cw.importMessages !== false;
     el.intChatwoot.daysLimit.value = cw.daysLimitImportMessages || 7;
     el.intChatwoot.ignoreJids.value = Array.isArray(cw.ignoreJids) ? cw.ignoreJids.join('\n') : '';
@@ -1190,7 +1195,7 @@
       logoUrl: el.intChatwoot.logoUrl.value.trim(),
       conversationPending: el.intChatwoot.conversationPending.checked,
       reopenConversation: el.intChatwoot.reopenConversation.checked,
-      importContacts: el.intChatwoot.importContacts.checked,
+      // importContacts agora vive em Configurações gerais; enviado por saveGeneral().
       importMessages: el.intChatwoot.importMessages.checked,
       daysLimitImportMessages: Number(el.intChatwoot.daysLimit.value) || 7,
       ignoreJids,

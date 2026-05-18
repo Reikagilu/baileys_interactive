@@ -163,6 +163,33 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_chat_meta_instance_last_ts
       ON chat_meta (instance, last_ts)
   `);
+    // ─── Tabela dedicada de contatos ───────────────────────────────────────────
+    // Substitui o uso de chat_meta.title para armazenar nomes de contato.
+    // chat_meta continua existindo para metadados de chat (lastMessage, unread,
+    // group subject), mas o nome humano canônico de um contato individual vive
+    // aqui. Resolução de nome lê primeiro desta tabela; chat_meta.title fica
+    // como fallback para chats já populados antes da migração e para grupos.
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      instance      TEXT NOT NULL,
+      jid           TEXT NOT NULL,
+      lid           TEXT,
+      phone_number  TEXT,
+      name          TEXT,
+      notify        TEXT,
+      verified_name TEXT,
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (instance, jid)
+    )
+  `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_contacts_instance_lid
+      ON contacts (instance, lid)
+  `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_contacts_instance_phone
+      ON contacts (instance, phone_number)
+  `);
     // Garante que a tabela chatwoot_synced existe antes que listUnsyncedSyncMessages
     // execute o LEFT JOIN. chatwoot-sync-store.ts usa a mesma conexão e também cria
     // esta tabela, mas a ordem de inicialização não é garantida.
@@ -458,6 +485,233 @@ export function countMessages(instance, jid) {
 export function clearInstance(instance) {
     stmt('clearInstance.messages', 'DELETE FROM messages WHERE instance = ?').run(instance);
     stmt('clearInstance.chatMeta', 'DELETE FROM chat_meta WHERE instance = ?').run(instance);
+    stmt('clearInstance.contacts', 'DELETE FROM contacts WHERE instance = ?').run(instance);
+}
+// ─── Contatos ────────────────────────────────────────────────────────────────
+/**
+ * Normaliza string vinda de payload Baileys: trim + descarta vazio.
+ * Retorna `null` para que SQL preserve a coluna existente via COALESCE.
+ */
+function normalizeContactField(value) {
+    if (value === undefined || value === null)
+        return null;
+    const trimmed = String(value).trim();
+    return trimmed || null;
+}
+/**
+ * Regex usada para distinguir um pushName "fraco" (apenas dígitos do JID)
+ * de um nome humano. Reutilizada do critério do chatwoot-bridge.
+ */
+function isMeaningfulName(value) {
+    if (!value)
+        return false;
+    // Aceita números formatados ou nomes com letras; rejeita apenas
+    // identificadores brutos (somente dígitos sem formatação).
+    return /[a-zA-ZÀ-ÿ+\-\s]/.test(value);
+}
+/**
+ * Upsert de um contato. Campos `null`/ausentes não sobrescrevem valores
+ * existentes (COALESCE). Sempre atualiza `updated_at`.
+ *
+ * Para `name`/`notify`/`verifiedName` aplica também uma proteção extra:
+ * uma string vazia ou só dígitos sem formatação NÃO sobrescreve um nome
+ * humano já gravado — evita que pushNames "fracos" (que coincidem com o
+ * número de telefone) apaguem o nome real vindo da agenda.
+ */
+export function upsertContact(instance, patch) {
+    if (!instance || !patch.jid)
+        return;
+    const jid = patch.jid.trim();
+    if (!jid)
+        return;
+    const name = normalizeContactField(patch.name);
+    const notify = normalizeContactField(patch.notify);
+    const verifiedName = normalizeContactField(patch.verifiedName);
+    const lid = normalizeContactField(patch.lid);
+    const phoneNumber = normalizeContactField(patch.phoneNumber);
+    // Sentinela: 1 quando o campo de nome é "forte" (tem letras/acentos);
+    // 0 caso contrário. Usada no CASE WHEN para decidir se sobrescreve.
+    const nameStrong = name && isMeaningfulName(name) ? 1 : 0;
+    const notifyStrong = notify && isMeaningfulName(notify) ? 1 : 0;
+    const verifiedStrong = verifiedName && isMeaningfulName(verifiedName) ? 1 : 0;
+    stmt('upsertContact', `
+    INSERT INTO contacts (instance, jid, lid, phone_number, name, notify, verified_name, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (instance, jid) DO UPDATE SET
+      lid           = COALESCE(excluded.lid,           contacts.lid),
+      phone_number  = COALESCE(excluded.phone_number,  contacts.phone_number),
+      name          = CASE WHEN ? = 1 THEN excluded.name          ELSE contacts.name          END,
+      notify        = CASE WHEN ? = 1 THEN excluded.notify        ELSE contacts.notify        END,
+      verified_name = CASE WHEN ? = 1 THEN excluded.verified_name ELSE contacts.verified_name END,
+      updated_at    = excluded.updated_at
+  `).run(instance, jid, lid, phoneNumber, name, notify, verifiedName, Date.now(), nameStrong, notifyStrong, verifiedStrong);
+}
+/**
+ * Upsert em lote (envolve em uma única transação SQLite).
+ * Aceita o tipo `Contact` do Baileys (`id`, `lid`, `phoneNumber`,
+ * `name`, `notify`, `verifiedName`). Ignora silenciosamente entradas
+ * sem `id`/`jid`.
+ */
+export function bulkUpsertContacts(instance, contacts) {
+    if (!instance || !contacts || contacts.length === 0)
+        return 0;
+    let count = 0;
+    runInTransaction(() => {
+        for (const c of contacts) {
+            const id = String(c.id ?? c.jid ?? '').trim();
+            if (!id)
+                continue;
+            upsertContact(instance, {
+                jid: id,
+                lid: c.lid ?? null,
+                phoneNumber: c.phoneNumber ?? null,
+                name: c.name ?? null,
+                notify: c.notify ?? null,
+                verifiedName: c.verifiedName ?? null,
+            });
+            count += 1;
+        }
+    });
+    return count;
+}
+function rowToContact(row) {
+    if (!row)
+        return null;
+    return {
+        jid: String(row.jid ?? ''),
+        lid: row.lid ?? undefined,
+        phoneNumber: row.phone_number ?? undefined,
+        name: row.name ?? undefined,
+        notify: row.notify ?? undefined,
+        verifiedName: row.verified_name ?? undefined,
+        updatedAt: Number(row.updated_at ?? 0),
+    };
+}
+/**
+ * Retorna o contato armazenado para um JID exato, ou null.
+ * Não faz fallback por LID — use `getContactByAnyId` para isso.
+ */
+export function getContact(instance, jid) {
+    const row = stmt('getContact', 'SELECT jid, lid, phone_number, name, notify, verified_name, updated_at FROM contacts WHERE instance = ? AND jid = ?').get(instance, jid);
+    return rowToContact(row);
+}
+/**
+ * Procura um contato pelo JID exato; se não achar, tenta pela coluna `lid`
+ * (útil quando se recebe um @lid mas o registro está gravado como PN, ou
+ * vice-versa).
+ */
+export function getContactByAnyId(instance, id) {
+    if (!id)
+        return null;
+    const direct = getContact(instance, id);
+    if (direct)
+        return direct;
+    const row = stmt('getContactByLid', 'SELECT jid, lid, phone_number, name, notify, verified_name, updated_at FROM contacts WHERE instance = ? AND lid = ? LIMIT 1').get(instance, id);
+    return rowToContact(row);
+}
+/**
+ * Retorna o nome mais forte disponível para um contato (verifiedName >
+ * name > notify), ou `null` se nenhum estiver disponível ou todos forem
+ * "fracos" (sem letras). Tenta JID direto e fallback pelo LID.
+ */
+export function getContactName(instance, id) {
+    const contact = getContactByAnyId(instance, id);
+    if (!contact)
+        return null;
+    const candidates = [contact.verifiedName, contact.name, contact.notify];
+    for (const c of candidates) {
+        const trimmed = (c ?? '').trim();
+        if (trimmed && isMeaningfulName(trimmed))
+            return trimmed;
+    }
+    // Fallback secundário: aceita qualquer string não-vazia se nenhum forte.
+    for (const c of candidates) {
+        const trimmed = (c ?? '').trim();
+        if (trimmed)
+            return trimmed;
+    }
+    return null;
+}
+/**
+ * Lista todos os contatos da instância (mais recentes primeiro).
+ * Limite padrão alto para uso de listagem; o caller pode filtrar.
+ */
+export function listContacts(instance, limit = 5000) {
+    const rows = stmt('listContacts', `SELECT jid, lid, phone_number, name, notify, verified_name, updated_at
+       FROM contacts
+       WHERE instance = ?
+       ORDER BY updated_at DESC
+       LIMIT ?`).all(instance, limit);
+    return rows.map((r) => rowToContact(r));
+}
+// ─── Backfill retroativo de contatos a partir de messages.sender_name ─────────────
+/**
+ * Popula a tabela `contacts` retroativamente a partir dos sender_name já capturados
+ * em `messages`. Útil para instâncias antigas que receberam mensagens antes do flag
+ * `importContacts` ser ativado, ou antes da tabela existir.
+ *
+ * Considera apenas:
+ *   - mensagens com `sender_name` não-vazio
+ *   - `from_me = 0`
+ *   - JIDs `@s.whatsapp.net` (ignora grupos, status, newsletters, @lid)
+ *
+ * Para cada `jid` distinto pega o `sender_name` mais recente (maior `ts`).
+ * Insere com `notify` = sender_name (campo "fraco", representando pushName).
+ * Se já houver um nome "forte" em `name`/`verified_name`, não sobrescreve graças
+ * ao CASE WHEN em `upsertContact`.
+ *
+ * Retorna `{ scanned, upserted }`.
+ */
+export function backfillContactsFromMessages(instance) {
+    // Janela de coleta: para cada jid, pega o sender_name mais recente não-vazio.
+    // Filtra apenas JIDs PN reais (@s.whatsapp.net), evitando @g.us / status / broadcast.
+    const rows = stmt('backfillContacts.collect', `
+    SELECT m.jid AS jid, m.sender_name AS sender_name, m.sender_number AS sender_number
+      FROM messages m
+      INNER JOIN (
+        SELECT jid, MAX(ts) AS maxTs
+          FROM messages
+          WHERE instance = ?
+            AND from_me  = 0
+            AND sender_name IS NOT NULL
+            AND TRIM(sender_name) <> ''
+            AND jid LIKE '%@s.whatsapp.net'
+          GROUP BY jid
+      ) latest
+      ON m.jid = latest.jid AND m.ts = latest.maxTs
+     WHERE m.instance = ?
+       AND m.from_me  = 0
+       AND m.sender_name IS NOT NULL
+       AND TRIM(m.sender_name) <> ''
+       AND m.jid LIKE '%@s.whatsapp.net'
+    `).all(instance, instance);
+    let scanned = 0;
+    let upserted = 0;
+    runInTransaction(() => {
+        for (const r of rows) {
+            scanned += 1;
+            const jid = r.jid;
+            const senderName = (r.sender_name ?? '').trim();
+            if (!senderName)
+                continue;
+            try {
+                // sender_name é um pushName (definido pelo próprio contato → "fraco").
+                // Mapeia para `notify`. Se houver "name" forte (vindo da agenda do usuário
+                // via eventos Baileys), upsertContact preserva o existente.
+                upsertContact(instance, {
+                    jid,
+                    phoneNumber: r.sender_number ?? jid,
+                    notify: senderName,
+                });
+                upserted += 1;
+            }
+            catch (err) {
+                log.msgStore.warn(`backfillContactsFromMessages: failed for jid=${jid}: ${err?.message}`);
+            }
+        }
+    });
+    log.msgStore.info(`backfillContactsFromMessages instance=${instance} scanned=${scanned} upserted=${upserted}`);
+    return { scanned, upserted };
 }
 // ─── Cleanup de mensagens por TTL ─────────────────────────────────────────────────
 let _cleanupInterval = null;

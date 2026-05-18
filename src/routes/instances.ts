@@ -33,6 +33,10 @@ import {
 import { isValidInstanceName, normalizeInstanceName } from '../utils/helpers.js';
 import { sendError, sendOk } from '../utils/api-response.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
+import {
+    backfillContactsFromMessages,
+    listContacts as msListContacts,
+} from '../services/message-store.js';
 
 const router = Router();
 
@@ -561,6 +565,7 @@ router.patch('/:name/settings/general', async (req: Request, res: Response) => {
         autoReadMessages: body.autoReadMessages as boolean | undefined,
         syncFullHistory: body.syncFullHistory as boolean | undefined,
         readStatus: body.readStatus as boolean | undefined,
+        importContacts: body.importContacts as boolean | undefined,
     });
     writeAuditEvent(req, res, {
         action: 'instances.settings.general.update',
@@ -589,6 +594,55 @@ router.patch('/:name/settings/general', async (req: Request, res: Response) => {
         syncRestartError,
         requiresReconnect,
     });
+});
+
+/**
+ * POST /v1/instances/:name/contacts/backfill
+ *
+ * Popula retroativamente a tabela `contacts` a partir dos sender_name já
+ * gravados em `messages`. Útil para instâncias que receberam mensagens antes
+ * do flag `importContacts` ter sido ativado, ou antes da tabela existir.
+ *
+ * Resposta: `{ scanned, upserted, total }` onde `total` é o número atual
+ * de linhas em `contacts` para a instância (após o backfill).
+ */
+router.post('/:name/contacts/backfill', (req: Request, res: Response) => {
+    const { name } = req.params;
+    if (!isValidInstanceName(name)) {
+        return sendError(res, 400, 'invalid_instance_name');
+    }
+    try {
+        const result = backfillContactsFromMessages(name);
+        const total = msListContacts(name).length;
+        writeAuditEvent(req, res, {
+            action: 'instances.contacts.backfill',
+            target: name,
+            details: { ...result, total },
+        });
+        return sendOk(res, { instance: name, ...result, total });
+    } catch (err) {
+        return sendError(res, 500, 'backfill_failed', (err as Error)?.message);
+    }
+});
+
+/**
+ * GET /v1/instances/:name/contacts
+ *
+ * Lista contatos persistidos da instância. Útil para inspeção/debug.
+ */
+router.get('/:name/contacts', (req: Request, res: Response) => {
+    const { name } = req.params;
+    if (!isValidInstanceName(name)) {
+        return sendError(res, 400, 'invalid_instance_name');
+    }
+    const rawLimit = Number((req.query.limit as string) ?? '');
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 10000) : 5000;
+    try {
+        const items = msListContacts(name, limit);
+        return sendOk(res, { instance: name, count: items.length, contacts: items });
+    } catch (err) {
+        return sendError(res, 500, 'list_contacts_failed', (err as Error)?.message);
+    }
 });
 
 // Whitelist de protocolos permitidos para proxy

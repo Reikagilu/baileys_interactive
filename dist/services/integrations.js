@@ -3,6 +3,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
+import { updateInstanceGeneral } from './instance-config.js';
+import { log } from '../utils/logger.js';
 function defaultChatwoot() {
     return {
         enabled: false,
@@ -342,5 +344,55 @@ export async function testN8n(instance) {
     }
     catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+// ─── One-shot migration: legacy chatwoot.importContacts → general.importContacts ─
+/**
+ * Copia o valor antigo de `chatwoot.importContacts` (em `integration_configs`)
+ * para `GeneralConfig.importContacts` (em `panel_config` / `instance-config`)
+ * em todas as instâncias que ainda não foram migradas.
+ *
+ * Estratégia:
+ *  - Para cada linha em `integration_configs`, lê `chatwoot_json` e extrai
+ *    `importContacts` (se existir).
+ *  - Se o General atual da instância tiver `importContacts === false` (default)
+ *    E o legacy estiver `true`, sobrescreve para `true`.
+ *  - Se ambos forem `false` ou se General já estiver `true`, não faz nada.
+ *  - Não modifica `chatwoot_json` (mantém o campo lá como compat retroativa).
+ *
+ * Idempotente: pode ser chamada toda inicialização sem efeitos colaterais
+ * acumulativos. Falhas em uma instância são logadas e não interrompem as demais.
+ */
+export function migrateLegacyImportContactsFlag() {
+    let migrated = 0;
+    let scanned = 0;
+    try {
+        const rows = db
+            .prepare('SELECT instance, chatwoot_json FROM integration_configs')
+            .all();
+        for (const row of rows) {
+            scanned += 1;
+            try {
+                const parsed = JSON.parse(row.chatwoot_json);
+                const legacyValue = parsed && typeof parsed === 'object' ? parsed.importContacts : undefined;
+                if (legacyValue !== true)
+                    continue;
+                // Apenas promove se o General atual ainda estiver com o default false.
+                // Não rebaixa: se o usuário já marcou true no General, mantém.
+                // (updateInstanceGeneral mescla com o estado atual.)
+                updateInstanceGeneral(row.instance, { importContacts: true });
+                migrated += 1;
+            }
+            catch (err) {
+                log.app.warn('failed to migrate legacy importContacts flag for instance', { instance: row.instance, err: err?.message });
+            }
+        }
+    }
+    catch (err) {
+        log.app.warn('failed to scan integration_configs for legacy importContacts migration', { err: err?.message });
+        return;
+    }
+    if (migrated > 0) {
+        log.app.info('migrated legacy chatwoot.importContacts → general.importContacts', { scanned, migrated });
     }
 }

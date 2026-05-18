@@ -22,7 +22,7 @@ import { verifyMediaUrlToken } from './utils/media-signature.js';
 import { log } from './utils/logger.js';
 import { parseChatwootWebhook, type ChatwootWebhookPayload, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot, normalizeChatwootWebhookSlug } from './services/chatwoot-bridge.js';
 import { getSyncProgress, requestSyncCancel, isMessageSynced, isSyncRunning } from './services/chatwoot-sync-store.js';
-import { getInstanceIntegrations, findInstanceByWebhookSlug } from './services/integrations.js';
+import { getInstanceIntegrations, findInstanceByWebhookSlug, migrateLegacyImportContactsFlag } from './services/integrations.js';
 import { isChatwootOriginated } from './services/chatwoot-tracking.js';
 import { startMessageCleanupJob, stopMessageCleanupJob } from './services/message-store.js';
 
@@ -87,6 +87,9 @@ async function dispatchChatwootActionToWhatsApp(
         replyToId,
         agentName: signedAgentName,
         signDelimiter: integrationCfg.signDelimiter,
+        // Propaga marcação de PTT detectada no parse do webhook do Chatwoot
+        // (categoria 'audio' ou extensão típica de gravação do navegador).
+        ptt: attachment.voiceNote ?? false,
       });
       if (!send.ok) return { ok: false, error: send.error || 'failed_to_send_media' };
     }
@@ -558,6 +561,16 @@ const httpServer = app.listen(config.port, () => {
       .catch((error) => {
         log.webhook.error('Falha ao iniciar worker de webhooks embutido', error);
       });
+  }
+
+  // Migração one-shot do flag legacy chatwoot.importContacts → general.importContacts.
+  // Idempotente; executa toda inicialização. Precisa rodar ANTES dos handlers
+  // Baileys serem registrados (reconnectPreviouslyActiveInstances) para que eles
+  // já leiam o valor migrado em getInstanceGeneral().
+  try {
+    migrateLegacyImportContactsFlag();
+  } catch (error) {
+    log.app.error('Falha não-fatal na migração de importContacts', error);
   }
 
   void reconnectPreviouslyActiveInstances(config.authFolder)

@@ -5,6 +5,7 @@ import { writeAuditEvent } from '../services/audit-log.js';
 import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
 import { getInstanceIntegrations, listIntegrationInstances, redactIntegrations, testChatwoot, testN8n, updateChatwootConfig, updateN8nConfig, } from '../services/integrations.js';
+import { updateInstanceGeneral } from '../services/instance-config.js';
 import { syncContactNamesToChatwoot, buildChatwootWebhookUrl, normalizeChatwootWebhookSlug, invalidateConversationCache, } from '../services/chatwoot-bridge.js';
 const router = Router();
 const NUMERIC_ID_PATTERN = /^\d{1,20}$/;
@@ -129,12 +130,26 @@ router.patch('/:instance/chatwoot', (req, res) => {
         logoUrl: body.logoUrl !== undefined ? String(body.logoUrl).trim() : undefined,
         conversationPending: typeof body.conversationPending === 'boolean' ? body.conversationPending : undefined,
         reopenConversation: typeof body.reopenConversation === 'boolean' ? body.reopenConversation : undefined,
+        // @deprecated — `importContacts` migrou para GeneralConfig. Mantemos aqui
+        // por compat retroativa: a leitura efetiva acontece em getInstanceGeneral().
+        // Quando o cliente envia, espelhamos no General logo abaixo.
         importContacts: typeof body.importContacts === 'boolean' ? body.importContacts : undefined,
         importMessages: typeof body.importMessages === 'boolean' ? body.importMessages : undefined,
         daysLimitImportMessages: body.daysLimitImportMessages !== undefined ? Number(body.daysLimitImportMessages) : undefined,
         ignoreJids,
         autoCreate: typeof body.autoCreate === 'boolean' ? body.autoCreate : undefined,
     });
+    // Espelhar importContacts no GeneralConfig para clients legados que ainda
+    // mandam o campo pelo endpoint da integração. Quando a UI nova for adotada,
+    // ela usará PATCH /settings/general diretamente e esta linha vira no-op.
+    if (typeof body.importContacts === 'boolean') {
+        try {
+            updateInstanceGeneral(instance, { importContacts: body.importContacts });
+        }
+        catch {
+            /* best-effort — não falhar o request inteiro */
+        }
+    }
     invalidateConversationCache(instance);
     // Note: history sync now happens ONLY on connection=open (see whatsapp.ts) or via manual button.
     // Removed auto-sync on save to avoid re-syncing every time other flags toggle.

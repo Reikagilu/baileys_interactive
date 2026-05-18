@@ -35,7 +35,15 @@ function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' };
 }
 function defaultGeneral() {
-    return { rejectCalls: false, ignoreGroups: false, alwaysOnline: false, autoReadMessages: false, syncFullHistory: false, readStatus: false };
+    return {
+        rejectCalls: false,
+        ignoreGroups: false,
+        alwaysOnline: false,
+        autoReadMessages: false,
+        syncFullHistory: false,
+        readStatus: false,
+        importContacts: false,
+    };
 }
 function defaultEvents() {
     const toggles = Object.fromEntries(INSTANCE_EVENT_NAMES.map((name) => [name, false]));
@@ -195,6 +203,7 @@ export function updateInstanceGeneral(instance, patch) {
             autoReadMessages: patch.autoReadMessages ?? current.general.autoReadMessages,
             syncFullHistory: patch.syncFullHistory ?? current.general.syncFullHistory,
             readStatus: patch.readStatus ?? current.general.readStatus,
+            importContacts: patch.importContacts ?? current.general.importContacts,
         },
     });
 }
