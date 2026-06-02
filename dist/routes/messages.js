@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { config } from '../config.js';
-import { getInstance, sendInstanceMediaMessage } from '../services/whatsapp.js';
+import { getInstance, sendInstanceMediaMessage, validateRecipientOnWhatsApp, waitForOutboundDelivery } from '../services/whatsapp.js';
 import { emitWebhookEvent } from '../services/webhooks.js';
 import { getIdempotentResult, storeIdempotentResult, acquireIdempotencyLock, releaseIdempotencyLock, } from '../services/idempotency.js';
 import { emitInstanceEvent } from '../services/instance-config.js';
@@ -67,13 +67,41 @@ function resolveTypingMs(body, content, explicitTypingMs) {
     if (manualTyping)
         return manualTyping;
     const mode = parseTypingMode(body.typingMode);
-    if (mode !== 'auto')
-        return null;
     const seedText = extractTypingSeed(body, content);
+    if (!seedText)
+        return null;
+    if (mode === 'manual')
+        return null;
     return computeAutoTypingMs(seedText);
 }
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function parseDeliveryTimeoutMs(raw) {
+    const value = Number(raw);
+    if (!Number.isFinite(value))
+        return 15_000;
+    return Math.max(1_000, Math.min(60_000, Math.round(value)));
+}
+function parseRequireDelivery(raw) {
+    if (raw === undefined || raw === null || raw === '')
+        return true;
+    if (typeof raw === 'boolean')
+        return raw;
+    const normalized = String(raw).trim().toLowerCase();
+    return normalized !== 'false' && normalized !== '0' && normalized !== 'no';
+}
+function buildN8nSendContext(body, validation) {
+    return {
+        inputTo: validation.input || String(body.to ?? '').trim(),
+        normalizedTo: validation.normalizedPhone,
+        whatsappJid: validation.jid,
+        validation: {
+            checked: true,
+            existsOnWhatsApp: validation.exists ?? null,
+            message: validation.message ?? null,
+        },
+    };
 }
 async function sendMessageWithTyping(ctx, jid, content, typingMs) {
     if (ctx && typingMs && typeof ctx.sock.sendPresenceUpdate === 'function') {
@@ -196,9 +224,23 @@ async function sendBasicMessage(req, res, contentFactory, validationError) {
     if (!instance)
         return;
     const to = String(body.to ?? '').trim();
-    const jid = toJid(to);
+    const validation = await validateRecipientOnWhatsApp(instance, to);
+    if (!validation.ok) {
+        const statusCode = validation.error === 'recipient_not_on_whatsapp'
+            ? 422
+            : validation.error === 'invalid_phone'
+                ? 400
+                : validation.error === 'instance_not_found'
+                    ? 404
+                    : validation.error === 'instance_not_connected'
+                        ? 409
+                        : 502;
+        sendError(res, statusCode, validation.error ?? 'recipient_validation_failed', validation.message, buildN8nSendContext(body, validation));
+        return;
+    }
+    const jid = validation.jid || toJid(to);
     if (!jid) {
-        sendError(res, 400, 'invalid_phone');
+        sendError(res, 400, 'invalid_phone', 'Nao foi possivel normalizar o numero informado.', buildN8nSendContext(body, validation));
         return;
     }
     const ctx = validateInstance(instance, res);
@@ -230,6 +272,8 @@ async function sendBasicMessage(req, res, contentFactory, validationError) {
             return;
         }
         const typingMs = resolveTypingMs(body, content);
+        const requireDelivery = parseRequireDelivery(body.requireDelivery);
+        const deliveryTimeoutMs = parseDeliveryTimeoutMs(body.deliveryTimeoutMs);
         // Timeout de 60s para evitar que sendMessage trave indefinidamente.
         const sendTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error('send_timeout')), 60_000));
         try {
@@ -241,20 +285,51 @@ async function sendBasicMessage(req, res, contentFactory, validationError) {
             return;
         }
         const sentKey = sent?.key;
+        const messageId = sentKey?.id;
+        if (!messageId) {
+            sendError(res, 502, 'send_no_ack', 'O Baileys nao retornou messageId. O WhatsApp nao confirmou nem o aceite inicial da mensagem.', buildN8nSendContext(body, validation));
+            return;
+        }
+        const delivery = await waitForOutboundDelivery(instance, messageId, {
+            timeoutMs: deliveryTimeoutMs,
+            minState: requireDelivery ? 'delivered' : 'server_ack',
+        });
+        const contextDetails = buildN8nSendContext(body, validation);
+        const deliveryDetails = {
+            messageId,
+            state: delivery.snapshot.state,
+            description: delivery.snapshot.description,
+            event: delivery.snapshot.event,
+            statusCode: delivery.snapshot.statusCode ?? null,
+            timedOut: delivery.timedOut,
+            waitedMs: deliveryTimeoutMs,
+            receipt: delivery.snapshot.receipt ?? null,
+            requireDelivery,
+        };
+        if (delivery.snapshot.state === 'failed') {
+            sendError(res, 502, 'whatsapp_delivery_failed', delivery.snapshot.description, { ...contextDetails, delivery: deliveryDetails });
+            return;
+        }
+        if (requireDelivery && (delivery.timedOut || delivery.snapshot.state === 'pending' || delivery.snapshot.state === 'server_ack')) {
+            sendError(res, 504, 'delivery_not_confirmed', 'A mensagem foi aceita pela API, mas nao houve confirmacao de entrega ao aparelho do destinatario dentro do tempo limite.', { ...contextDetails, delivery: deliveryDetails });
+            return;
+        }
         const resultPayload = {
             instance,
             to: jid,
-            messageId: sentKey?.id,
+            messageId,
             typingMs: typingMs ?? 0,
             idempotency: { key: idempotencyKey || null, replayed: false },
+            ...contextDetails,
+            delivery: deliveryDetails,
         };
         if (idempotencyKey) {
             storeIdempotentResult(idempotencyKey, idempotencyScope, resultPayload);
         }
-        emitWebhookEvent('messages.upsert', { source: 'api', direction: 'outbound', instance, to: jid, messageId: sentKey?.id, content }, instance);
+        emitWebhookEvent('messages.upsert', { source: 'api', direction: 'outbound', instance, to: jid, messageId, content }, instance);
         void emitInstanceEvent(instance, 'SEND_MESSAGE', {
             to: jid,
-            messageId: sentKey?.id,
+            messageId,
             content,
         });
         sendOk(res, resultPayload);

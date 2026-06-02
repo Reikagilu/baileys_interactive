@@ -24,6 +24,10 @@ export interface WASocketLike {
         };
         messageTimestamp?: number;
     }>;
+    onWhatsApp?: (...phoneNumber: string[]) => Promise<Array<{
+        jid: string;
+        exists: boolean;
+    }> | undefined>;
     presenceSubscribe?: (jid: string) => Promise<unknown>;
     relayMessage?: (jid: string, content: unknown, opts?: unknown) => Promise<unknown>;
     requestPairingCode?: (phoneNumber: string) => Promise<string>;

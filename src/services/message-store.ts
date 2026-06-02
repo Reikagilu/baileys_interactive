@@ -192,7 +192,7 @@ function getDb(): DatabaseSync {
     try {
       db.exec(`
         UPDATE chat_meta
-        SET message_count = (
+        SET message_count = COALESCE((
           SELECT cnt FROM (
             SELECT instance, jid, COUNT(*) AS cnt
             FROM messages
@@ -201,7 +201,7 @@ function getDb(): DatabaseSync {
           ) agg
           WHERE agg.instance = chat_meta.instance
             AND agg.jid = chat_meta.jid
-        )
+        ), 0)
         WHERE message_count = 0
       `);
     } catch (err) {

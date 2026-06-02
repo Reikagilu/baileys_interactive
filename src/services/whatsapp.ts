@@ -2,6 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { WAMessageStatus } from 'baileys';
 import type { InstanceContext } from '../types/whatsapp.js';
 import { config } from '../config.js';
 import { isValidInstanceName } from '../utils/helpers.js';
@@ -29,6 +30,13 @@ import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.j
 import { markChatwootOriginated } from './chatwoot-tracking.js';
 import { log } from '../utils/logger.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
+import {
+  sleep as humanSleep,
+  randomIntBetween as humanRandomIntBetween,
+  jitter as humanJitter,
+  getHumanizeSettings,
+  humanizedSleep,
+} from './humanize.js';
 
 const instances = new Map<string, InstanceContext>();
 const reconnectAttempts = new Map<string, number>();
@@ -69,6 +77,323 @@ const EXTERNAL_MESSAGE_STRIP_KEYS = new Set([
   'waveform',
   'messageContextInfo',
 ]);
+
+type OutboundDeliveryState =
+  | 'pending'
+  | 'server_ack'
+  | 'delivered'
+  | 'read'
+  | 'played'
+  | 'failed';
+
+interface OutboundDeliverySnapshot {
+  instance: string;
+  messageId: string;
+  state: OutboundDeliveryState;
+  level: number;
+  description: string;
+  event: 'send' | 'messages.update' | 'message-receipt.update';
+  statusCode?: number;
+  updatedAt: number;
+  receipt?: {
+    userJid?: string;
+    deliveryTimestamp?: number;
+    readTimestamp?: number;
+  };
+}
+
+interface RecipientValidationResult {
+  ok: boolean;
+  input: string;
+  normalizedPhone: string;
+  jid: string;
+  exists?: boolean;
+  error?: string;
+  message?: string;
+}
+
+const outboundDeliveryStates = new Map<string, OutboundDeliverySnapshot>();
+const outboundDeliveryWaiters = new Map<string, Set<(snapshot: OutboundDeliverySnapshot) => void>>();
+const outboundDeliveryCleanupTimers = new Map<string, NodeJS.Timeout>();
+
+function makeOutboundDeliveryKey(instance: string, messageId: string): string {
+  return `${instance}:${messageId}`;
+}
+
+function cleanupOutboundDeliveryStateLater(key: string, finalState: boolean): void {
+  const existing = outboundDeliveryCleanupTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const ttlMs = finalState ? 10 * 60_000 : 30 * 60_000;
+  const timer = setTimeout(() => {
+    outboundDeliveryCleanupTimers.delete(key);
+    outboundDeliveryStates.delete(key);
+    outboundDeliveryWaiters.delete(key);
+  }, ttlMs);
+  timer.unref?.();
+  outboundDeliveryCleanupTimers.set(key, timer);
+}
+
+function notifyOutboundDeliveryWaiters(key: string, snapshot: OutboundDeliverySnapshot): void {
+  const waiters = outboundDeliveryWaiters.get(key);
+  if (!waiters || waiters.size === 0) return;
+  for (const waiter of waiters) waiter(snapshot);
+}
+
+function isFinalOutboundDeliveryState(snapshot: OutboundDeliverySnapshot): boolean {
+  return snapshot.state === 'delivered' || snapshot.state === 'read' || snapshot.state === 'played' || snapshot.state === 'failed';
+}
+
+function setOutboundDeliveryState(snapshot: OutboundDeliverySnapshot): void {
+  const key = makeOutboundDeliveryKey(snapshot.instance, snapshot.messageId);
+  const current = outboundDeliveryStates.get(key);
+  if (current && current.level > snapshot.level) return;
+  if (current && current.level === snapshot.level && current.updatedAt > snapshot.updatedAt) return;
+  outboundDeliveryStates.set(key, snapshot);
+  cleanupOutboundDeliveryStateLater(key, isFinalOutboundDeliveryState(snapshot));
+  notifyOutboundDeliveryWaiters(key, snapshot);
+}
+
+function mapMessageStatus(status: unknown): Pick<OutboundDeliverySnapshot, 'state' | 'level' | 'description' | 'statusCode'> {
+  const numericStatus = typeof status === 'number' && Number.isFinite(status) ? status : undefined;
+  if (numericStatus === WAMessageStatus.ERROR) {
+    return {
+      state: 'failed',
+      level: -1,
+      description: 'WhatsApp rejeitou a mensagem apos o envio.',
+      statusCode: numericStatus,
+    };
+  }
+  if (numericStatus === WAMessageStatus.PENDING) {
+    return {
+      state: 'pending',
+      level: 0,
+      description: 'Mensagem aceita localmente e aguardando confirmacao do WhatsApp.',
+      statusCode: numericStatus,
+    };
+  }
+  if (numericStatus === WAMessageStatus.SERVER_ACK) {
+    return {
+      state: 'server_ack',
+      level: 1,
+      description: 'WhatsApp confirmou o recebimento no servidor, mas ainda sem entrega ao aparelho do destinatario.',
+      statusCode: numericStatus,
+    };
+  }
+  if (numericStatus === WAMessageStatus.DELIVERY_ACK) {
+    return {
+      state: 'delivered',
+      level: 2,
+      description: 'Mensagem entregue ao aparelho do destinatario.',
+      statusCode: numericStatus,
+    };
+  }
+  if (numericStatus === WAMessageStatus.READ) {
+    return {
+      state: 'read',
+      level: 3,
+      description: 'Mensagem lida pelo destinatario.',
+      statusCode: numericStatus,
+    };
+  }
+  if (numericStatus === WAMessageStatus.PLAYED) {
+    return {
+      state: 'played',
+      level: 4,
+      description: 'Mensagem de audio/video reproduzida pelo destinatario.',
+      statusCode: numericStatus,
+    };
+  }
+  return {
+    state: 'pending',
+    level: 0,
+    description: 'Status de entrega ainda nao confirmado pelo WhatsApp.',
+    statusCode: numericStatus,
+  };
+}
+
+function extractReceiptSnapshot(receipt: unknown): {
+  userJid?: string;
+  deliveryTimestamp?: number;
+  readTimestamp?: number;
+} {
+  const data = isRecord(receipt) ? receipt : {};
+  const userJid = typeof data.userJid === 'string' ? data.userJid : undefined;
+  const deliveryTimestamp = typeof data.receiptTimestamp === 'number'
+    ? data.receiptTimestamp
+    : typeof data.deliveryTimestamp === 'number'
+      ? data.deliveryTimestamp
+      : undefined;
+  const readTimestamp = typeof data.readTimestamp === 'number' ? data.readTimestamp : undefined;
+  return { userJid, deliveryTimestamp, readTimestamp };
+}
+
+function updateOutboundDeliveryFromMessageUpdate(instance: string, payload: unknown): void {
+  const updates = Array.isArray(payload) ? payload : [payload];
+  for (const item of updates) {
+    if (!isRecord(item) || !isRecord(item.key) || !isRecord(item.update)) continue;
+    const messageId = typeof item.key.id === 'string' ? item.key.id.trim() : '';
+    if (!messageId) continue;
+    const mapped = mapMessageStatus(item.update.status);
+    setOutboundDeliveryState({
+      instance,
+      messageId,
+      state: mapped.state,
+      level: mapped.level,
+      description: mapped.description,
+      event: 'messages.update',
+      statusCode: mapped.statusCode,
+      updatedAt: Date.now(),
+    });
+  }
+}
+
+function updateOutboundDeliveryFromReceiptUpdate(instance: string, payload: unknown): void {
+  const updates = Array.isArray(payload) ? payload : [payload];
+  for (const item of updates) {
+    if (!isRecord(item) || !isRecord(item.key)) continue;
+    const messageId = typeof item.key.id === 'string' ? item.key.id.trim() : '';
+    if (!messageId) continue;
+    const receipt = extractReceiptSnapshot(item.receipt);
+    const state: OutboundDeliverySnapshot = {
+      instance,
+      messageId,
+      state: receipt.readTimestamp ? 'read' : 'delivered',
+      level: receipt.readTimestamp ? 3 : 2,
+      description: receipt.readTimestamp
+        ? 'Mensagem lida pelo destinatario.'
+        : 'Mensagem entregue ao aparelho do destinatario.',
+      event: 'message-receipt.update',
+      updatedAt: Date.now(),
+      receipt,
+    };
+    setOutboundDeliveryState(state);
+  }
+}
+
+export async function validateRecipientOnWhatsApp(name: string, rawPhone: string): Promise<RecipientValidationResult> {
+  const input = String(rawPhone ?? '').trim();
+  const normalizedPhone = input.replace(/\D+/g, '');
+  const jid = normalizedPhone ? `${normalizedPhone}@s.whatsapp.net` : '';
+  if (!normalizedPhone) {
+    return {
+      ok: false,
+      input,
+      normalizedPhone,
+      jid,
+      error: 'invalid_phone',
+      message: 'Numero vazio ou invalido. Envie apenas DDI+DDD+numero.',
+    };
+  }
+  const ctx = instances.get(name);
+  if (!ctx || !ctx.sock) {
+    return {
+      ok: false,
+      input,
+      normalizedPhone,
+      jid,
+      error: 'instance_not_found',
+      message: 'Instancia nao encontrada para validar o destinatario.',
+    };
+  }
+  if (ctx.status !== 'connected') {
+    return {
+      ok: false,
+      input,
+      normalizedPhone,
+      jid,
+      error: 'instance_not_connected',
+      message: 'Instancia desconectada. Conecte a sessao antes de validar o destinatario.',
+    };
+  }
+  if (typeof ctx.sock.onWhatsApp !== 'function') {
+    return {
+      ok: true,
+      input,
+      normalizedPhone,
+      jid,
+      exists: undefined,
+      message: 'A biblioteca atual nao suporta validacao previa de numero; envio seguira sem essa checagem.',
+    };
+  }
+  try {
+    const results = await ctx.sock.onWhatsApp(normalizedPhone);
+    const first = Array.isArray(results) ? results[0] : undefined;
+    const exists = first?.exists === true;
+    const resolvedJid = typeof first?.jid === 'string' && first.jid.trim() ? first.jid.trim() : jid;
+    if (!exists) {
+      return {
+        ok: false,
+        input,
+        normalizedPhone,
+        jid: resolvedJid,
+        exists: false,
+        error: 'recipient_not_on_whatsapp',
+        message: 'Numero validado antes do envio e nao encontrado no WhatsApp.',
+      };
+    }
+    return {
+      ok: true,
+      input,
+      normalizedPhone,
+      jid: resolvedJid,
+      exists: true,
+      message: 'Numero confirmado no WhatsApp antes do envio.',
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      input,
+      normalizedPhone,
+      jid,
+      error: 'recipient_validation_failed',
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function waitForOutboundDelivery(
+  instance: string,
+  messageId: string,
+  options?: { timeoutMs?: number; minState?: 'server_ack' | 'delivered' | 'read' },
+): Promise<{ snapshot: OutboundDeliverySnapshot; timedOut: boolean }> {
+  const timeoutMs = Math.max(1000, Math.min(60_000, Math.round(options?.timeoutMs ?? 15_000)));
+  const minLevel = options?.minState === 'read' ? 3 : options?.minState === 'server_ack' ? 1 : 2;
+  const key = makeOutboundDeliveryKey(instance, messageId);
+  const current = outboundDeliveryStates.get(key);
+  if (current && (current.level >= minLevel || current.state === 'failed')) {
+    return { snapshot: current, timedOut: false };
+  }
+  const pendingSnapshot = current ?? {
+    instance,
+    messageId,
+    state: 'pending' as const,
+    level: 0,
+    description: 'Mensagem enviada para o WhatsApp, aguardando confirmacao de entrega.',
+    event: 'send' as const,
+    updatedAt: Date.now(),
+  };
+  if (!current) setOutboundDeliveryState(pendingSnapshot);
+  return await new Promise((resolve) => {
+    const waiters = outboundDeliveryWaiters.get(key) ?? new Set<(snapshot: OutboundDeliverySnapshot) => void>();
+    const finalize = (snapshot: OutboundDeliverySnapshot, timedOut: boolean) => {
+      clearTimeout(timer);
+      waiters.delete(handler);
+      if (waiters.size === 0) outboundDeliveryWaiters.delete(key);
+      resolve({ snapshot, timedOut });
+    };
+    const handler = (snapshot: OutboundDeliverySnapshot) => {
+      if (snapshot.state === 'failed' || snapshot.level >= minLevel) {
+        finalize(snapshot, false);
+      }
+    };
+    waiters.add(handler);
+    outboundDeliveryWaiters.set(key, waiters);
+    const timer = setTimeout(() => {
+      finalize(outboundDeliveryStates.get(key) ?? pendingSnapshot, true);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -785,12 +1110,23 @@ purgeExpiredMediaBinaries();
 // relay (no chat-viewer access) don't accumulate files indefinitely.
 setInterval(() => purgeExpiredMediaBinaries(), 60 * 60 * 1000).unref();
 
+/**
+ * Generations counter: stop() bumps the gen; in-flight setTimeout callbacks
+ * compare against the gen captured when they were scheduled and abort if it
+ * changed. Avoids the race where stopAlwaysOnline races with a pending
+ * setTimeout firing after disconnect.
+ */
+const alwaysOnlineGen = new Map<string, number>();
+
 function stopAlwaysOnline(name: string): void {
   const timer = alwaysOnlineIntervals.get(name);
   if (timer) {
-    clearInterval(timer);
+    // Used to be setInterval; with humanize it's a chain of setTimeouts.
+    // clearTimeout works on both handle types (Node returns Timeout for both).
+    clearTimeout(timer);
     alwaysOnlineIntervals.delete(name);
   }
+  alwaysOnlineGen.set(name, (alwaysOnlineGen.get(name) ?? 0) + 1);
 }
 
 function startAlwaysOnline(name: string, ctx: InstanceContext): void {
@@ -799,12 +1135,29 @@ function startAlwaysOnline(name: string, ctx: InstanceContext): void {
   if (!settings.alwaysOnline) return;
   if (typeof ctx.sock.sendPresenceUpdate !== 'function') return;
 
-  ctx.sock.sendPresenceUpdate?.('available').catch(() => {});
+  // PRIO-5 (humanize): substitui o setInterval fixo de 30s por uma cadeia de
+  // setTimeout self-rescheduling com jitter ±25% (default base 75s ⇒
+  // ~56..94s). Elimina o pattern detectável de "available no segundo exato
+  // a cada 30s". Também atrasa o primeiro ping em 200–2000ms para
+  // descorrelacionar reconexões simultâneas de múltiplas instâncias.
+  const humanize = getHumanizeSettings(name);
+  const baseMs = humanize.enabled ? humanize.alwaysOnlineBaseMs : 30_000;
+  const jitterPct = humanize.enabled ? humanize.alwaysOnlineJitterPct : 0;
+  const initialDelay = humanize.enabled ? humanRandomIntBetween(200, 2000) : 0;
 
-  const timer = setInterval(() => {
-    ctx.sock.sendPresenceUpdate?.('available').catch(() => {});
-  }, 30000);
-  alwaysOnlineIntervals.set(name, timer);
+  const gen = (alwaysOnlineGen.get(name) ?? 0);
+  const scheduleNext = (delayMs: number) => {
+    const handle = setTimeout(() => {
+      // Abort if a newer start/stop has run since we were scheduled.
+      if (alwaysOnlineGen.get(name) !== gen) return;
+      if (instances.get(name) !== ctx || ctx.status !== 'connected') return;
+      ctx.sock.sendPresenceUpdate?.('available').catch(() => {});
+      scheduleNext(humanJitter(baseMs, jitterPct));
+    }, delayMs);
+    handle.unref?.();
+    alwaysOnlineIntervals.set(name, handle as unknown as NodeJS.Timeout);
+  };
+  scheduleNext(initialDelay);
 }
 
 function pruneGroupChatsFromCache(name: string): void {
@@ -819,12 +1172,20 @@ function pruneGroupChatsFromCache(name: string): void {
   }
 }
 
+/** Generation guard for the humanize-driven setTimeout chain (mesma técnica
+ *  do alwaysOnline). Sem isso, um setTimeout pendente pode disparar
+ *  fetchMessageHistory após a desconexão. */
+const syncHistoryGen = new Map<string, number>();
+
 function stopContinuousHistorySync(name: string): void {
   const timer = syncHistoryIntervals.get(name);
   if (timer) {
-    clearInterval(timer);
+    // Antes era setInterval; agora pode ser setTimeout (modo humanize). clearTimeout
+    // funciona com qualquer Timeout do Node.
+    clearTimeout(timer);
     syncHistoryIntervals.delete(name);
   }
+  syncHistoryGen.set(name, (syncHistoryGen.get(name) ?? 0) + 1);
   syncHistoryCursor.delete(name);
   syncHistoryInFlight.delete(name);
 }
@@ -878,8 +1239,14 @@ async function runContinuousHistorySync(name: string, ctx: InstanceContext): Pro
       return;
     }
 
+    // PRIO-1 (humanize): reduzimos chats por tick (default 2) e adicionamos
+    // sleep aleatório entre cada fetchMessageHistory para que o burst não saia
+    // como uma rajada simultânea de 6 stanzas.
+    const humanize = getHumanizeSettings(name);
+    const batchSize = humanize.enabled ? humanize.historyBatchChats : CONTINUOUS_HISTORY_BATCH_CHATS;
+
     const start = syncHistoryCursor.get(name) ?? 0;
-    const limit = Math.min(CONTINUOUS_HISTORY_BATCH_CHATS, list.length);
+    const limit = Math.min(Math.max(1, batchSize), list.length);
     const selected: Array<(typeof list)[number]> = [];
     for (let i = 0; i < limit; i++) {
       const idx = (start + i) % list.length;
@@ -887,9 +1254,16 @@ async function runContinuousHistorySync(name: string, ctx: InstanceContext): Pro
     }
     syncHistoryCursor.set(name, (start + limit) % list.length);
 
+    let isFirst = true;
     for (const chat of selected) {
       if (instances.get(name) !== ctx || ctx.status !== 'connected') break;
       if (!hasFetchHistory) break;
+      if (!isFirst && humanize.enabled) {
+        await humanSleep(humanRandomIntBetween(humanize.historyFetchSleepMinMs, humanize.historyFetchSleepMaxMs));
+        // Re-check após o sleep — pode ter desconectado nesse meio-tempo.
+        if (instances.get(name) !== ctx || ctx.status !== 'connected') break;
+      }
+      isFirst = false;
       const existing = getInstanceChatMessages(name, chat.jid);
       const oldest = existing.length > 0 ? existing[0] : undefined;
       const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
@@ -926,11 +1300,36 @@ function startContinuousHistorySync(name: string, ctx: InstanceContext): void {
   const settings = getInstanceGeneral(name);
   if (!settings.syncFullHistory) return;
 
-  void runContinuousHistorySync(name, ctx);
-  const timer = setInterval(() => {
-    void runContinuousHistorySync(name, ctx);
-  }, CONTINUOUS_HISTORY_SYNC_MS);
-  syncHistoryIntervals.set(name, timer);
+  // PRIO-1 (humanize): intervalo base ~10min com jitter ±30%. Eliminamos o
+  // tick fixo de 7s (que era flagrante padrão de bot). Implementado como
+  // cadeia de setTimeout self-rescheduling para que cada próximo agendamento
+  // pegue um valor jittered novo.
+  const humanize = getHumanizeSettings(name);
+  const baseMs = humanize.enabled ? humanize.historySyncBaseMs : CONTINUOUS_HISTORY_SYNC_MS;
+  const jitterPct = humanize.enabled ? humanize.historySyncJitterPct : 0;
+
+  // Primeira execução: pequeno delay aleatório (3–15s no modo humanize) para
+  // descorrelacionar de "connection === 'open'" — assim o catch-up não sai
+  // junto com o messaging-history.set inicial.
+  const firstDelay = humanize.enabled ? humanRandomIntBetween(3000, 15_000) : 0;
+  const gen = (syncHistoryGen.get(name) ?? 0);
+
+  const scheduleNext = (delayMs: number) => {
+    const handle = setTimeout(async () => {
+      if (syncHistoryGen.get(name) !== gen) return;
+      if (instances.get(name) !== ctx || ctx.status !== 'connected') return;
+      try {
+        await runContinuousHistorySync(name, ctx);
+      } catch {
+        // best-effort
+      }
+      if (syncHistoryGen.get(name) !== gen) return;
+      scheduleNext(humanJitter(baseMs, jitterPct));
+    }, delayMs);
+    handle.unref?.();
+    syncHistoryIntervals.set(name, handle as unknown as NodeJS.Timeout);
+  };
+  scheduleNext(firstDelay);
 }
 
 async function resolveProxyAgent(instance: string): Promise<{ agent: unknown | null; error?: string }> {
@@ -1216,16 +1615,87 @@ function serializeMediaSourceNode(node: Record<string, unknown>): Record<string,
   for (const field of DOWNLOAD_FIELDS) {
     const val = node[field];
     if (val === undefined || val === null) continue;
+    // Buffer / Uint8Array / TypedArray genérico: serializa como base64.
+    // Após o fix de stripMessageNoise, mediaKey/fileEncSha256/fileSha256 chegam
+    // aqui como Uint8Array (não Buffer), então é crítico tratar ambos.
     if (Buffer.isBuffer(val)) {
       out[field] = val.toString('base64');
-      out[`${field}__enc`] = 'base64'; // marker para re-hidratação
+      out[`${field}__enc`] = 'base64';
+    } else if (val instanceof Uint8Array) {
+      out[field] = Buffer.from(val.buffer, val.byteOffset, val.byteLength).toString('base64');
+      out[`${field}__enc`] = 'base64';
+    } else if (ArrayBuffer.isView(val)) {
+      const view = val as ArrayBufferView;
+      out[field] = Buffer.from(view.buffer, view.byteOffset, view.byteLength).toString('base64');
+      out[`${field}__enc`] = 'base64';
     } else if (typeof val === 'bigint') {
       out[field] = val.toString();
+      out[`${field}__enc`] = 'bigint';
+    } else if (isLongLike(val)) {
+      // protobufjs Long: { low, high, unsigned }. Persiste como string decimal
+      // para evitar perda de precisão e marca como 'long' para reidratar.
+      out[field] = longLikeToString(val as Record<string, unknown>);
+      out[`${field}__enc`] = 'long';
     } else {
       out[field] = val;
     }
   }
   return out;
+}
+
+/**
+ * Verifica se o valor é um Long do protobufjs (formato `{ low, high, unsigned }`).
+ * Long é usado pelo Baileys/protobufjs para campos numéricos de 64 bits como
+ * `fileLength` (tamanho do arquivo) e `mediaKeyTimestamp`.
+ */
+function isLongLike(val: unknown): val is { low: number; high: number; unsigned?: boolean } {
+  if (!val || typeof val !== 'object') return false;
+  const obj = val as Record<string, unknown>;
+  return typeof obj.low === 'number' && typeof obj.high === 'number';
+}
+
+/**
+ * Converte um Long-like para string decimal sem perda de precisão.
+ * Equivalente a Long.prototype.toString() do protobufjs.
+ */
+function longLikeToString(obj: Record<string, unknown>): string {
+  const low = obj.low as number;
+  const high = obj.high as number;
+  const unsigned = Boolean(obj.unsigned);
+  // BigInt path: combina os dois u32 em um i64/u64.
+  const lowU = BigInt(low >>> 0); // converte para u32
+  const highU = BigInt(high >>> 0);
+  let combined = (highU << 32n) | lowU;
+  if (!unsigned && high < 0) {
+    // signed negativo: subtrai 2^64 para obter complemento
+    combined -= 1n << 64n;
+  }
+  return combined.toString();
+}
+
+/**
+ * Detecta se um valor é um Uint8Array serializado como plain object com chaves
+ * numéricas (`{ "0": 100, "1": 161, ... }`). Acontecia antes do fix do
+ * serialize, quando Uint8Array caía no else e ia para `JSON.stringify` direto.
+ *
+ * Esses registros antigos não conseguem mais ser baixados (mídia já expirou no
+ * servidor WA), mas precisam ser reconhecidos para evitar passar lixo para o
+ * Baileys e tentar retry inutilmente.
+ */
+function isLegacyUint8ArrayObject(val: unknown): val is Record<string, number> {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+  if (val instanceof Uint8Array || Buffer.isBuffer(val) || ArrayBuffer.isView(val)) return false;
+  const obj = val as Record<string, unknown>;
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+  // Todas as chaves devem ser índices numéricos contíguos a partir de 0
+  // e os valores precisam ser inteiros 0-255.
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i] !== String(i)) return false;
+    const v = obj[String(i)];
+    if (typeof v !== 'number' || v < 0 || v > 255 || !Number.isInteger(v)) return false;
+  }
+  return true;
 }
 
 function injectMediaBase64(message: unknown, kind: MediaKind, base64: string, depth = 0): unknown {
@@ -1458,11 +1928,55 @@ function rehydrateMediaSourceNode(src: Record<string, unknown>): Record<string, 
   for (const [key, val] of Object.entries(src)) {
     if (key.endsWith('__enc')) continue; // marker de encoding, não é campo real
     const encKey = `${key}__enc`;
-    if (src[encKey] === 'base64' && typeof val === 'string') {
+    const enc = src[encKey];
+
+    // Caminho marcado: serializeMediaSourceNode escreveu um marker
+    if (enc === 'base64' && typeof val === 'string') {
       out[key] = Buffer.from(val, 'base64');
-    } else {
-      out[key] = val;
+      continue;
     }
+    if (enc === 'bigint' && typeof val === 'string') {
+      try {
+        out[key] = BigInt(val);
+      } catch {
+        out[key] = val;
+      }
+      continue;
+    }
+    if (enc === 'long' && typeof val === 'string') {
+      // Reidrata Long como BigInt — Baileys aceita BigInt em campos como
+      // fileLength sem problemas e evita dependência direta de protobufjs.
+      try {
+        out[key] = BigInt(val);
+      } catch {
+        out[key] = val;
+      }
+      continue;
+    }
+
+    // Caminhos legados: registros gravados antes do fix do serialize.
+    // Antes, Uint8Array virava `{ "0": N, "1": N, ... }` e Long virava
+    // `{ low, high, unsigned }`. Tentamos reidratar para que o download
+    // continue funcionando em registros antigos.
+    if (isLegacyUint8ArrayObject(val)) {
+      const keys = Object.keys(val).sort((a, b) => Number(a) - Number(b));
+      const buf = Buffer.alloc(keys.length);
+      for (let i = 0; i < keys.length; i++) {
+        buf[i] = (val as Record<string, number>)[String(i)];
+      }
+      out[key] = buf;
+      continue;
+    }
+    if (isLongLike(val)) {
+      try {
+        out[key] = BigInt(longLikeToString(val as unknown as Record<string, unknown>));
+      } catch {
+        out[key] = val;
+      }
+      continue;
+    }
+
+    out[key] = val;
   }
   return out;
 }
@@ -2491,6 +3005,23 @@ export async function createInstance(
     } = await import('baileys');
     const authPath = path.resolve(process.cwd(), authFolder, name);
 
+    // Detect a corrupted (0-byte) creds.json before loading auth state.
+    // This can happen when the process is killed mid-write. If found, remove it
+    // so that useMultiFileAuthState starts fresh (QR flow) instead of crashing
+    // or silently treating the instance as unregistered.
+    const credsFilePath = path.join(authPath, 'creds.json');
+    try {
+      const credsStat = fs.statSync(credsFilePath);
+      if (credsStat.size === 0) {
+        log.whatsapp.child(name).error(
+          'creds_corrupted_empty — creds.json está vazio (0 bytes), provavelmente corrompido por interrupção durante escrita; removendo para gerar novo QR'
+        );
+        fs.unlinkSync(credsFilePath);
+      }
+    } catch {
+      // File doesn't exist yet — normal for first-time setup
+    }
+
     let authState = await useMultiFileAuthState(authPath);
     repairInconsistentOwnSignalSessions(authPath, authState.state.creds as { registered?: boolean; me?: { lid?: string | null } }, name);
 
@@ -2891,7 +3422,22 @@ export async function createInstance(
             return;
           }
 
+          // WhatsApp invalidou a sessão remotamente (deslogado do celular,
+          // device limit, expired credentials, etc). A auth no disco está
+          // permanentemente inválida — qualquer reconexão futura usando essa
+          // creds vai receber 401 imediato sem nunca emitir QR.
+          // Para destravar, apagamos a auth para que o próximo POST /v1/instances
+          // gere um QR limpo de pareamento.
+          const folder = ctx.authFolder;
+          const authPath = path.resolve(process.cwd(), folder, name);
+          log.whatsapp.child(name).warn(`auth_invalid_session_dropped  code=${String(code)}  previousStatus=${previousStatus}  reset_auth=true`);
           closeSocket(ctx.sock);
+          stopAlwaysOnline(name);
+          stopContinuousHistorySync(name);
+          const authWasReset = maybeResetInstanceAuthState(name, authPath, 'auth_invalid_session_dropped');
+          if (!authWasReset) {
+            log.whatsapp.child(name).warn(`auth_invalid_session_dropped  reset_blocked  code=${String(code)}`);
+          }
           instances.delete(name);
           reconnectAttempts.delete(name);
           markAutostart(name, false);
@@ -2902,8 +3448,7 @@ export async function createInstance(
           });
           chatCache.delete(name);
           clearInstanceMediaBinaries(name, true);
-          stopAlwaysOnline(name);
-          stopContinuousHistorySync(name);
+          pairingIssuedAt.delete(name);
           return;
         }
 
@@ -3138,7 +3683,39 @@ export async function createInstance(
       }
 
       if (keysToRead.size && typeof ctx.sock.readMessages === 'function') {
-        ctx.sock.readMessages([...keysToRead.values()]).catch(() => {});
+        // PRIO-2 (humanize): em vez de chamar readMessages na MESMA tick do
+        // upsert (que renderiza as duas marcas azuis em <50ms — assinatura
+        // claríssima de bot), agendamos com delay aleatório + quebramos em
+        // chunks por chat. Em modo humanize off, mantemos o comportamento
+        // original (single call, instantâneo).
+        const allKeys = [...keysToRead.values()];
+        const humanize = getHumanizeSettings(name);
+        if (!humanize.enabled) {
+          ctx.sock.readMessages(allKeys).catch(() => {});
+        } else {
+          void (async () => {
+            // Initial delay — "leitura humana": 2.5–11s default antes da
+            // primeira ack-bateria.
+            await humanSleep(humanRandomIntBetween(humanize.autoReadDelayMinMs, humanize.autoReadDelayMaxMs));
+            // Re-check connection após o sleep (pode ter caído nesse meio).
+            const sock = instances.get(name)?.sock;
+            if (!sock || typeof sock.readMessages !== 'function') return;
+
+            // Quebra em chunks com sleep entre eles. Mantém envio em ordem.
+            const chunkSize = Math.max(1, humanize.autoReadChunkSize);
+            for (let i = 0; i < allKeys.length; i += chunkSize) {
+              const chunk = allKeys.slice(i, i + chunkSize);
+              try {
+                await sock.readMessages(chunk);
+              } catch {
+                // best-effort
+              }
+              if (i + chunkSize < allKeys.length) {
+                await humanSleep(humanRandomIntBetween(humanize.autoReadChunkSleepMinMs, humanize.autoReadChunkSleepMaxMs));
+              }
+            }
+          })().catch(() => { /* best-effort */ });
+        }
       }
     });
 
@@ -3228,11 +3805,13 @@ export async function createInstance(
     });
 
     sock.ev.on('messages.update', (payload: unknown) => {
+      updateOutboundDeliveryFromMessageUpdate(name, payload);
       emitWebhookEvent('messages.update', { instance: name, payload }, name);
       void emitInstanceEvent(name, 'MESSAGES_UPDATE', { payload });
     });
 
     sock.ev.on('message-receipt.update', (payload: unknown) => {
+      updateOutboundDeliveryFromReceiptUpdate(name, payload);
       emitWebhookEvent('message-receipt.update', { instance: name, payload }, name);
     });
 
@@ -3877,18 +4456,47 @@ function getInstanceChatMessagesInternal(name: string, jid: string): CachedMessa
     quotedMessageId?: string;
     media?: Record<string, unknown>;
     contact?: Record<string, unknown>;
-  }): CachedMessageInternal => ({
-    id: m.id,
-    fromMe: m.fromMe,
-    text: m.text,
-    timestamp: m.timestamp,
-    senderName: m.senderName,
-    senderNumber: m.senderNumber,
-    participant: m.participant,
-    quotedMessageId: m.quotedMessageId,
-    media: m.media as unknown as CachedMedia | undefined,
-    contact: m.contact as unknown as CachedContact | undefined,
-  });
+  }): CachedMessageInternal => {
+    // Reconstrói `mediaSource` a partir do `media._src` persistido no SQLite.
+    // O `_src` carrega o node original (url/directPath/mediaKey/etc.) serializado
+    // por `serializeMediaSourceNode` — necessário para re-download retroativo de
+    // mídia em mensagens carregadas do disco (path histórico).
+    let mediaSource: CachedMessageInternal['mediaSource'];
+    let mediaForPublic: CachedMedia | undefined;
+    if (m.media) {
+      const rawMedia = m.media;
+      const src = rawMedia._src;
+      const kind = rawMedia.kind;
+      if (src && typeof src === 'object' && typeof kind === 'string' && kind in MEDIA_NODE_BY_KIND) {
+        mediaSource = {
+          kind: kind as MediaKind,
+          node: rehydrateMediaSourceNode(src as Record<string, unknown>),
+        };
+      }
+      // Remove _src do objeto media exposto publicamente — ele é detalhe de
+      // implementação interna, não deve sair na API/UI.
+      if ('_src' in rawMedia) {
+        const { _src, ...rest } = rawMedia as { _src?: unknown } & Record<string, unknown>;
+        void _src;
+        mediaForPublic = rest as unknown as CachedMedia;
+      } else {
+        mediaForPublic = rawMedia as unknown as CachedMedia;
+      }
+    }
+    return {
+      id: m.id,
+      fromMe: m.fromMe,
+      text: m.text,
+      timestamp: m.timestamp,
+      senderName: m.senderName,
+      senderNumber: m.senderNumber,
+      participant: m.participant,
+      quotedMessageId: m.quotedMessageId,
+      media: mediaForPublic,
+      contact: m.contact as unknown as CachedContact | undefined,
+      mediaSource,
+    };
+  };
 
   // Se não há mensagens em memória, carrega do SQLite
   if (memMessages.length === 0) {
@@ -4169,12 +4777,39 @@ export async function applyReadSettingsToCachedMessages(name: string): Promise<{
     return { ok: true, count: 0 };
   }
 
-  try {
-    await ctx.sock.readMessages([...keys.values()]);
-    return { ok: true, count: keys.size };
-   } catch {
-     return { ok: false, count: keys.size };
-   }
+  // PRIO-3 (humanize): quando operador troca autoReadMessages de off→on, o
+  // método antigo enfileirava TODAS as mensagens não-fromMe de TODOS os chats
+  // em UM ÚNICO readMessages — um stanza com milhares de receipts.
+  // Aqui quebramos em chunks com sleep aleatório entre eles. O custo extra é
+  // latência total maior, mas o operador toggle não é tempo-real.
+  const humanize = getHumanizeSettings(name);
+  const allKeys = [...keys.values()];
+
+  if (!humanize.enabled) {
+    try {
+      await ctx.sock.readMessages(allKeys);
+      return { ok: true, count: allKeys.length };
+    } catch {
+      return { ok: false, count: allKeys.length };
+    }
+  }
+
+  const chunkSize = Math.max(1, humanize.autoReadChunkSize);
+  let okCount = 0;
+  let failed = false;
+  for (let i = 0; i < allKeys.length; i += chunkSize) {
+    const chunk = allKeys.slice(i, i + chunkSize);
+    try {
+      await ctx.sock.readMessages(chunk);
+      okCount += chunk.length;
+    } catch {
+      failed = true;
+    }
+    if (i + chunkSize < allKeys.length) {
+      await humanSleep(humanRandomIntBetween(humanize.autoReadChunkSleepMinMs, humanize.autoReadChunkSleepMaxMs));
+    }
+  }
+  return { ok: !failed, count: okCount };
 }
 
 /**
@@ -4195,11 +4830,54 @@ function isValidJid(jid: string): boolean {
   return VALID_JID_RE.test(jid);
 }
 
+/**
+ * Executa um "humanized presence wrap" antes do envio: pequenas pausas
+ * randomizadas (preSendDelayMs) e um loop de `composing` com heartbeats
+ * para simular digitação. Após o callback, manda `paused`. Tudo best-effort
+ * — falhas individuais não interrompem o envio principal.
+ *
+ * `typingMs` aqui já é um valor final calculado pelo caller (geralmente via
+ * `computeTypingMs(instance, text)` quando humanize está habilitado).
+ */
+async function withHumanizedPresence<T>(
+  sock: any,
+  jid: string,
+  opts: { typingMs?: number; preSendDelayMs?: number },
+  send: () => Promise<T>,
+): Promise<T> {
+  const preDelay = Math.max(0, opts.preSendDelayMs ?? 0);
+  if (preDelay > 0) {
+    await humanSleep(preDelay);
+  }
+  const typingMs = Math.max(0, opts.typingMs ?? 0);
+  if (typingMs > 0 && typeof sock.sendPresenceUpdate === 'function') {
+    const HEARTBEAT_BASE_MS = 7000;
+    try { await sock.presenceSubscribe?.(jid); } catch { /* ignore */ }
+    let remaining = typingMs;
+    try {
+      while (remaining > 0) {
+        try { await sock.sendPresenceUpdate('composing', jid); } catch { /* ignore */ }
+        const heartbeat = HEARTBEAT_BASE_MS + Math.floor(Math.random() * 2000);
+        const chunk = Math.min(remaining, heartbeat);
+        await humanSleep(chunk);
+        remaining -= chunk;
+      }
+    } catch { /* ignore */ }
+  }
+  try {
+    return await send();
+  } finally {
+    if (typingMs > 0 && typeof sock.sendPresenceUpdate === 'function') {
+      try { await sock.sendPresenceUpdate('paused', jid); } catch { /* ignore */ }
+    }
+  }
+}
+
 export async function sendInstanceTextMessage(
   name: string,
   jid: string,
   text: string,
-  options?: { replyToId?: string; agentName?: string; signDelimiter?: string },
+  options?: { replyToId?: string; agentName?: string; signDelimiter?: string; typingMs?: number; preSendDelayMs?: number },
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
   if (!isValidJid(jid)) return { ok: false, error: 'invalid_jid' };
   const ctx = instances.get(name);
@@ -4209,7 +4887,12 @@ export async function sendInstanceTextMessage(
     const delimiter = normalizeSignDelimiter(options?.signDelimiter);
     const finalText = formatChatwootOutboundLabel(text, delimiter, options?.agentName);
     const quoted = options?.replyToId ? buildQuotedMessage(name, jid, options.replyToId) : undefined;
-    const sent = await (ctx.sock.sendMessage as any)(jid, { text: finalText }, quoted ? { quoted } : undefined) as { key?: { id?: string } } | null;
+    const sent = await withHumanizedPresence(
+      ctx.sock,
+      jid,
+      { typingMs: options?.typingMs, preSendDelayMs: options?.preSendDelayMs },
+      () => (ctx.sock.sendMessage as any)(jid, { text: finalText }, quoted ? { quoted } : undefined),
+    ) as { key?: { id?: string } } | null;
     const msgId = sent?.key?.id;
     // Se o Baileys não retornou um msgId, o envio não foi confirmado — retorna erro.
     if (!msgId) {
@@ -4326,6 +5009,10 @@ export async function sendInstanceMediaMessage(
        * corretamente com esse container).
        */
       ptt?: boolean;
+      /** Duração total (ms) do indicador `composing` antes do envio. */
+      typingMs?: number;
+      /** Atraso aleatório fixo (ms) antes de qualquer indicador/send. */
+      preSendDelayMs?: number;
     },
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
   if (!isValidJid(jid)) return { ok: false, error: 'invalid_jid' };
@@ -4391,7 +5078,12 @@ export async function sendInstanceMediaMessage(
     }
 
     const quoted = params.replyToId ? buildQuotedMessage(name, jid, params.replyToId) : undefined;
-    const sent = await (ctx.sock.sendMessage as any)(jid, content, quoted ? { quoted } : undefined) as { key?: { id?: string } } | null;
+    const sent = await withHumanizedPresence(
+      ctx.sock,
+      jid,
+      { typingMs: params.typingMs, preSendDelayMs: params.preSendDelayMs },
+      () => (ctx.sock.sendMessage as any)(jid, content, quoted ? { quoted } : undefined),
+    ) as { key?: { id?: string } } | null;
     const msgId = sent?.key?.id;
     // Se o Baileys não retornou um msgId, o envio não foi confirmado — retorna erro.
     if (!msgId) {

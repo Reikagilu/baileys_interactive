@@ -25,6 +25,7 @@ import { getSyncProgress, requestSyncCancel, isMessageSynced, isSyncRunning } fr
 import { getInstanceIntegrations, findInstanceByWebhookSlug, migrateLegacyImportContactsFlag } from './services/integrations.js';
 import { isChatwootOriginated } from './services/chatwoot-tracking.js';
 import { startMessageCleanupJob, stopMessageCleanupJob } from './services/message-store.js';
+import { getHumanizeSettings, computeTypingMs, sleep as humanSleep, randomIntBetween as humanRandomIntBetween } from './services/humanize.js';
 function extractChatwootSourceIds(payload) {
     const attrs = payload.content_attributes ?? {};
     const candidates = new Set();
@@ -72,20 +73,42 @@ async function dispatchChatwootActionToWhatsApp(instance, integrationCfg, action
         }
         return trimmed;
     };
+    // Humanização: quando habilitada, simula uma sequência de digitação +
+    // pequenos atrasos entre anexos para evitar bursts perfeitos que sinalizam
+    // automação. Esses parâmetros só passam a valer para o primeiro disparo de
+    // cada anexo/texto; o caller (`sendInstance*Message`) cuida do
+    // `composing`/`paused` em torno do envio.
+    const humanize = getHumanizeSettings(instance);
     if (attachments && attachments.length > 0) {
         for (let i = 0; i < attachments.length; i++) {
             const attachment = attachments[i];
+            const caption = i === 0 ? text || undefined : undefined;
+            // Typing baseado no texto que de fato carrega a caption (anexos sem
+            // caption têm typingMs derivado apenas do baseMs).
+            const typingMs = humanize.enabled
+                ? computeTypingMs(instance, caption ?? '')
+                : 0;
+            // Sleep entre anexos: só após o primeiro envio. Simula tempo humano de
+            // selecionar/anexar o próximo arquivo.
+            if (humanize.enabled && i > 0) {
+                await humanSleep(humanRandomIntBetween(humanize.betweenAttachmentsMinMs, humanize.betweenAttachmentsMaxMs));
+            }
+            const preSendDelayMs = humanize.enabled && i === 0
+                ? humanRandomIntBetween(humanize.preSendMinMs, humanize.preSendMaxMs)
+                : 0;
             const send = await sendInstanceMediaMessage(instance, jid, {
                 mediaUrl: resolveMediaUrl(attachment.mediaUrl),
                 mimeType: attachment.mimeType,
                 fileName: attachment.fileName,
-                caption: i === 0 ? text || undefined : undefined,
+                caption,
                 replyToId,
                 agentName: signedAgentName,
                 signDelimiter: integrationCfg.signDelimiter,
                 // Propaga marcação de PTT detectada no parse do webhook do Chatwoot
                 // (categoria 'audio' ou extensão típica de gravação do navegador).
                 ptt: attachment.voiceNote ?? false,
+                typingMs,
+                preSendDelayMs,
             });
             if (!send.ok)
                 return { ok: false, error: send.error || 'failed_to_send_media' };
@@ -93,10 +116,16 @@ async function dispatchChatwootActionToWhatsApp(instance, integrationCfg, action
         return { ok: true };
     }
     if (text) {
+        const typingMs = humanize.enabled ? computeTypingMs(instance, text) : 0;
+        const preSendDelayMs = humanize.enabled
+            ? humanRandomIntBetween(humanize.preSendMinMs, humanize.preSendMaxMs)
+            : 0;
         const send = await sendInstanceTextMessage(instance, jid, text, {
             replyToId,
             agentName: signedAgentName,
             signDelimiter: integrationCfg.signDelimiter,
+            typingMs,
+            preSendDelayMs,
         });
         if (!send.ok)
             return { ok: false, error: send.error || 'failed_to_send_text' };

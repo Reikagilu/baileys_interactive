@@ -315,6 +315,61 @@ const REPLACE_PEER_SELF_FIX = `                await decrypt();
                 if (msg.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT && msg.category !== 'peer') {
                     // [opencode-self-session-cleanup]`;
 
+// ─── Patch 7: escrita atômica em use-multi-file-auth-state.js ────────────────
+// O writeFile do Node.js trunca o arquivo antes de escrever. Se o processo for
+// interrompido (SIGKILL, OOM, falha de disco) durante o write, o arquivo fica
+// com 0 bytes. Para creds.json isso causa perda permanente da sessão WhatsApp.
+// Solução: escrever em arquivo tmp (.tmp.<random>) e depois renomear atomicamente
+// para o destino. O rename é atômico no mesmo filesystem (POSIX), garantindo que
+// o destino nunca fique em estado parcialmente escrito.
+
+const TARGET_AUTH_STATE = path.join(ROOT, 'node_modules', 'baileys', 'lib', 'Utils', 'use-multi-file-auth-state.js');
+const MARKER_ATOMIC_WRITE = '[opencode-atomic-write]';
+
+// Âncoras para o estado original do Baileys (sem modificação):
+const ANCHOR_ATOMIC_WRITE_IMPORTS = `import { Mutex } from 'async-mutex';
+import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises';
+import { join } from 'path';`;
+
+const REPLACE_ATOMIC_WRITE_IMPORTS = `import { Mutex } from 'async-mutex';
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'fs/promises';
+import { randomBytes } from 'crypto';
+import { join } from 'path';`;
+
+const ANCHOR_ATOMIC_WRITE_FN = `    const writeData = async (data, file) => {
+        const filePath = join(folder, fixFileName(file));
+        const mutex = getFileLock(filePath);
+        return mutex.acquire().then(async (release) => {
+            try {
+                await writeFile(filePath, JSON.stringify(data, BufferJSON.replacer));
+            }
+            finally {
+                release();
+            }
+        });
+    };`;
+
+const REPLACE_ATOMIC_WRITE_FN = `    const writeData = async (data, file) => {
+        const filePath = join(folder, fixFileName(file));
+        const mutex = getFileLock(filePath);
+        return mutex.acquire().then(async (release) => {
+            try {
+                // [opencode-atomic-write] Atomic write: write to a temp file then rename to the target.
+                // This prevents a crash during writeFile from leaving a 0-byte (corrupted) file.
+                const tmpPath = filePath + '.tmp.' + randomBytes(4).toString('hex');
+                await writeFile(tmpPath, JSON.stringify(data, BufferJSON.replacer));
+                await rename(tmpPath, filePath);
+            }
+            finally {
+                release();
+            }
+        });
+    };`;
+
+// Backward-compat: âncoras alternativas para o caso em que os imports já foram modificados
+// mas a função writeData ainda usa writeFile direto (estado intermediário).
+const ANCHOR_ATOMIC_WRITE = ANCHOR_ATOMIC_WRITE_IMPORTS;
+
 // ─── Execução ─────────────────────────────────────────────────────────────────
 
 function fail(msg) {
@@ -332,12 +387,15 @@ if (!fs.existsSync(TARGET_SEND)) {
 let src = fs.readFileSync(TARGET, 'utf8');
 let srcSend = fs.readFileSync(TARGET_SEND, 'utf8');
 
+let srcAuthState = fs.existsSync(TARGET_AUTH_STATE) ? fs.readFileSync(TARGET_AUTH_STATE, 'utf8') : null;
+
 if (
   src.includes(MARKER_DEDUPE) &&
   src.includes(MARKER_SELF_CLEANUP) &&
   src.includes(MARKER_NO_RETRY_SELF) &&
   src.includes(MARKER_PEER_SELF_FIX) &&
-  srcSend.includes(MARKER_PEER_CACHE)
+  srcSend.includes(MARKER_PEER_CACHE) &&
+  (srcAuthState === null || srcAuthState.includes(MARKER_ATOMIC_WRITE))
 ) {
   console.log('[patch-baileys] todos os patches já aplicados (markers presentes). Nada a fazer.');
   process.exit(0);
@@ -474,4 +532,28 @@ if (!srcDecode.includes(MARKER_SKIP_SELF_DECRYPT)) {
   console.log('[patch-baileys] patch 6 (skip-self-decrypt) aplicado em', TARGET_DECODE);
 } else {
   console.log('[patch-baileys] patch 6 (skip-self-decrypt) já presente, pulando.');
+}
+
+// Patch 7: escrita atômica em use-multi-file-auth-state.js
+if (srcAuthState === null) {
+  console.log('[patch-baileys] patch 7 (atomic-write): arquivo não encontrado, pulando.');
+} else if (!srcAuthState.includes(MARKER_ATOMIC_WRITE)) {
+  const hasOriginalImports = srcAuthState.includes(ANCHOR_ATOMIC_WRITE_IMPORTS);
+  const hasFnAnchor = srcAuthState.includes(ANCHOR_ATOMIC_WRITE_FN);
+  if (!hasOriginalImports && !hasFnAnchor) {
+    fail('patch 7 (atomic-write): nenhuma âncora conhecida encontrada em use-multi-file-auth-state.js. Layout do Baileys mudou — atualize scripts/patch-baileys.mjs.');
+  }
+  if (hasOriginalImports) {
+    srcAuthState = srcAuthState.replace(ANCHOR_ATOMIC_WRITE_IMPORTS, REPLACE_ATOMIC_WRITE_IMPORTS);
+  }
+  if (srcAuthState.includes(ANCHOR_ATOMIC_WRITE_FN)) {
+    srcAuthState = srcAuthState.replace(ANCHOR_ATOMIC_WRITE_FN, REPLACE_ATOMIC_WRITE_FN);
+  }
+  if (!srcAuthState.includes(MARKER_ATOMIC_WRITE)) {
+    fail('patch 7 (atomic-write): substituição não inseriu o marker — abortando.');
+  }
+  fs.writeFileSync(TARGET_AUTH_STATE, srcAuthState, 'utf8');
+  console.log('[patch-baileys] patch 7 (atomic-write) aplicado em', TARGET_AUTH_STATE);
+} else {
+  console.log('[patch-baileys] patch 7 (atomic-write) já presente, pulando.');
 }

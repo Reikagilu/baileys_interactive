@@ -34,6 +34,9 @@ export const INSTANCE_EVENT_NAMES = [
 function defaultProxy() {
     return { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' };
 }
+function defaultHumanize() {
+    return { enabled: true };
+}
 function defaultGeneral() {
     return {
         rejectCalls: false,
@@ -43,6 +46,7 @@ function defaultGeneral() {
         syncFullHistory: false,
         readStatus: false,
         importContacts: false,
+        humanize: defaultHumanize(),
     };
 }
 function defaultEvents() {
@@ -194,6 +198,13 @@ export function updateInstanceProxy(instance, patch) {
 }
 export function updateInstanceGeneral(instance, patch) {
     const current = getInstancePanelConfig(instance);
+    // Merge humanize sub-block field-by-field so a partial patch doesn't wipe
+    // unrelated humanize keys.
+    const currentHumanize = current.general.humanize ?? defaultHumanize();
+    const patchHumanize = patch.humanize ?? {};
+    const nextHumanize = {
+        enabled: patchHumanize.enabled ?? currentHumanize.enabled,
+    };
     return persist({
         ...current,
         general: {
@@ -204,6 +215,7 @@ export function updateInstanceGeneral(instance, patch) {
             syncFullHistory: patch.syncFullHistory ?? current.general.syncFullHistory,
             readStatus: patch.readStatus ?? current.general.readStatus,
             importContacts: patch.importContacts ?? current.general.importContacts,
+            humanize: nextHumanize,
         },
     });
 }

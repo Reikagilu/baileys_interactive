@@ -742,7 +742,11 @@ opts) {
             if (opts.reopenConversation) {
                 // Pick the conversation with the highest id (most recent) without
                 // allocating a new sorted array — O(n) reduce instead of O(n log n) sort.
-                conv = existing.reduce((max, c) => (c.id > max.id ? c : max));
+                // Guard: reduce sem initial value lança em array vazio. Se não houver
+                // conversa pré-existente, seguir para o caminho de criação abaixo.
+                if (existing.length > 0) {
+                    conv = existing.reduce((max, c) => (c.id > max.id ? c : max));
+                }
             }
             else {
                 conv = existing.find((c) => c.status !== 'resolved');
@@ -926,6 +930,10 @@ export async function dispatchToChatwoot(instanceName, messages) {
     const byJid = new Map();
     for (const msg of messages) {
         const jid = String(msg.key?.remoteJid ?? '').trim() || '__unknown__';
+        // Pular newsletters (canais de transmissão) e status broadcast logo aqui
+        // para não consumir slot do worker nem persistir tentativa.
+        if (jid === 'status@broadcast' || jid.endsWith('@newsletter'))
+            continue;
         const group = byJid.get(jid);
         if (group)
             group.push(msg);
@@ -1024,6 +1032,11 @@ async function dispatchSingleMessage(instanceName, cwCfg, cfg, inbox, msg, optio
     const remoteJid = key.remoteJid;
     // Skip broadcast/status messages
     if (remoteJid === 'status@broadcast')
+        return { skipped: true };
+    // Skip newsletter channels (canais de transmissão do WhatsApp). Não são
+    // conversas bidirecionais — o Chatwoot não consegue criar contato para
+    // JIDs `@newsletter` e o dispatcher fica em loop tentando.
+    if (remoteJid.endsWith('@newsletter'))
         return { skipped: true };
     // Skip JIDs in ignoreJids list
     if (cfg.ignoreJids?.includes(remoteJid))

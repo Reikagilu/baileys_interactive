@@ -44,6 +44,15 @@ export interface ProxyConfig {
     password: string;
 }
 
+export interface HumanizeConfig {
+    /**
+     * Master switch. When false, every humanize.* helper resolves with zero
+     * delay/jitter — useful when the operator wants raw throughput or is
+     * debugging timing-sensitive flows.
+     */
+    enabled: boolean;
+}
+
 export interface GeneralConfig {
     rejectCalls: boolean;
     ignoreGroups: boolean;
@@ -61,6 +70,14 @@ export interface GeneralConfig {
      * o valor antigo para cá no startup.
      */
     importContacts: boolean;
+    /**
+     * Bloco de humanização: adiciona jitter, delays e batches escalonados a
+     * todos os comportamentos automatizados (auto-read, history sync,
+     * alwaysOnline, envio Chatwoot→WhatsApp, rejectCalls) para mascarar
+     * padrões de máquina. Padrão `enabled: true` — operador pode desligar via
+     * checkbox no painel.
+     */
+    humanize: HumanizeConfig;
 }
 
 export interface EventsConfig {
@@ -81,6 +98,10 @@ function defaultProxy(): ProxyConfig {
     return { enabled: false, protocol: 'http', host: '', port: '', username: '', password: '' };
 }
 
+function defaultHumanize(): HumanizeConfig {
+    return { enabled: true };
+}
+
 function defaultGeneral(): GeneralConfig {
     return {
         rejectCalls: false,
@@ -90,6 +111,7 @@ function defaultGeneral(): GeneralConfig {
         syncFullHistory: false,
         readStatus: false,
         importContacts: false,
+        humanize: defaultHumanize(),
     };
 }
 
@@ -248,6 +270,13 @@ export function updateInstanceProxy(instance: string, patch: Partial<ProxyConfig
 
 export function updateInstanceGeneral(instance: string, patch: Partial<GeneralConfig>): InstancePanelConfig {
     const current = getInstancePanelConfig(instance);
+    // Merge humanize sub-block field-by-field so a partial patch doesn't wipe
+    // unrelated humanize keys.
+    const currentHumanize = current.general.humanize ?? defaultHumanize();
+    const patchHumanize: Partial<HumanizeConfig> = patch.humanize ?? {};
+    const nextHumanize: HumanizeConfig = {
+        enabled: patchHumanize.enabled ?? currentHumanize.enabled,
+    };
     return persist({
         ...current,
         general: {
@@ -258,6 +287,7 @@ export function updateInstanceGeneral(instance: string, patch: Partial<GeneralCo
             syncFullHistory: patch.syncFullHistory ?? current.general.syncFullHistory,
             readStatus: patch.readStatus ?? current.general.readStatus,
             importContacts: patch.importContacts ?? current.general.importContacts,
+            humanize: nextHumanize,
         },
     });
 }
