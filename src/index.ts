@@ -13,19 +13,30 @@ import integrationsRouter from './routes/integrations.js';
 import { openApiSpec } from './docs/openapi.js';
 import { renderSwaggerUiHtml } from './docs/swagger-ui.js';
 import { requestContext } from './middleware/request-context.js';
-import { sendError } from './utils/api-response.js';
+import { sendError, sendOk } from './utils/api-response.js';
 import { getAllInstances, getInstance, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances, disconnectInstance } from './services/whatsapp.js';
 import { getWebhookMetrics } from './services/webhooks.js';
 import { requireApiKey } from './middleware/api-auth.js';
-import { normalizeInstanceName } from './utils/helpers.js';
+import { normalizeInstanceName, isValidInstanceName } from './utils/helpers.js';
 import { verifyMediaUrlToken } from './utils/media-signature.js';
 import { log } from './utils/logger.js';
 import { parseChatwootWebhook, type ChatwootWebhookPayload, invalidateConversationCache, autoCreateChatwootInbox, syncHistoryToChatwoot, normalizeChatwootWebhookSlug } from './services/chatwoot-bridge.js';
 import { getSyncProgress, requestSyncCancel, isMessageSynced, isSyncRunning } from './services/chatwoot-sync-store.js';
 import { getInstanceIntegrations, findInstanceByWebhookSlug, migrateLegacyImportContactsFlag } from './services/integrations.js';
 import { isChatwootOriginated } from './services/chatwoot-tracking.js';
-import { startMessageCleanupJob, stopMessageCleanupJob } from './services/message-store.js';
+import { startMessageCleanupJob, stopMessageCleanupJob, recomputeMessageCounts } from './services/message-store.js';
 import { getHumanizeSettings, computeTypingMs, sleep as humanSleep, randomIntBetween as humanRandomIntBetween } from './services/humanize.js';
+import { installCrashHandlers } from './utils/crash-reporter.js';
+import { installMetrics } from './utils/metrics.js';
+
+// Instala os handlers de uncaughtException/unhandledRejection ANTES de qualquer
+// outro código rodar. Se algum import subsequente falhar ou algum módulo root
+// disparar reject, o stack vai pra /app/data/crashes.log + webhook.
+installCrashHandlers();
+
+// Inicializa módulo de métricas — contadores em memória + flush para
+// /app/data/metrics.json a cada 30s.
+installMetrics();
 
 function extractChatwootSourceIds(payload: ChatwootWebhookPayload): string[] {
   const attrs = payload.content_attributes ?? {};
@@ -541,6 +552,36 @@ app.post('/v1/integrations/:instance/chatwoot/sync-cancel', requireApiKey(['inte
   }
   const cancelled = requestSyncCancel(instance);
   return res.json({ ok: true, cancelled });
+});
+
+// Admin: recontar message_count em chat_meta. Roda em Worker Thread,
+// não trava o event loop. Use após migrations ou se count de algum chat
+// estiver errado.
+app.post('/v1/admin/recount', apiLimiter, requireApiKey(['ops:read']), async (_req, res) => {
+  try {
+    const result = await recomputeMessageCounts({});
+    return sendOk(res, result);
+  } catch (err) {
+    return sendError(res, 500, 'recount_failed', undefined, {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+app.post('/v1/admin/recount/:instance', apiLimiter, requireApiKey(['ops:read']), async (req, res) => {
+  const instance = normalizeInstanceName(req.params.instance);
+  if (!isValidInstanceName(instance)) {
+    return sendError(res, 400, 'invalid_instance_name', undefined, { instance });
+  }
+  try {
+    const result = await recomputeMessageCounts({ instance });
+    return sendOk(res, result);
+  } catch (err) {
+    return sendError(res, 500, 'recount_failed', undefined, {
+      instance,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 });
 
 // API key só nas rotas /v1 (a interface em / carrega sem key)

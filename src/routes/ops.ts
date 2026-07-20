@@ -4,6 +4,7 @@ import { listRecentAuditEvents } from '../services/audit-log.js';
 import { getWebhookMetrics } from '../services/webhooks.js';
 import { getAllInstances } from '../services/whatsapp.js';
 import { sendOk } from '../utils/api-response.js';
+import { getMetricsSnapshot } from '../utils/metrics.js';
 
 const router = Router();
 
@@ -62,6 +63,21 @@ router.get('/alerts', (_req, res) => {
         status: alerts.length ? 'degraded' : 'healthy',
         alerts,
         snapshot: { connectedInstances: connected, totalInstances: instances.length, webhook },
+    });
+});
+
+// Métricas em tempo real + saúde geral — complementar a /health (que é estático).
+// Use para dashboards e alertas externos.
+router.get('/metrics', (_req, res) => {
+    const snapshot = getMetricsSnapshot();
+    const instances = getAllInstances();
+    const connected = instances.filter((i) => i.status === 'connected').length;
+    return sendOk(res, {
+        snapshot: {
+            connectedInstances: connected,
+            totalInstances: instances.length,
+        },
+        metrics: snapshot,
     });
 });
 

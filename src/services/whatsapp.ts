@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { WAMessageStatus } from 'baileys';
 import type { InstanceContext } from '../types/whatsapp.js';
@@ -38,6 +38,8 @@ import {
   humanizedSleep,
 } from './humanize.js';
 
+import { recordOpencodePeerSelfFix, recordMessagesUpsert, recordConnected, recordConnectionClose, recordReconnectAttempt } from '../utils/metrics.js';
+
 const instances = new Map<string, InstanceContext>();
 const reconnectAttempts = new Map<string, number>();
 const pairingIssuedAt = new Map<string, number>();
@@ -55,7 +57,11 @@ const lastStatePath = path.join(runtimePath, 'instance-last-state.json');
 const lastInstanceState = new Map<string, { status: string; wasConnected: boolean; stoppedByUser: boolean; updatedAt: string }>();
 let _instanceStateDb: DatabaseSync | null = null;
 const mediaStoragePath = path.resolve(process.cwd(), 'data', 'chat-media');
-const mediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
+// Keep the media index in /app/data so it survives container recreation together
+// with the media binaries. Older containers wrote it under .runtime; load that
+// file as a fallback during migration, but persist new state to /app/data.
+const mediaIndexPath = path.resolve(process.cwd(), 'data', 'chat-media-index.json');
+const legacyMediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
 const CONTINUOUS_HISTORY_SYNC_MS = 7000;
 const CONTINUOUS_HISTORY_BATCH_CHATS = 6;
 const CONTINUOUS_HISTORY_FETCH_COUNT = 120;
@@ -410,6 +416,7 @@ interface CachedMedia {
   url?: string;
   bytes?: number;
   mediaId?: string;
+  storageKey?: string;
   omittedReason?: 'too_large' | 'download_failed' | 'decryption_failed';
 }
 
@@ -427,6 +434,7 @@ interface CachedMediaBinary {
   sizeBytes: number;
   createdAt: number;
   expiresAt: number;
+  storageKey?: string;
 }
 
 interface CachedMessage {
@@ -458,6 +466,7 @@ interface CachedChat {
 
 const chatCache = new Map<string, Map<string, CachedChat>>();
 const chatMediaBinaryStore = new Map<string, CachedMediaBinary>();
+const chatMediaStorageKeyIndex = new Map<string, string>();
 const chatMediaEnsureInFlight = new Map<string, Promise<void>>();
 
 // Cached dynamic import promises — Node caches modules internally but each
@@ -501,13 +510,44 @@ function mediaFileExtension(kind: MediaKind, mimeType?: string): string {
   return 'bin';
 }
 
+function mediaKindFromExtension(ext: string): { kind: MediaKind; mimeType: string } | null {
+  const value = ext.replace(/^\./, '').trim().toLowerCase();
+  if (value === 'jpg' || value === 'jpeg') return { kind: 'image', mimeType: 'image/jpeg' };
+  if (value === 'png') return { kind: 'image', mimeType: 'image/png' };
+  if (value === 'webp') return { kind: 'sticker', mimeType: 'image/webp' };
+  if (value === 'gif') return { kind: 'image', mimeType: 'image/gif' };
+  if (value === 'mp4') return { kind: 'video', mimeType: 'video/mp4' };
+  if (value === 'webm') return { kind: 'video', mimeType: 'video/webm' };
+  if (value === 'ogg') return { kind: 'audio', mimeType: 'audio/ogg' };
+  if (value === 'mp3') return { kind: 'audio', mimeType: 'audio/mpeg' };
+  if (value === 'm4a') return { kind: 'audio', mimeType: 'audio/mp4' };
+  if (value === 'pdf') return { kind: 'document', mimeType: 'application/pdf' };
+  return null;
+}
+
+async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash('sha256');
+  await new Promise<void>((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', resolve);
+  });
+  return hash.digest('hex');
+}
+
 function loadMediaIndex(): void {
   chatMediaBinaryStore.clear();
+  chatMediaStorageKeyIndex.clear();
   try {
-    if (!fs.existsSync(mediaIndexPath)) return;
-    const raw = fs.readFileSync(mediaIndexPath, 'utf8');
+    const sourcePath = fs.existsSync(mediaIndexPath)
+      ? mediaIndexPath
+      : (fs.existsSync(legacyMediaIndexPath) ? legacyMediaIndexPath : '');
+    if (!sourcePath) return;
+    const raw = fs.readFileSync(sourcePath, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object') return;
+    let migrated = false;
     for (const [mediaId, value] of Object.entries(parsed as Record<string, unknown>)) {
       if (!value || typeof value !== 'object') continue;
       const entry = value as Partial<CachedMediaBinary>;
@@ -521,12 +561,18 @@ function loadMediaIndex(): void {
         sizeBytes: Number(entry.sizeBytes ?? 0),
         createdAt: Number(entry.createdAt ?? Date.now()),
         expiresAt: Number(entry.expiresAt ?? Date.now()),
+        storageKey: entry.storageKey ? String(entry.storageKey) : undefined,
       };
       const absolutePath = path.join(mediaStoragePath, normalized.relativePath);
       if (fs.existsSync(absolutePath)) {
         chatMediaBinaryStore.set(mediaId, normalized);
+        if (normalized.storageKey) chatMediaStorageKeyIndex.set(normalized.storageKey, mediaId);
       }
     }
+    if (sourcePath === legacyMediaIndexPath && chatMediaBinaryStore.size > 0) {
+      migrated = true;
+    }
+    if (migrated) persistMediaIndex();
   } catch {
     // ignore malformed index
   }
@@ -949,9 +995,31 @@ function repairInconsistentOwnSignalSessions(
   }
 }
 
+function hasValidAuthForRestore(name: string, authFolder: string): boolean {
+  // Verifica se a pasta de auth tem creds.json registrado (>0 bytes) e nao
+  // eh placeholder vazio. Usado por shouldRestoreInstanceOnStartup pra
+  // distinguir "instancia morreu mas creds estao ok" de "creds foram apagadas".
+  try {
+    const authPath = path.resolve(process.cwd(), authFolder, name);
+    const credsPath = path.join(authPath, 'creds.json');
+    if (!fs.existsSync(credsPath)) return false;
+    const stat = fs.statSync(credsPath);
+    if (stat.size === 0) return false;
+    // Tenta parsear pra garantir que nao eh JSON malformado
+    const raw = fs.readFileSync(credsPath, 'utf8');
+    const parsed = JSON.parse(raw) as { registered?: boolean };
+    // registered=false indica sessao nao-pareada (estado intermediario).
+    // Pode ser recovery legit, mas eh mais arriscado recuperar.
+    return parsed.registered === true;
+  } catch {
+    return false;
+  }
+}
+
 function shouldRestoreInstanceOnStartup(
   state: { status: string; wasConnected: boolean; stoppedByUser: boolean; updatedAt: string } | undefined,
   name: string,
+  authFolder: string = 'auth',
 ): boolean {
   if (state?.stoppedByUser) return false;
 
@@ -959,7 +1027,18 @@ function shouldRestoreInstanceOnStartup(
   // the exact last known state across restarts: if it was disconnected before
   // shutdown, it must stay disconnected after boot.
   if (state) {
-    return state.status === 'connected' || state.status === 'connecting' || state.status === 'qr';
+    const status = state.status;
+    if (status === 'connected' || status === 'connecting' || status === 'qr') {
+      return true;
+    }
+    // F5 fix: se creds ainda estão registrados, tenta recuperar.
+    // 'disconnected' pode ser resultado de reconnect_exhausted (Beyound desistiu
+    // após 6 tentativas). As creds no disco continuam válidas — vale tentar
+    // recriar o socket. Se falhar, createInstance vai setar auth_invalid.
+    if (status === 'disconnected' || status === 'auth_invalid') {
+      return hasValidAuthForRestore(name, authFolder);
+    }
+    return false;
   }
 
   // Backward compatibility for older installs that have auth folders but no
@@ -1078,6 +1157,8 @@ async function handleCorruptedSelfSessions(
     log.whatsapp
       .child(name)
       .info('self_session_corrupted_cleaned', { jids, count: jids.length });
+    // Métrica: incrementa contador de cleanups por instância.
+    recordOpencodePeerSelfFix(name);
   } catch (err) {
     log.whatsapp.child(name).warn('self_session_cleanup_failed', { jids, err });
   }
@@ -1106,6 +1187,7 @@ async function handleCorruptedSelfSessions(
 
 loadMediaIndex();
 purgeExpiredMediaBinaries();
+scheduleExistingMediaAdoption();
 // Periodically purge expired media files from disk so instances used purely as
 // relay (no chat-viewer access) don't accumulate files indefinitely.
 setInterval(() => purgeExpiredMediaBinaries(), 60 * 60 * 1000).unref();
@@ -1472,6 +1554,7 @@ function purgeExpiredMediaBinaries(now = Date.now()): void {
     const absolutePath = path.join(mediaStoragePath, item.relativePath);
     // Use async deletion to avoid blocking the event loop; fire-and-forget.
     fs.promises.rm(absolutePath, { force: true }).catch(() => { /* ignore */ });
+    if (item.storageKey) chatMediaStorageKeyIndex.delete(item.storageKey);
     chatMediaBinaryStore.delete(mediaId);
   }
   persistMediaIndex();
@@ -1488,6 +1571,7 @@ function clearInstanceMediaBinaries(instance: string, force = false): void {
       } catch {
         // ignore deletion failures
       }
+      if (item.storageKey) chatMediaStorageKeyIndex.delete(item.storageKey);
       chatMediaBinaryStore.delete(mediaId);
       changed = true;
     }
@@ -1537,6 +1621,31 @@ function storeMediaBinary(instance: string, media: CachedMedia): CachedMedia {
 
   const createdAt = Date.now();
   const expiresAt = createdAt + config.limits.chatMediaRetentionMs;
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const storageKey = `${instance}:sha256:${sha256}`;
+  const existingMediaId = chatMediaStorageKeyIndex.get(storageKey);
+  const existing = existingMediaId ? chatMediaBinaryStore.get(existingMediaId) : undefined;
+  if (existing) {
+    const existingPath = path.join(mediaStoragePath, existing.relativePath);
+    if (fs.existsSync(existingPath)) {
+      existing.expiresAt = Math.max(existing.expiresAt, expiresAt);
+      existing.createdAt = Math.min(existing.createdAt, createdAt);
+      existing.sizeBytes = existing.sizeBytes || bytes.length;
+      existing.storageKey = storageKey;
+      chatMediaBinaryStore.set(existing.mediaId, existing);
+      persistMediaIndex();
+      return {
+        ...media,
+        mediaId: existing.mediaId,
+        storageKey,
+        base64: undefined,
+        bytes: existing.sizeBytes || bytes.length,
+      };
+    }
+    chatMediaBinaryStore.delete(existing.mediaId);
+    chatMediaStorageKeyIndex.delete(storageKey);
+  }
+
   const mediaId = randomUUID();
   const ext = mediaFileExtension(media.kind, mimeType);
   const year = new Date(createdAt).getUTCFullYear();
@@ -1564,15 +1673,126 @@ function storeMediaBinary(instance: string, media: CachedMedia): CachedMedia {
     sizeBytes: bytes.length,
     createdAt,
     expiresAt,
+    storageKey,
   });
+  chatMediaStorageKeyIndex.set(storageKey, mediaId);
   persistMediaIndex();
 
   return {
     ...media,
     mediaId,
+    storageKey,
     base64: undefined,
     bytes: bytes.length,
   };
+}
+
+async function adoptExistingMediaBinaries(): Promise<void> {
+  if (process.env.CHAT_MEDIA_ADOPT_EXISTING === 'false') return;
+  if (!fs.existsSync(mediaStoragePath)) return;
+
+  const deleteDuplicates = process.env.CHAT_MEDIA_DELETE_DUPLICATES !== 'false';
+  let scanned = 0;
+  let adopted = 0;
+  let duplicatesDeleted = 0;
+  let bytesDeleted = 0;
+  let errors = 0;
+
+  const walk = async (dir: string): Promise<void> => {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      errors += 1;
+      return;
+    }
+
+    for (const entry of entries) {
+      const absolutePath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      const relativePath = path.relative(mediaStoragePath, absolutePath);
+      const parts = relativePath.split(path.sep);
+      const instance = parts[0];
+      if (!instance || parts.length < 2) continue;
+
+      const extMeta = mediaKindFromExtension(path.extname(entry.name));
+      if (!extMeta) continue;
+
+      const alreadyIndexed = [...chatMediaBinaryStore.values()].some((item) => item.relativePath === relativePath);
+      if (alreadyIndexed) continue;
+
+      try {
+        const stat = await fs.promises.stat(absolutePath);
+        if (!stat.isFile() || stat.size <= 0) continue;
+        scanned += 1;
+        const sha256 = await sha256File(absolutePath);
+        const storageKey = `${instance}:sha256:${sha256}`;
+        const existingMediaId = chatMediaStorageKeyIndex.get(storageKey);
+        const existing = existingMediaId ? chatMediaBinaryStore.get(existingMediaId) : undefined;
+        if (existing) {
+          const existingPath = path.join(mediaStoragePath, existing.relativePath);
+          if (deleteDuplicates && fs.existsSync(existingPath)) {
+            await fs.promises.rm(absolutePath, { force: true });
+            duplicatesDeleted += 1;
+            bytesDeleted += stat.size;
+          }
+          continue;
+        }
+
+        const mediaId = path.parse(entry.name).name || randomUUID();
+        const createdAt = Math.floor(stat.mtimeMs || Date.now());
+        const expiresAt = createdAt + config.limits.chatMediaRetentionMs;
+        const record: CachedMediaBinary = {
+          instance,
+          mediaId,
+          kind: extMeta.kind,
+          mimeType: extMeta.mimeType,
+          relativePath,
+          sizeBytes: stat.size,
+          createdAt,
+          expiresAt,
+          storageKey,
+        };
+        chatMediaBinaryStore.set(mediaId, record);
+        chatMediaStorageKeyIndex.set(storageKey, mediaId);
+        adopted += 1;
+        if (adopted % 500 === 0 || duplicatesDeleted % 500 === 0) persistMediaIndex();
+      } catch {
+        errors += 1;
+      }
+
+      if ((scanned + adopted + duplicatesDeleted) % 100 === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    }
+  };
+
+  log.whatsapp.info('media_adoption_started');
+  await walk(mediaStoragePath);
+  persistMediaIndex();
+  log.whatsapp.info('media_adoption_finished', {
+    scanned,
+    adopted,
+    duplicatesDeleted,
+    bytesDeleted,
+    bytesDeletedGiB: Number((bytesDeleted / 1024 / 1024 / 1024).toFixed(2)),
+    errors,
+  });
+}
+
+function scheduleExistingMediaAdoption(): void {
+  const delayMs = Number.parseInt(process.env.CHAT_MEDIA_ADOPT_DELAY_MS ?? '30000', 10);
+  const handle = setTimeout(() => {
+    adoptExistingMediaBinaries().catch((err) => {
+      log.whatsapp.warn('media_adoption_failed', err);
+    });
+  }, Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : 30000);
+  handle.unref?.();
 }
 
 function findMediaNode(message: unknown, depth = 0): { kind: MediaKind; node: Record<string, unknown> } | null {
@@ -2396,7 +2616,7 @@ async function resolveReactionTarget(
     };
   }
 
-  await ensureCachedMessageMedia(instance, target);
+  await ensureCachedMessageMedia(instance, target, chatJid);
   const targetType = target.media?.kind ?? (target.contact ? 'contact' : 'text');
   return {
     id: target.id,
@@ -2462,9 +2682,11 @@ async function normalizeSingleMessageForExternal(
   };
   const quotedMessageId = extractQuotedMessageId(raw);
   if (quotedMessageId) cleaned.quotedMessageId = quotedMessageId;
+  const rawKey = isRecord(raw.key) ? raw.key : null;
+  const rawJid = typeof rawKey?.remoteJid === 'string' ? rawKey.remoteJid.trim() : undefined;
   const cached = getCachedMessageForRaw(instance, raw);
   if (cached) {
-    await ensureCachedMessageMedia(instance, cached);
+    await ensureCachedMessageMedia(instance, cached, rawJid);
     cleaned.text = cached.text;
     if (cached.quotedMessageId) cleaned.quotedMessageId = cached.quotedMessageId;
     const resolvedType = cached.media?.kind ?? inferredType;
@@ -2941,7 +3163,7 @@ export async function reconnectPreviouslyActiveInstances(authFolder: string): Pr
   const queue = [...savedSessions].filter((name) => {
     if (!isValidInstanceName(name)) return false;
     const state = lastInstanceState.get(name);
-    return shouldRestoreInstanceOnStartup(state, name);
+    return shouldRestoreInstanceOnStartup(state, name, authFolder);
   });
   let started = 0;
 
@@ -3174,6 +3396,7 @@ export async function createInstance(
       if (connection === 'open') {
         ctx.status = 'connected';
         ctx.qr = null;
+        recordConnected(name);
         authRecoveryIssuedAt.delete(name);
         reconnectAttempts.set(name, 0);
         if (state.creds.registered !== true && isCompletedPairingState(state.creds as { account?: unknown; signalIdentities?: unknown })) {
@@ -3283,6 +3506,7 @@ export async function createInstance(
         }
 
         log.whatsapp.child(name).info(`connection_close  code=${String(code ?? 'n/a')}  message=${String(message ?? 'n/a')}`);
+        recordConnectionClose(name, code);
 
         // 515 = restartRequired: durante o pareamento isso e normal. O WhatsApp
         // pede apenas que o socket seja recriado usando a mesma auth recem-gravada.
@@ -3482,6 +3706,7 @@ export async function createInstance(
           const delayMs = Math.min(1000 * attempts, 6000);
           markAuthRecoveryWindow(name);
           log.whatsapp.child(name).info(`reconnect_attempt=${attempts}  delay_ms=${delayMs}`);
+        recordReconnectAttempt(name);
           closeSocket(ctx.sock);
           ctx.status = 'connecting';
           trackLastInstanceState(name, {
@@ -3512,6 +3737,7 @@ export async function createInstance(
       const data = (payload ?? {}) as { messages?: Array<Record<string, unknown>> };
       const originalList = Array.isArray(data.messages) ? data.messages : [];
       const ingested = ingestMessagesToCache(name, originalList, { fromHistory: false });
+      recordMessagesUpsert(name, ingested.inserted);
       const list = ingested.list;
 
       // Detecta mensagens que falharam descriptografia (CIPHERTEXT stub) na própria
@@ -4369,10 +4595,11 @@ function toPublicCachedMessage(instance: string, message: CachedMessageInternal)
   };
 }
 
-async function ensureCachedMessageMedia(instance: string, message: CachedMessageInternal): Promise<void> {
+async function ensureCachedMessageMedia(instance: string, message: CachedMessageInternal, jid?: string): Promise<void> {
   if (!message.media || message.media.base64 || message.media.omittedReason || !message.mediaSource) return;
+  if (message.media.mediaId) return;
 
-  const lockKey = `${instance}:${message.id}`;
+  const lockKey = `${instance}:${jid ?? ''}:${message.id}`;
   const existing = chatMediaEnsureInFlight.get(lockKey);
   if (existing) {
     await existing;
@@ -4398,6 +4625,15 @@ async function ensureCachedMessageMedia(instance: string, message: CachedMessage
       };
 
       message.media = storeMediaBinary(instance, message.media);
+      if (jid && message.media.mediaId) {
+        try {
+          msUpdateMessageFields(instance, jid, message.id, {
+            media: message.media as unknown as Record<string, unknown>,
+          });
+        } catch {
+          // Best-effort: cache and media index already have the deduplicated binary.
+        }
+      }
       return;
     }
 
@@ -4618,7 +4854,16 @@ export async function getInstanceChatMessagesWithMedia(
   const list = onlyIds?.size
     ? source.filter((message) => onlyIds.has(message.id))
     : source;
-  await Promise.all(list.map((message) => ensureCachedMessageMedia(name, message)));
+  const concurrency = Math.min(4, Math.max(1, list.length));
+  let cursor = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (cursor < list.length) {
+      const index = cursor++;
+      const message = list[index];
+      if (message) await ensureCachedMessageMedia(name, message, jid);
+    }
+  });
+  await Promise.all(workers);
   return list.map((item) => toPublicCachedMessage(name, item));
 }
 
@@ -4636,6 +4881,7 @@ export function getInstanceChatMediaBinary(
   let bytes: Buffer;
   try {
     if (!fs.existsSync(absolutePath)) {
+      if (item.storageKey) chatMediaStorageKeyIndex.delete(item.storageKey);
       chatMediaBinaryStore.delete(mediaId);
       persistMediaIndex();
       return { ok: false, error: 'not_found' };
