@@ -34,6 +34,8 @@ import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.j
 import { markChatwootOriginated } from './chatwoot-tracking.js';
 import { log } from '../utils/logger.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
+import { NamedTimerRegistry } from '../utils/named-timer-registry.js';
+import { outboundDeliveryMessageId } from '../utils/outbound-delivery-key.js';
 import {
   sleep as humanSleep,
   randomIntBetween as humanRandomIntBetween,
@@ -46,6 +48,7 @@ import { recordOpencodePeerSelfFix, recordMessagesUpsert, recordConnected, recor
 
 const instances = new Map<string, InstanceContext>();
 const reconnectAttempts = new Map<string, number>();
+const pendingReconnectTimers = new NamedTimerRegistry();
 const pairingIssuedAt = new Map<string, number>();
 const authRecoveryIssuedAt = new Map<string, number>();
 const alwaysOnlineIntervals = new Map<string, NodeJS.Timeout>();
@@ -282,7 +285,7 @@ function updateOutboundDeliveryFromMessageUpdate(instance: string, payload: unkn
   const updates = Array.isArray(payload) ? payload : [payload];
   for (const item of updates) {
     if (!isRecord(item) || !isRecord(item.key) || !isRecord(item.update)) continue;
-    const messageId = typeof item.key.id === 'string' ? item.key.id.trim() : '';
+    const messageId = outboundDeliveryMessageId(item.key);
     if (!messageId) continue;
     const mapped = mapMessageStatus(item.update.status);
     setOutboundDeliveryState({
@@ -302,7 +305,7 @@ function updateOutboundDeliveryFromReceiptUpdate(instance: string, payload: unkn
   const updates = Array.isArray(payload) ? payload : [payload];
   for (const item of updates) {
     if (!isRecord(item) || !isRecord(item.key)) continue;
-    const messageId = typeof item.key.id === 'string' ? item.key.id.trim() : '';
+    const messageId = outboundDeliveryMessageId(item.key);
     if (!messageId) continue;
     const receipt = extractReceiptSnapshot(item.receipt);
     const state: OutboundDeliverySnapshot = {
@@ -916,6 +919,7 @@ loadLastInstanceState();
 function registerShutdownStateHandlers(): void {
   const markShutdown = () => {
     processShuttingDown = true;
+    pendingReconnectTimers.cancelAll();
     persistCurrentInstanceStatesForShutdown();
   };
   process.once('SIGINT', markShutdown);
@@ -2039,8 +2043,10 @@ async function downloadMediaBase64(
     if (typeof module.downloadContentFromMessage !== 'function') return { omittedReason: 'download_failed' };
 
     const DOWNLOAD_TIMEOUT_MS = 30_000;
+    let activeStream: (AsyncIterable<Uint8Array | Buffer> & { destroy?: (error?: Error) => void; return?: () => unknown }) | undefined;
     const downloadPromise = (async () => {
       const stream = await module.downloadContentFromMessage!(node, MEDIA_NODE_BY_KIND[kind].downloadType);
+      activeStream = stream as typeof activeStream;
       const chunks: Buffer[] = [];
       let total = 0;
       const limit = maxMediaBytes(kind, scope);
@@ -2058,8 +2064,25 @@ async function downloadMediaBase64(
       return { base64: Buffer.concat(chunks).toString('base64'), bytes: total };
     })();
 
-    const timeoutPromise = new Promise<{ omittedReason: 'download_failed' }>((resolve) =>
-      setTimeout(() => resolve({ omittedReason: 'download_failed' }), DOWNLOAD_TIMEOUT_MS)
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<{ omittedReason: 'download_failed' }>((resolve) => {
+      timeoutHandle = setTimeout(() => {
+        try {
+          if (typeof activeStream?.destroy === 'function') {
+            activeStream.destroy(new Error('media_download_timeout'));
+          } else if (typeof activeStream?.return === 'function') {
+            void Promise.resolve(activeStream.return()).catch(() => {});
+          }
+        } catch {
+          // Best-effort cancellation; the timeout result still resolves safely.
+        }
+        resolve({ omittedReason: 'download_failed' });
+      }, DOWNLOAD_TIMEOUT_MS);
+      timeoutHandle.unref?.();
+    });
+    void downloadPromise.then(
+      () => { if (timeoutHandle) clearTimeout(timeoutHandle); },
+      () => { if (timeoutHandle) clearTimeout(timeoutHandle); },
     );
 
     return await Promise.race([downloadPromise, timeoutPromise]);
@@ -3247,6 +3270,8 @@ export async function createInstance(
     return { ok: false, instance: normalizedName || String(name ?? ''), error: 'invalid_instance_name' };
   }
   name = normalizedName;
+  // A manual create supersedes any delayed reconnect for the same instance.
+  pendingReconnectTimers.cancel(name);
 
   if (instances.has(name)) {
     const ctx = instances.get(name)!;
@@ -3443,6 +3468,7 @@ export async function createInstance(
       }
 
       if (connection === 'open') {
+        pendingReconnectTimers.cancel(name);
         ctx.status = 'connected';
         ctx.qr = null;
         recordConnected(name);
@@ -3573,10 +3599,7 @@ export async function createInstance(
           });
           stopAlwaysOnline(name);
           stopContinuousHistorySync(name);
-          // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-          setTimeout(() => {
-            if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-          }, 2000);
+          pendingReconnectTimers.schedule(name, 2000, () => createInstance(name, folder));
           return;
         }
 
@@ -3604,10 +3627,7 @@ export async function createInstance(
             });
             stopAlwaysOnline(name);
             stopContinuousHistorySync(name);
-            // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-            setTimeout(() => {
-              if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-            }, 1200);
+            pendingReconnectTimers.schedule(name, 1200, () => createInstance(name, folder));
             return;
           }
 
@@ -3629,10 +3649,7 @@ export async function createInstance(
                 wasConnected: false,
                 stoppedByUser: false,
               });
-              // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-              setTimeout(() => {
-                if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-              }, 1200);
+              pendingReconnectTimers.schedule(name, 1200, () => createInstance(name, folder));
             } else {
               instances.delete(name);
               trackLastInstanceState(name, {
@@ -3666,10 +3683,7 @@ export async function createInstance(
               wasConnected: false,
               stoppedByUser: false,
             });
-            // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-            setTimeout(() => {
-              if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-            }, 1200);
+            pendingReconnectTimers.schedule(name, 1200, () => createInstance(name, folder));
             return;
           }
 
@@ -3688,10 +3702,7 @@ export async function createInstance(
               status: 'connecting',
               stoppedByUser: false,
             });
-            // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-            setTimeout(() => {
-              if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-            }, delayMs);
+            pendingReconnectTimers.schedule(name, delayMs, () => createInstance(name, folder));
             return;
           }
 
@@ -3740,8 +3751,7 @@ export async function createInstance(
               ctx.status = 'connecting';
               ctx.qr = null;
               trackLastInstanceState(name, { status: 'connecting', stoppedByUser: false });
-              // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-              setTimeout(() => { if (!processShuttingDown) createInstance(name, folder).catch(() => {}); }, 2000);
+              pendingReconnectTimers.schedule(name, 2000, () => createInstance(name, folder));
               return;
             }
           }
@@ -3755,7 +3765,7 @@ export async function createInstance(
           const delayMs = Math.min(1000 * attempts, 6000);
           markAuthRecoveryWindow(name);
           log.whatsapp.child(name).info(`reconnect_attempt=${attempts}  delay_ms=${delayMs}`);
-        recordReconnectAttempt(name);
+          recordReconnectAttempt(name);
           closeSocket(ctx.sock);
           ctx.status = 'connecting';
           trackLastInstanceState(name, {
@@ -3764,10 +3774,7 @@ export async function createInstance(
           });
           stopAlwaysOnline(name);
           stopContinuousHistorySync(name);
-          // TODO: guardar handle em pendingReconnectTimer para cancelar se desconectado manualmente
-          setTimeout(() => {
-            if (!processShuttingDown) createInstance(name, folder).catch(() => {});
-          }, delayMs);
+          pendingReconnectTimers.schedule(name, delayMs, () => createInstance(name, folder));
         } else {
           log.whatsapp.child(name).error(`reconnect_exhausted — esgotadas ${attempts} tentativas de reconexão, instância desconectada`);
           // Cleanup completo: remover do Map, parar intervalos, atualizar estado persistido.
@@ -4352,6 +4359,7 @@ export async function requestInstancePairingCode(
  * Desconecta e remove a instância da memória (credenciais permanecem em disco).
  */
 export function disconnectInstance(name: string, options?: { keepAutostart?: boolean }): boolean {
+  pendingReconnectTimers.cancel(name);
   const ctx = instances.get(name);
   if (!ctx) return false;
   // Captura o status ANTES de fechar o socket — closeSocket() pode disparar
@@ -4397,6 +4405,7 @@ export async function logoutInstance(name: string, authFolder: string): Promise<
     return { ok: false, error: 'invalid_instance_name' };
   }
   name = normalizedName;
+  pendingReconnectTimers.cancel(name);
 
   const ctx = instances.get(name);
   if (ctx) {

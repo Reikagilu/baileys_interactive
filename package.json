@@ -23,6 +23,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "https-proxy-agent": "^7.0.6",
+    "protobufjs": "^8.7.1",
     "qrcode": "^1.5.4",
     "swagger-ui-dist": "^5.20.7"
   },

@@ -2,8 +2,15 @@
  * Formata número para JID do WhatsApp (5511999999999@s.whatsapp.net)
  */
 export function toJid(phone) {
-    const digits = String(phone ?? '').replace(/\D+/g, '');
-    return digits ? `${digits}@s.whatsapp.net` : null;
+    const raw = String(phone ?? '').trim();
+    if (/^\d+@s\.whatsapp\.net$/i.test(raw))
+        return raw.toLowerCase();
+    const digits = raw.replace(/\D+/g, '');
+    // Raw destinations must be plausible E.164 numbers. Preserve already formed
+    // JIDs for protocol/internal callers, but reject accidental short inputs.
+    if (digits.length < 8 || digits.length > 15)
+        return null;
+    return `${digits}@s.whatsapp.net`;
 }
 export const INSTANCE_NAME_PATTERN = /^[a-z0-9_-]{1,64}$/i;
 export function isValidInstanceName(value) {

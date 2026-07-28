@@ -2116,7 +2116,16 @@ export async function autoCreateChatwootInbox(
       await cwFetch(cwCfg, 'PATCH', `/inboxes/${inbox.id}`, {
         channel: { webhook_url: webhookUrl },
       });
-      log.chatwoot.child(instanceName).info(`autoCreate: webhook_url configurado  url=${webhookUrl}`);
+      // Never print the query secret embedded in webhookUrl.
+      const webhookLogUrl = (() => {
+        try {
+          const parsed = new URL(webhookUrl);
+          return `${parsed.origin}${parsed.pathname}`;
+        } catch {
+          return '[configured]';
+        }
+      })();
+      log.chatwoot.child(instanceName).info(`autoCreate: webhook_url configurado  url=${webhookLogUrl}  protected=${Boolean(config.security.chatwootWebhookSecret.trim())}`);
     } catch (err) {
       // Non-fatal: log but continue
       log.chatwoot.child(instanceName).warn('autoCreate: não foi possível atualizar webhook_url', err);

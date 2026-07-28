@@ -83,6 +83,11 @@ export function emitCrashWebhook(report) {
  */
 let installed = false;
 let terminating = false;
+function terminateCorruptedProcess() {
+    process.exitCode = 1;
+    const forceExit = setTimeout(() => process.exit(1), 250);
+    forceExit.unref();
+}
 export function installCrashHandlers() {
     if (installed)
         return;
@@ -107,11 +112,12 @@ export function installCrashHandlers() {
                 `  stack: ${(err?.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`);
         }
         catch { }
-        process.exitCode = 1;
-        const forceExit = setTimeout(() => process.exit(1), 250);
-        forceExit.unref();
+        terminateCorruptedProcess();
     });
     process.on('unhandledRejection', (reason, _promise) => {
+        if (terminating)
+            return;
+        terminating = true;
         const err = reason instanceof Error ? reason : new Error(String(reason));
         const report = {
             ts: new Date().toISOString(),
@@ -128,6 +134,7 @@ export function installCrashHandlers() {
                 `  stack: ${(err.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`);
         }
         catch { }
+        terminateCorruptedProcess();
     });
 }
 export const CRASH_LOG_FILE = CRASH_LOG_PATH;

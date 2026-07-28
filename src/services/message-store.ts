@@ -199,6 +199,21 @@ function getDb(): DatabaseSync {
     CREATE INDEX IF NOT EXISTS idx_message_delivery_updated
       ON message_delivery (updated_at)
   `);
+  // Versions before 2026-07-28 persisted inbound status events in the outbound
+  // delivery table. Remove only rows proven inbound by the primary message store;
+  // keep orphan receipts because they may legitimately arrive before ingest.
+  const cleanedInboundDelivery = db.prepare(`
+    DELETE FROM message_delivery
+    WHERE EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.instance = message_delivery.instance
+        AND m.msg_id = message_delivery.msg_id
+        AND m.from_me = 0
+    )
+  `).run().changes ?? 0;
+  if (cleanedInboundDelivery > 0) {
+    log.msgStore.info(`delivery cleanup: ${cleanedInboundDelivery} inbound rows removed`);
+  }
   try {
     db.exec('ALTER TABLE messages ADD COLUMN participant TEXT');
   } catch (err) {

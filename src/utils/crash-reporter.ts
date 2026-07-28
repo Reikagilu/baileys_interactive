@@ -89,6 +89,13 @@ export function emitCrashWebhook(report: CrashReport): void {
  */
 let installed = false;
 let terminating = false;
+
+function terminateCorruptedProcess(): void {
+  process.exitCode = 1;
+  const forceExit = setTimeout(() => process.exit(1), 250);
+  forceExit.unref();
+}
+
 export function installCrashHandlers(): void {
   if (installed) return;
   installed = true;
@@ -113,12 +120,12 @@ export function installCrashHandlers(): void {
         `  stack: ${(err?.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`
       );
     } catch {}
-    process.exitCode = 1;
-    const forceExit = setTimeout(() => process.exit(1), 250);
-    forceExit.unref();
+    terminateCorruptedProcess();
   });
 
   process.on('unhandledRejection', (reason, _promise) => {
+    if (terminating) return;
+    terminating = true;
     const err = reason instanceof Error ? reason : new Error(String(reason));
     const report: CrashReport = {
       ts: new Date().toISOString(),
@@ -136,6 +143,7 @@ export function installCrashHandlers(): void {
         `  stack: ${(err.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`
       );
     } catch {}
+    terminateCorruptedProcess();
   });
 }
 
