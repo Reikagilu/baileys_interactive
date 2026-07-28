@@ -3,6 +3,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
+import { discardResponseBody } from '../utils/http-response.js';
 
 export const INSTANCE_EVENT_NAMES = [
     'APPLICATION_STARTUP',
@@ -349,10 +350,11 @@ export async function emitInstanceEvent(
             body,
             signal: controller.signal,
         });
-        if (!response.ok) {
-            return { ok: false, skipped: false, status: response.status, error: `webhook_http_${response.status}` };
-        }
-        return { ok: true, skipped: false, status: response.status };
+        const status = response.status;
+        const ok = response.ok;
+        await discardResponseBody(response);
+        if (!ok) return { ok: false, skipped: false, status, error: `webhook_http_${status}` };
+        return { ok: true, skipped: false, status };
     } catch (error) {
         return { ok: false, skipped: false, error: error instanceof Error ? error.message : String(error) };
     } finally {

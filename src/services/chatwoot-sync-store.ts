@@ -75,7 +75,7 @@ function getDb(): DatabaseSync {
   // ser retentadas. Isso garante ZERO perda de mensagens mesmo em falhas temporárias.
   db.exec(`
     CREATE TABLE IF NOT EXISTS chatwoot_pending (
-      id            INTEGER NOT NULL,
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
       instance      TEXT NOT NULL,
       msg_id        TEXT NOT NULL,
       payload       TEXT NOT NULL,
@@ -83,9 +83,35 @@ function getDb(): DatabaseSync {
       next_attempt  INTEGER NOT NULL DEFAULT 0,
       last_error    TEXT,
       created_at    INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (instance, msg_id)
+      UNIQUE (instance, msg_id)
     )
   `);
+  const pendingColumns = db.prepare('PRAGMA table_info(chatwoot_pending)').all() as Array<{ name: string; pk: number }>;
+  const pendingId = pendingColumns.find((column) => column.name === 'id');
+  if (pendingId && pendingId.pk !== 1) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`
+        CREATE TABLE chatwoot_pending_v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          instance TEXT NOT NULL, msg_id TEXT NOT NULL, payload TEXT NOT NULL,
+          attempt INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT, created_at INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(instance, msg_id)
+        );
+        INSERT OR IGNORE INTO chatwoot_pending_v2
+          (instance, msg_id, payload, attempt, next_attempt, last_error, created_at)
+        SELECT instance, msg_id, payload, attempt, next_attempt, last_error, created_at
+        FROM chatwoot_pending;
+        DROP TABLE chatwoot_pending;
+        ALTER TABLE chatwoot_pending_v2 RENAME TO chatwoot_pending;
+      `);
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
+  }
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_chatwoot_pending_next
       ON chatwoot_pending (next_attempt)
@@ -413,12 +439,18 @@ function loadInflightFromDb(): void {
       )
     `).run();
 
-    for (const row of rows) {
-      const key = messageSyncKey(row.instance, row.msg_id);
-      _messageSyncInFlight.add(key);
-    }
+    // An in-memory lock cannot survive a crash. Clear orphan locks so the next
+    // realtime/history pass can acquire and retry each message exactly once.
     if (rows.length > 0) {
-      log.chatwoot.info(`In-flight recovery: ${rows.length} mensagem(ns) em voo serão reprocessadas`);
+      _db!.prepare(`
+        DELETE FROM chatwoot_inflight
+        WHERE NOT EXISTS (
+          SELECT 1 FROM chatwoot_synced s
+          WHERE s.instance = chatwoot_inflight.instance
+            AND s.msg_id = chatwoot_inflight.msg_id
+        )
+      `).run();
+      log.chatwoot.info(`In-flight recovery: ${rows.length} lock(s) órfão(s) liberado(s) para reprocessamento`);
     }
   } catch (err) {
     log.chatwoot.error('Falha ao carregar in-flight do SQLite', err);
@@ -496,9 +528,13 @@ export function addPendingMessage(
   const now = Date.now();
   try {
     db.prepare(`
-      INSERT OR REPLACE INTO chatwoot_pending
+      INSERT INTO chatwoot_pending
         (instance, msg_id, payload, attempt, next_attempt, last_error, created_at)
       VALUES (?, ?, ?, 1, ?, ?, ?)
+      ON CONFLICT(instance, msg_id) DO UPDATE SET
+        payload = excluded.payload,
+        next_attempt = MIN(chatwoot_pending.next_attempt, excluded.next_attempt),
+        last_error = excluded.last_error
     `).run(instance, msgId, payload, now + RETRY_DELAYS_MS[0], error || 'unknown', now);
     log.chatwoot.child(instance).warn(`Mensagem ${msgId} adicionada à fila de retry (attempt=1)`);
   } catch (err) {

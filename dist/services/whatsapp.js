@@ -8,7 +8,7 @@ import { isValidInstanceName } from '../utils/helpers.js';
 import { signMediaUrlToken } from '../utils/media-signature.js';
 import { emitWebhookEvent } from './webhooks.js';
 import { emitInstanceEvent, getInstanceGeneral, getInstancePanelConfig } from './instance-config.js';
-import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, runInTransaction as msRunInTransaction, bulkUpsertContacts as msBulkUpsertContacts, upsertContact as msUpsertContact, } from './message-store.js';
+import { upsertMessage as msUpsert, updateMessageFields as msUpdateMessageFields, upsertChatMeta as msUpsertMeta, incrementUnread as msIncrementUnread, resetUnread as msResetUnread, listChats as msListChats, listMessages as msListMessages, countMessages as msCountMessages, clearInstance as msClearInstance, runInTransaction as msRunInTransaction, bulkUpsertContacts as msBulkUpsertContacts, upsertContact as msUpsertContact, setMessageDeliveryState as msSetDeliveryState, getMessageDeliveryState as msGetDeliveryState, getMessageDeliveryStates as msGetDeliveryStates, } from './message-store.js';
 import { markMessageSynced } from './chatwoot-sync-store.js';
 import { getInstanceIntegrations } from './integrations.js';
 import { dispatchToChatwoot, autoCreateChatwootInbox } from './chatwoot-bridge.js';
@@ -39,9 +39,9 @@ const mediaStoragePath = path.resolve(process.cwd(), 'data', 'chat-media');
 // file as a fallback during migration, but persist new state to /app/data.
 const mediaIndexPath = path.resolve(process.cwd(), 'data', 'chat-media-index.json');
 const legacyMediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
-const CONTINUOUS_HISTORY_SYNC_MS = 7000;
-const CONTINUOUS_HISTORY_BATCH_CHATS = 6;
-const CONTINUOUS_HISTORY_FETCH_COUNT = 120;
+const CONTINUOUS_HISTORY_SYNC_MS = Math.max(30_000, Number(process.env.CONTINUOUS_HISTORY_SYNC_MS ?? 60_000));
+const CONTINUOUS_HISTORY_BATCH_CHATS = Math.max(1, Math.min(10, Number(process.env.CONTINUOUS_HISTORY_BATCH_CHATS ?? 4)));
+const CONTINUOUS_HISTORY_FETCH_COUNT = Math.max(20, Math.min(250, Number(process.env.CONTINUOUS_HISTORY_FETCH_COUNT ?? 100)));
 const MESSAGE_WRAPPER_KEYS = [
     'ephemeralMessage',
     'viewOnceMessage',
@@ -89,14 +89,50 @@ function notifyOutboundDeliveryWaiters(key, snapshot) {
 function isFinalOutboundDeliveryState(snapshot) {
     return snapshot.state === 'delivered' || snapshot.state === 'read' || snapshot.state === 'played' || snapshot.state === 'failed';
 }
+function deliverySnapshotFromStored(instance, messageId, stored) {
+    const levels = {
+        failed: -1, pending: 0, server_ack: 1, delivered: 2, read: 3, played: 4,
+    };
+    return {
+        instance,
+        messageId,
+        state: stored.state,
+        level: levels[stored.state],
+        description: stored.description ?? `Estado persistido: ${stored.state}`,
+        event: stored.event ?? 'messages.update',
+        statusCode: stored.statusCode,
+        updatedAt: stored.updatedAt,
+    };
+}
 function setOutboundDeliveryState(snapshot) {
     const key = makeOutboundDeliveryKey(snapshot.instance, snapshot.messageId);
-    const current = outboundDeliveryStates.get(key);
-    if (current && current.level > snapshot.level)
+    const persisted = !outboundDeliveryStates.has(key)
+        ? msGetDeliveryState(snapshot.instance, snapshot.messageId)
+        : undefined;
+    const current = outboundDeliveryStates.get(key)
+        ?? (persisted ? deliverySnapshotFromStored(snapshot.instance, snapshot.messageId, persisted) : undefined);
+    const currentSucceeded = current && ['delivered', 'read', 'played'].includes(current.state);
+    // Failure must replace pending/server_ack, but must never regress a confirmed delivery.
+    if (snapshot.state === 'failed' && currentSucceeded)
+        return;
+    if (current?.state === 'failed' && snapshot.state !== 'failed')
+        return;
+    if (snapshot.state !== 'failed' && current && current.level > snapshot.level)
         return;
     if (current && current.level === snapshot.level && current.updatedAt > snapshot.updatedAt)
         return;
     outboundDeliveryStates.set(key, snapshot);
+    msSetDeliveryState(snapshot.instance, snapshot.messageId, {
+        state: snapshot.state,
+        statusCode: snapshot.statusCode,
+        updatedAt: snapshot.updatedAt,
+        event: snapshot.event,
+        description: snapshot.description,
+    });
+    if (snapshot.state === 'failed') {
+        log.whatsapp.child(snapshot.instance).error(`outbound_delivery_failed msgId=${snapshot.messageId} statusCode=${String(snapshot.statusCode ?? 'n/a')}`);
+        emitWebhookEvent('message.delivery.failed', snapshot, snapshot.instance);
+    }
     cleanupOutboundDeliveryStateLater(key, isFinalOutboundDeliveryState(snapshot));
     notifyOutboundDeliveryWaiters(key, snapshot);
 }
@@ -298,7 +334,11 @@ export async function waitForOutboundDelivery(instance, messageId, options) {
     const timeoutMs = Math.max(1000, Math.min(60_000, Math.round(options?.timeoutMs ?? 15_000)));
     const minLevel = options?.minState === 'read' ? 3 : options?.minState === 'server_ack' ? 1 : 2;
     const key = makeOutboundDeliveryKey(instance, messageId);
-    const current = outboundDeliveryStates.get(key);
+    const persisted = msGetDeliveryState(instance, messageId);
+    const current = outboundDeliveryStates.get(key)
+        ?? (persisted ? deliverySnapshotFromStored(instance, messageId, persisted) : undefined);
+    if (current && !outboundDeliveryStates.has(key))
+        outboundDeliveryStates.set(key, current);
     if (current && (current.level >= minLevel || current.state === 'failed')) {
         return { snapshot: current, timedOut: false };
     }
@@ -4242,7 +4282,7 @@ export function getInstanceChatList(name) {
         ? merged
         : merged.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
 }
-function toPublicCachedMessage(instance, message) {
+function toPublicCachedMessage(instance, message, delivery) {
     const media = message.media
         ? {
             ...message.media,
@@ -4260,6 +4300,7 @@ function toPublicCachedMessage(instance, message) {
         quotedMessageId: message.quotedMessageId,
         media,
         contact: message.contact,
+        delivery: delivery ?? message.delivery,
     };
 }
 async function ensureCachedMessageMedia(instance, message, jid) {
@@ -4388,6 +4429,7 @@ function getInstanceChatMessagesInternal(name, jid) {
             quotedMessageId: m.quotedMessageId,
             media: mediaForPublic,
             contact: m.contact,
+            delivery: m.delivery,
             mediaSource,
         };
     };
@@ -4499,7 +4541,9 @@ function shouldSendAsVoiceNote(mimeType, fileName) {
     return mime.includes('codecs=opus') || mime === 'audio/ogg' || file.endsWith('.ogg') || file.endsWith('.opus');
 }
 export function getInstanceChatMessages(name, jid) {
-    return getInstanceChatMessagesInternal(name, jid).map((item) => toPublicCachedMessage(name, item));
+    const items = getInstanceChatMessagesInternal(name, jid);
+    const deliveries = msGetDeliveryStates(name, items.map((item) => item.id));
+    return items.map((item) => toPublicCachedMessage(name, item, deliveries.get(item.id)));
 }
 export async function getInstanceChatMessagesWithMedia(name, jid, onlyIds) {
     purgeExpiredMediaBinaries();
@@ -4518,7 +4562,8 @@ export async function getInstanceChatMessagesWithMedia(name, jid, onlyIds) {
         }
     });
     await Promise.all(workers);
-    return list.map((item) => toPublicCachedMessage(name, item));
+    const deliveries = msGetDeliveryStates(name, list.map((item) => item.id));
+    return list.map((item) => toPublicCachedMessage(name, item, deliveries.get(item.id)));
 }
 export function getInstanceChatMediaBinary(name, mediaId) {
     purgeExpiredMediaBinaries();
@@ -4842,6 +4887,7 @@ async function fetchMediaToBuffer(mediaUrl) {
     try {
         response = await fetch(safeMediaUrl, { signal: controller.signal });
         if (!response.ok) {
+            await response.body?.cancel().catch(() => { });
             clearTimeout(fetchTimeout);
             return { error: `media_fetch_status_${response.status}` };
         }

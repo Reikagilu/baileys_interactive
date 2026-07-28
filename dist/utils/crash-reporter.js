@@ -82,11 +82,15 @@ export function emitCrashWebhook(report) {
  * Idempotente: pode ser chamado mais de uma vez sem duplicar listeners.
  */
 let installed = false;
+let terminating = false;
 export function installCrashHandlers() {
     if (installed)
         return;
     installed = true;
     process.on('uncaughtException', (err, origin) => {
+        if (terminating)
+            return;
+        terminating = true;
         const report = {
             ts: new Date().toISOString(),
             kind: 'uncaughtException',
@@ -103,6 +107,9 @@ export function installCrashHandlers() {
                 `  stack: ${(err?.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`);
         }
         catch { }
+        process.exitCode = 1;
+        const forceExit = setTimeout(() => process.exit(1), 250);
+        forceExit.unref();
     });
     process.on('unhandledRejection', (reason, _promise) => {
         const err = reason instanceof Error ? reason : new Error(String(reason));

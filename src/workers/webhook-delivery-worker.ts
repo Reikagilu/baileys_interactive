@@ -17,6 +17,7 @@
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
+import { discardResponseBody } from '../utils/http-response.js';
 import {
     buildWebhookHeaders,
     claimDueDeliveries,
@@ -93,6 +94,7 @@ async function processDelivery(delivery: WebhookDelivery): Promise<void> {
         });
 
         if (response.ok || (response.status >= 200 && response.status < 300)) {
+            await discardResponseBody(response);
             markDeliverySuccess(delivery.id, response.status, WORKER_ID);
             log.webhook?.debug?.(`[worker:${WORKER_ID}] delivered ${delivery.id} → ${response.status}`);
         } else if (response.status >= 400 && response.status < 500 && response.status !== 429) {
@@ -105,6 +107,7 @@ async function processDelivery(delivery: WebhookDelivery): Promise<void> {
                 const errorText = (await response.text().catch(() => '')).slice(0, 200);
                 markDeliveryFailed(delivery.id, `http_${response.status}: ${errorText}`, response.status, WORKER_ID);
             } else {
+                await discardResponseBody(response);
                 markDeliveryRetry(delivery.id, `http_${response.status}`, response.status, attemptCount, WORKER_ID);
             }
         }

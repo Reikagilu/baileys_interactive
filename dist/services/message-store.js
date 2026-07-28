@@ -11,6 +11,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
@@ -104,6 +105,24 @@ function getDb() {
       PRIMARY KEY (instance, jid, msg_id)
     )
   `);
+    // Delivery lives in a separate table so acknowledgements that arrive before
+    // messages.upsert are not lost. PK(instance,msg_id) keeps writes O(log n).
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS message_delivery (
+      instance       TEXT NOT NULL,
+      msg_id         TEXT NOT NULL,
+      state          TEXT NOT NULL DEFAULT 'pending',
+      status_code    INTEGER,
+      updated_at     INTEGER NOT NULL DEFAULT 0,
+      event          TEXT,
+      description    TEXT,
+      PRIMARY KEY (instance, msg_id)
+    )
+  `);
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_message_delivery_updated
+      ON message_delivery (updated_at)
+  `);
     try {
         db.exec('ALTER TABLE messages ADD COLUMN participant TEXT');
     }
@@ -125,32 +144,22 @@ function getDb() {
         if (!String(err).includes('duplicate column'))
             throw err;
     }
-    // Defer the message_count backfill — runs a single GROUP BY scan instead of
-    // a correlated subquery per row, which is 10-100x faster on large databases.
-    // setImmediate only defers by 1 tick; the update itself is synchronous and can
-    // still stall the event loop if the DB is huge. For very large databases
-    // consider running this in a worker thread or skipping altogether.
-    setImmediate(() => {
-        try {
-            db.exec(`
-        UPDATE chat_meta
-        SET message_count = COALESCE((
-          SELECT cnt FROM (
-            SELECT instance, jid, COUNT(*) AS cnt
-            FROM messages
-            WHERE NOT (text = '[message]' AND media_json IS NULL AND contact_json IS NULL)
-            GROUP BY instance, jid
-          ) agg
-          WHERE agg.instance = chat_meta.instance
-            AND agg.jid = chat_meta.jid
-        ), 0)
-        WHERE message_count = 0
-      `);
-        }
-        catch (err) {
-            log.msgStore.warn('message_count backfill falhou', err);
-        }
-    });
+    // Backfill de message_count removido do boot.
+    //
+    // Por quê: mesmo com setImmediate, este UPDATE roda síncrono no mesmo
+    // thread do Node, escaneando todas as mensagens (378k+ em produção) e
+    // travando o event loop por vários segundos/minutos. Durante esse tempo,
+    // o handler de messages.upsert do Baileys fica bloqueado, e mensagens
+    // em tempo real são perdidas (WhatsApp não retém stanzas indefinidamente).
+    //
+    // O upsertMessage() mantém message_count atualizado via UPSERT
+    // (message_count = message_count + excluded.message_count) para qualquer
+    // chat que recebe novas mensagens. Para chats pré-existentes que ficaram
+    // com count=0 por causa desta remoção, usar:
+    //   POST /v1/admin/recount            → recabeça todas as instâncias
+    //   POST /v1/admin/recount/:instance  → recabeça uma instância
+    // (rota registrada em src/index.ts). A operação roda em Worker Thread e
+    // não trava o event loop.
     db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_instance_jid_ts
       ON messages (instance, jid, ts)
@@ -305,6 +314,60 @@ export function updateMessageFields(instance, jid, msgId, patch) {
     // Cast para any pois node:sqlite aceita todos os tipos primitivos mas o TS não expõe o union type correto no spread.
     stmt(`updateMessageFields.m${maskKey}`, sql).run(...args);
 }
+/** Persist/update a delivery acknowledgement independently of message ingest order. */
+export function setMessageDeliveryState(instance, msgId, delivery) {
+    if (!instance || !msgId || !delivery.state)
+        return;
+    stmt('setMessageDeliveryState', `
+    INSERT INTO message_delivery
+      (instance, msg_id, state, status_code, updated_at, event, description)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(instance, msg_id) DO UPDATE SET
+      state = excluded.state,
+      status_code = excluded.status_code,
+      updated_at = excluded.updated_at,
+      event = excluded.event,
+      description = excluded.description
+    WHERE excluded.updated_at >= message_delivery.updated_at
+  `).run(instance, msgId, delivery.state, delivery.statusCode ?? null, delivery.updatedAt, delivery.event ?? null, delivery.description ?? null);
+}
+export function getMessageDeliveryState(instance, msgId) {
+    if (!instance || !msgId)
+        return undefined;
+    const row = stmt('getMessageDeliveryState', `
+    SELECT state, status_code, updated_at, event, description
+    FROM message_delivery WHERE instance = ? AND msg_id = ?
+  `).get(instance, msgId);
+    return row ? {
+        state: row.state,
+        statusCode: row.status_code ?? undefined,
+        updatedAt: row.updated_at,
+        event: row.event ?? undefined,
+        description: row.description ?? undefined,
+    } : undefined;
+}
+export function getMessageDeliveryStates(instance, msgIds) {
+    const result = new Map();
+    const unique = [...new Set(msgIds.filter(Boolean))];
+    for (let offset = 0; offset < unique.length; offset += 400) {
+        const chunk = unique.slice(offset, offset + 400);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = getDb().prepare(`
+      SELECT msg_id, state, status_code, updated_at, event, description
+      FROM message_delivery
+      WHERE instance = ? AND msg_id IN (${placeholders})
+    `).all(instance, ...chunk);
+        for (const row of rows)
+            result.set(row.msg_id, {
+                state: row.state,
+                statusCode: row.status_code ?? undefined,
+                updatedAt: row.updated_at,
+                event: row.event ?? undefined,
+                description: row.description ?? undefined,
+            });
+    }
+    return result;
+}
 /**
  * Atualiza metadados do chat.
  *
@@ -381,12 +444,20 @@ export function listChats(instance) {
  */
 export function listMessages(instance, jid, limit = 500, afterTs) {
     const rows = stmt('listMessages', `
-    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
+    SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id,
+           media_json, contact_json, delivery_state, delivery_status_code,
+           delivery_updated_at, delivery_event, delivery_description
     FROM (
-      SELECT msg_id, from_me, text, ts, sender_name, sender_number, participant, quoted_msg_id, media_json, contact_json
-      FROM messages
-      WHERE instance = ? AND jid = ? AND (? IS NULL OR ts >= ?)
-      ORDER BY ts DESC
+      SELECT m.msg_id, m.from_me, m.text, m.ts, m.sender_name, m.sender_number,
+             m.participant, m.quoted_msg_id, m.media_json, m.contact_json,
+             d.state AS delivery_state, d.status_code AS delivery_status_code,
+             d.updated_at AS delivery_updated_at, d.event AS delivery_event,
+             d.description AS delivery_description
+      FROM messages m
+      LEFT JOIN message_delivery d
+        ON d.instance = m.instance AND d.msg_id = m.msg_id
+      WHERE m.instance = ? AND m.jid = ? AND (? IS NULL OR m.ts >= ?)
+      ORDER BY m.ts DESC
       LIMIT ?
     )
     ORDER BY ts ASC
@@ -402,6 +473,13 @@ export function listMessages(instance, jid, limit = 500, afterTs) {
         quotedMessageId: r.quoted_msg_id ?? undefined,
         media: parseJson(r.media_json),
         contact: parseJson(r.contact_json),
+        delivery: r.delivery_state ? {
+            state: r.delivery_state,
+            statusCode: r.delivery_status_code ?? undefined,
+            updatedAt: r.delivery_updated_at ?? 0,
+            event: r.delivery_event ?? undefined,
+            description: r.delivery_description ?? undefined,
+        } : undefined,
     }));
 }
 /**
@@ -781,11 +859,144 @@ function runMessageCleanup() {
       )
     `).run();
         const deletedMeta = resultMeta.changes ?? 0;
-        if (cleanedMedia > 0 || deletedMeta > 0) {
-            log.msgStore.success(`cleanup concluído: ${cleanedMedia} mídias limpas, ${deletedMeta} chats órfãos removidos`);
+        const resultDelivery = stmt('cleanupOrphanDelivery', `
+      DELETE FROM message_delivery
+      WHERE updated_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM messages m
+          WHERE m.instance = message_delivery.instance
+            AND m.msg_id = message_delivery.msg_id
+          LIMIT 1
+        )
+    `).run(cutoff);
+        const deletedDelivery = resultDelivery.changes ?? 0;
+        if (cleanedMedia > 0 || deletedMeta > 0 || deletedDelivery > 0) {
+            log.msgStore.success(`cleanup concluído: ${cleanedMedia} mídias limpas, ${deletedMeta} chats órfãos, ${deletedDelivery} receipts órfãos removidos`);
         }
     }
     catch (err) {
         log.msgStore.error(`cleanup falhou: ${err instanceof Error ? err.message : String(err)}`);
     }
+}
+// Recomputa message_count para chat_meta a partir da tabela messages.
+//
+// Estratégia: roda em Worker Thread (não trava o event loop do Node).
+// - Se `instance` for passado, só recabeça aquela instância.
+// - Caso contrário, recabeça TODAS as instâncias.
+//
+// Uso típico após adicionar/remover migration ou para corrigir chats
+// pré-existentes que ficaram com count=0 por ausência de mensagens novas.
+//
+// Endpoint HTTP: POST /v1/admin/recount[/:instance]
+//
+// Retorna uma Promise<{ updated: number, scanned: number, instance?: string }>.
+// módulo pai é ESM, e o worker precisa ser CommonJS para suportar `await`
+// top-level sem warnings sobre formato de módulo.
+let _workerScriptPath = null;
+async function getWorkerScriptPathAsync() {
+    if (_workerScriptPath)
+        return _workerScriptPath;
+    // Usa createRequire pra carregar módulos core do Node sem precisar de import
+    // dinâmico assíncrono neste escopo síncrono.
+    const { createRequire } = await import('node:module');
+    const req = createRequire(import.meta.url);
+    const fsSync = req('node:fs');
+    const osSync = req('node:os');
+    const pathSync = req('node:path');
+    const dir = fsSync.mkdtempSync(pathSync.join(osSync.tmpdir(), 'beyound-recount-'));
+    const file = pathSync.join(dir, 'recount.cjs');
+    fsSync.writeFileSync(file, RECOUNT_WORKER_SRC, 'utf8');
+    _workerScriptPath = file;
+    return file;
+}
+const RECOUNT_WORKER_SRC = `
+const { parentPort, workerData } = require('node:worker_threads');
+const { DatabaseSync } = require('node:sqlite');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+(async () => {  // IIFE wrapper for top-level await support
+
+const { dbPath, instanceFilter } = workerData;
+
+const db = new DatabaseSync(dbPath);
+db.exec('PRAGMA journal_mode = WAL');
+db.exec('PRAGMA busy_timeout = 5000');
+db.exec('PRAGMA synchronous = NORMAL');
+
+const CHUNK = 200;
+const YIELD_EVERY_MS = 250;
+
+const totalSql = instanceFilter
+  ? 'SELECT COUNT(*) AS c FROM chat_meta WHERE instance = ?'
+  : 'SELECT COUNT(*) AS c FROM chat_meta';
+const totalParams = instanceFilter ? [instanceFilter] : [];
+const { c: total } = db.prepare(totalSql).get(...totalParams);
+
+let scanned = 0;
+let updated = 0;
+let offset = 0;
+
+while (offset < total) {
+  const chunkSql = instanceFilter
+    ? 'SELECT instance, jid FROM chat_meta WHERE instance = ? ORDER BY instance, jid LIMIT ? OFFSET ?'
+    : 'SELECT instance, jid FROM chat_meta ORDER BY instance, jid LIMIT ? OFFSET ?';
+  const chunkParams = instanceFilter
+    ? [instanceFilter, CHUNK, offset]
+    : [CHUNK, offset];
+  const rows = db.prepare(chunkSql).all(...chunkParams);
+  if (rows.length === 0) break;
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const { instance, jid } of rows) {
+      const cnt = db.prepare(
+        "SELECT COUNT(*) AS c FROM messages WHERE instance = ? AND jid = ? AND NOT (text = '[message]' AND media_json IS NULL AND contact_json IS NULL)"
+      ).get(instance, jid).c;
+      db.prepare('UPDATE chat_meta SET message_count = ? WHERE instance = ? AND jid = ?')
+        .run(cnt, instance, jid);
+      updated += 1;
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch {}
+    parentPort.postMessage({ type: 'error', error: String(err) });
+    break;
+  }
+
+  scanned += rows.length;
+  offset += rows.length;
+  parentPort.postMessage({ type: 'progress', scanned, updated, total });
+  await sleep(YIELD_EVERY_MS);
+}
+
+parentPort.postMessage({ type: 'done', scanned, updated, total });
+})().catch((e) => parentPort.postMessage({ type: 'error', error: String(e) }));
+`;
+export async function recomputeMessageCounts(opts = {}) {
+    const dbPath = path.resolve(process.cwd(), config.messages.dbPath);
+    const workerScriptPath = await getWorkerScriptPathAsync();
+    return new Promise((resolve, reject) => {
+        const worker = new Worker(workerScriptPath, {
+            workerData: { dbPath, instanceFilter: opts.instance ?? null },
+        });
+        worker.on('message', (msg) => {
+            if (msg.type === 'error') {
+                log.msgStore.warn('recomputeMessageCounts worker error', msg.error);
+            }
+            else if (msg.type === 'done') {
+                log.msgStore.info(`recomputeMessageCounts done  instance=${opts.instance ?? 'ALL'}  scanned=${msg.scanned}  updated=${msg.updated}`);
+                resolve({ updated: msg.updated ?? 0, scanned: msg.scanned ?? 0, instance: opts.instance });
+                worker.terminate().catch(() => { });
+            }
+        });
+        worker.on('error', (err) => {
+            log.msgStore.warn('recomputeMessageCounts worker thread error', err);
+            reject(err);
+        });
+        worker.on('exit', (code) => {
+            if (code !== 0) {
+                log.msgStore.warn(`recomputeMessageCounts worker exited code=${code}`);
+            }
+        });
+    });
 }

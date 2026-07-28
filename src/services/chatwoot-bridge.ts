@@ -1153,7 +1153,13 @@ export async function dispatchToChatwoot(
 
   const inbox = await getInbox(instanceName, cwCfg, cfg.nameInbox || 'WhatsApp');
   if (!inbox) {
-    log.chatwoot.child(instanceName).warn(`Inbox "${cfg.nameInbox}" não encontrada no Chatwoot — verifique a configuração inboxId/nameInbox`);
+    log.chatwoot.child(instanceName).warn(`Inbox "${cfg.nameInbox}" não encontrada no Chatwoot — mensagens serão retentadas`);
+    for (const msg of messages) {
+      const jid = String(msg.key?.remoteJid ?? '');
+      const msgId = String(msg.key?.id ?? '');
+      if (!msgId || jid === 'status@broadcast' || jid.endsWith('@newsletter')) continue;
+      addPendingMessage(instanceName, msgId, JSON.stringify(msg), 'inbox_not_found');
+    }
     return;
   }
 
@@ -1185,6 +1191,10 @@ export async function dispatchToChatwoot(
           } catch (dbErr) {
             log.chatwoot.child(instanceName).error(`markMessageSynced falhou para msgId=${msgId}`, dbErr);
           }
+        } else if (result.skipped) {
+          // Terminal ignore/dedup: persist with conversation_id=0 so history sync
+          // does not reinterpret unsupported stubs and retry forever.
+          markMessageSyncedWithPersistence(instanceName, msgId, 0);
         }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -1289,9 +1299,11 @@ async function dispatchSingleMessage(
     return { skipped: true };
   }
 
-  // Skip messages with no meaningful content (unknown type with no text or media)
+  // Skip messages with no meaningful content consistently in realtime and history.
   const msgType = msg.messageType ?? msg.message_type ?? '';
   const hasContent = (msg.text && !msg.text.startsWith('[')) || msg.media?.caption || msg.media?.base64 || msg.media?.url;
+  const hasContact = Boolean(rawMsg?.contactMessage || rawMsg?.contactsArrayMessage);
+  if (msg.text === '[message]' && !msg.media && !hasContact) return { skipped: true };
   const isGroup = remoteJid.endsWith('@g.us');
   const isFromMe = key.fromMe;
   // Skip unknown-type messages that carry no displayable content — these include
@@ -2532,8 +2544,11 @@ async function processRetryBatch(): Promise<void> {
         markMessageSyncedWithPersistence(instance, msgId, result.conversationId);
         removePendingMessage(id);
         log.chatwoot.child(instance).success(`Retry sukses  msgId=${msgId}  attempt=${attempt + 1}`);
+      } else if (result.skipped) {
+        markMessageSyncedWithPersistence(instance, msgId, 0);
+        removePendingMessage(id);
       } else {
-        updatePendingMessageRetry(id, attempt, result.skipped ? 'skipped' : 'no_conversation');
+        updatePendingMessageRetry(id, attempt, 'no_conversation');
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);

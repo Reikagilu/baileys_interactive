@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
 import { updateInstanceGeneral } from './instance-config.js';
 import { log } from '../utils/logger.js';
+import { discardResponseBody } from '../utils/http-response.js';
 
 export interface ChatwootConfig {
   enabled: boolean;
@@ -379,11 +380,11 @@ export async function testChatwoot(instance: string): Promise<{
       },
       config.integrations.requestTimeoutMs
     );
-    return {
-      ok: res.status >= 200 && res.status < 300,
-      status: res.status,
-      error: res.status >= 200 && res.status < 300 ? undefined : `chatwoot_http_${res.status}`,
-    };
+    const status = res.status;
+    await discardResponseBody(res);
+    return { ok: status >= 200 && status < 300, status,
+      error: status >= 200 && status < 300 ? undefined : `chatwoot_http_${status}` };
+
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -430,11 +431,11 @@ export async function testN8n(instance: string): Promise<{
       config.integrations.requestTimeoutMs
     );
 
-    return {
-      ok: res.status >= 200 && res.status < 300,
-      status: res.status,
-      error: res.status >= 200 && res.status < 300 ? undefined : `n8n_http_${res.status}`,
-    };
+    const status = res.status;
+    await discardResponseBody(res);
+    return { ok: status >= 200 && status < 300, status,
+      error: status >= 200 && status < 300 ? undefined : `n8n_http_${status}` };
+
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

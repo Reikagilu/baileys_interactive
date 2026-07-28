@@ -40,6 +40,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const TARGET = path.join(ROOT, 'node_modules', 'baileys', 'lib', 'Socket', 'messages-recv.js');
 const TARGET_DECODE = path.join(ROOT, 'node_modules', 'baileys', 'lib', 'Utils', 'decode-wa-message.js');
+const TARGET_MEDIA = path.join(ROOT, 'node_modules', 'baileys', 'lib', 'Utils', 'messages-media.js');
+const MARKER_UNDICI_STREAM = '[beyound-undici-stream-error-forward]';
 
 const MARKER_DEDUPE = '[opencode-stanza-dedupe]';
 const MARKER_SELF_CLEANUP = '[opencode-self-session-cleanup]';
@@ -395,7 +397,9 @@ if (
   src.includes(MARKER_NO_RETRY_SELF) &&
   src.includes(MARKER_PEER_SELF_FIX) &&
   srcSend.includes(MARKER_PEER_CACHE) &&
-  (srcAuthState === null || srcAuthState.includes(MARKER_ATOMIC_WRITE))
+  (srcAuthState === null || srcAuthState.includes(MARKER_ATOMIC_WRITE)) &&
+  fs.existsSync(TARGET_MEDIA) &&
+  fs.readFileSync(TARGET_MEDIA, 'utf8').includes(MARKER_UNDICI_STREAM)
 ) {
   console.log('[patch-baileys] todos os patches já aplicados (markers presentes). Nada a fazer.');
   process.exit(0);
@@ -556,4 +560,24 @@ if (srcAuthState === null) {
   console.log('[patch-baileys] patch 7 (atomic-write) aplicado em', TARGET_AUTH_STATE);
 } else {
   console.log('[patch-baileys] patch 7 (atomic-write) já presente, pulando.');
+}
+
+
+// Patch 8: forward undici source-stream failures into the decrypt transform.
+if (!fs.existsSync(TARGET_MEDIA)) fail('messages-media.js não encontrado em ' + TARGET_MEDIA);
+let srcMedia = fs.readFileSync(TARGET_MEDIA, 'utf8');
+if (!srcMedia.includes(MARKER_UNDICI_STREAM)) {
+  const anchor = `    return fetched.pipe(output, { end: true });`;
+  const replacement = `    // [beyound-undici-stream-error-forward]
+    // Readable.pipe() does not forward source errors to the destination.
+    // Forward explicitly so a truncated CDN body rejects the consumer instead
+    // of becoming an uncaughtException in the process.
+    fetched.on('error', error => output.destroy(error));
+    return fetched.pipe(output, { end: true });`;
+  if (!srcMedia.includes(anchor)) fail('patch 8: âncora fetched.pipe não encontrada; layout do Baileys mudou.');
+  srcMedia = srcMedia.replace(anchor, replacement);
+  fs.writeFileSync(TARGET_MEDIA, srcMedia, 'utf8');
+  console.log('[patch-baileys] patch 8 (undici-stream-error-forward) aplicado em', TARGET_MEDIA);
+} else {
+  console.log('[patch-baileys] patch 8 (undici-stream-error-forward) já presente, pulando.');
 }
