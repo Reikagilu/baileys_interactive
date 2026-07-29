@@ -1,15 +1,44 @@
-# Dependências
+# Dependencies
 node_modules/
 
-# Ambiente — NUNCA commitar dados reais
+# Environment and secrets
 .env
+.env.*
+!.env.example
 
-# Dados persistidos (gerados em runtime)
+# Runtime state — never commit
+.auth/
 auth/
 data/
+.runtime/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
 
-# Artefatos de build temporários
+# Backups and temporary patches
+*.bak
+*.bak-*
+*.backup
+*.orig
+*.rej
+backups/
+tmp/
+.tmp/
+
+# Coverage, caches and local tooling
+coverage/
+.nyc_output/
+.cache/
+.local/
+tool-output/
+*.tsbuildinfo
+
+# Build scratch directory
 dist/dist/
 
-# Logs locais
-*.log
+# Editors and operating systems
+.DS_Store
+.vscode/
+.idea/

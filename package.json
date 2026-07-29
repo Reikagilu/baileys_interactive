@@ -1,7 +1,7 @@
 {
-  "name": "Beyound",
+  "name": "beyound",
   "version": "1.0.0",
-  "description": "API Node.js para múltiplas contas WhatsApp com InfiniteAPI (Baileys) e disparo de componentes especiais",
+  "description": "Self-hosted multi-instance WhatsApp gateway with durable webhooks, Chatwoot and n8n integrations.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -13,7 +13,8 @@
     "dev": "tsx watch src/index.ts",
     "worker:webhooks": "node dist/workers/webhook-delivery-worker.js",
     "start:stack": "node dist/index.js & node dist/workers/webhook-delivery-worker.js",
-    "postinstall": "node scripts/patch-baileys.mjs"
+    "postinstall": "node scripts/patch-baileys.mjs",
+    "docs:check": "npm run build && node --test dist/tests/openapi-contract.test.js"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -31,7 +32,17 @@
     "@types/express": "^4.17.21",
     "@types/node": "^22.0.0",
     "@types/qrcode": "^1.5.5",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.6.0"
-  }
+  },
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Reikagilu/baileys_interactive.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Reikagilu/baileys_interactive/issues"
+  },
+  "homepage": "https://github.com/Reikagilu/baileys_interactive#readme"
 }
