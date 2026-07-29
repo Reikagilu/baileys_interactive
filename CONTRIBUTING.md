@@ -24,7 +24,7 @@ Use Node.js 22 when possible. Add or update tests for behavior changes. If a rou
 - Explain the problem, root cause and chosen solution.
 - Include reproducible verification output.
 - Call out migrations, compatibility changes and operational risks.
-- Keep generated `dist/` files synchronized with `src/` by running `npm run build`.
+- `dist/` is generated from `src/` and is not committed. Run `npm run build` before testing runtime changes.
 - Do not commit `node_modules` or runtime state.
 
 ## Commit style

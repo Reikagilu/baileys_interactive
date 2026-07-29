@@ -1,44 +1,44 @@
 # syntax=docker/dockerfile:1.7
-# Estratégia: instala dependências no container (npm ci), copia o dist/ base,
-# recompila os arquivos modificados de src/ e restaura os módulos reais do dist base.
 
 ARG NODE_VERSION=22
 
-FROM node:${NODE_VERSION}-bookworm-slim AS runtime
-
+FROM node:${NODE_VERSION}-bookworm-slim AS build
 WORKDIR /app
 
-ENV NODE_ENV=production
-ENV PORT=8787
-ENV AUTH_FOLDER=auth
-ENV WEBHOOK_DB_PATH=data/webhooks.sqlite
-ENV INTEGRATIONS_DB_PATH=data/integrations.sqlite
-ENV MESSAGES_DB_PATH=data/messages.sqlite
+COPY package*.json ./
+RUN npm ci --ignore-scripts
 
-RUN mkdir -p /app/auth /app/data \
-  && chown node:node /app /app/auth /app/data
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
 
-# Instala dependências primeiro (camada cacheável separada)
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    PORT=8787 \
+    AUTH_FOLDER=/app/auth \
+    WEBHOOK_DB_PATH=/app/data/webhooks.sqlite \
+    INTEGRATIONS_DB_PATH=/app/data/integrations.sqlite \
+    MESSAGES_DB_PATH=/app/data/messages.sqlite \
+    AUDIT_LOG_PATH=/app/data/audit.log
+
+RUN mkdir -p /app/auth /app/data && chown node:node /app /app/auth /app/data
+
 COPY --chown=node:node package*.json ./
-RUN npm ci --omit=dev --ignore-scripts
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-# Aplica patches em node_modules/baileys (idempotente). Reaplicado a cada build
-# porque npm ci sempre reescreve o módulo. Veja scripts/patch-baileys.mjs.
-COPY --chown=node:node scripts ./scripts
-RUN node ./scripts/patch-baileys.mjs
+# The upstream Baileys stream patch is applied after every clean install.
+COPY --chown=node:node scripts/patch-baileys.mjs ./scripts/patch-baileys.mjs
+RUN node ./scripts/patch-baileys.mjs && rm -rf ./scripts
 
-# Copia o restante do código
-COPY --chown=node:node dist ./dist
+COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node public ./public
-COPY --chown=node:node src ./src
-COPY --chown=node:node tsconfig.build.json ./tsconfig.build.json
-COPY --chown=node:node build.sh ./build.sh
-
-RUN bash ./build.sh \
-  && find ./dist -type f \( -name "*.map" -o -name "*.d.ts" \) -delete \
-  && rm -rf ./dist/tests ./dist/dist ./src ./tsconfig.build.json ./build.sh ./scripts
 
 USER node
-
 EXPOSE 8787
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD node -e "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
 CMD ["node", "--no-warnings=ExperimentalWarning", "dist/index.js"]

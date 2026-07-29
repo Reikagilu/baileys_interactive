@@ -110,6 +110,9 @@ export function installCrashHandlers(): void {
       stack: err?.stack,
     };
     recordCrash(report);
+    // Arm fail-fast before best-effort hooks: a slow SQLite/webhook path must
+    // never allow another timer to override the fatal exit code.
+    terminateCorruptedProcess();
     metricsRecordCrash();
     emitCrashWebhook(report);
     try {
@@ -120,7 +123,6 @@ export function installCrashHandlers(): void {
         `  stack: ${(err?.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`
       );
     } catch {}
-    terminateCorruptedProcess();
   });
 
   process.on('unhandledRejection', (reason, _promise) => {
@@ -134,6 +136,9 @@ export function installCrashHandlers(): void {
       stack: err.stack,
     };
     recordCrash(report);
+    // Arm fail-fast before best-effort hooks: a slow SQLite/webhook path must
+    // never allow another timer to override the fatal exit code.
+    terminateCorruptedProcess();
     metricsRecordCrash();
     emitCrashWebhook(report);
     try {
@@ -143,7 +148,6 @@ export function installCrashHandlers(): void {
         `  stack: ${(err.stack ?? '').split('\n').slice(0, 20).join('\n  ')}\n`
       );
     } catch {}
-    terminateCorruptedProcess();
   });
 }
 

@@ -35,8 +35,8 @@ coverage/
 tool-output/
 *.tsbuildinfo
 
-# Build scratch directory
-dist/dist/
+# Generated build output
+dist/
 
 # Editors and operating systems
 .DS_Store

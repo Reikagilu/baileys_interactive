@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "npm run clean && tsc",
     "build:local": "bash ./build.sh",
     "docker:rebuild": "bash ./docker-rebuild.sh",
     "test": "npm run build && node --test dist/tests/**/*.test.js",
@@ -14,7 +14,11 @@
     "worker:webhooks": "node dist/workers/webhook-delivery-worker.js",
     "start:stack": "node dist/index.js & node dist/workers/webhook-delivery-worker.js",
     "postinstall": "node scripts/patch-baileys.mjs",
-    "docs:check": "npm run build && node --test dist/tests/openapi-contract.test.js"
+    "docs:check": "npm run build && node --test dist/tests/openapi-contract.test.js",
+    "doctor": "node scripts/doctor.mjs",
+    "check": "npm test && npm run docs:check",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prestart": "npm run build"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -39,10 +43,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Reikagilu/baileys_interactive.git"
+    "url": "git+https://github.com/Reikagilu/Beyound.git"
   },
   "bugs": {
-    "url": "https://github.com/Reikagilu/baileys_interactive/issues"
+    "url": "https://github.com/Reikagilu/Beyound/issues"
   },
-  "homepage": "https://github.com/Reikagilu/baileys_interactive#readme"
+  "homepage": "https://github.com/Reikagilu/Beyound#readme"
 }

@@ -27,8 +27,8 @@ Self-hosted, multi-instance WhatsApp gateway built with Node.js, TypeScript, Exp
 ### Start
 
 ```bash
-git clone https://github.com/Reikagilu/baileys_interactive.git
-cd baileys_interactive
+git clone https://github.com/Reikagilu/Beyound.git
+cd Beyound
 cp .env.example .env
 openssl rand -hex 32
 ```
@@ -36,6 +36,7 @@ openssl rand -hex 32
 Place the generated value in `API_KEY` inside `.env`, set `SERVER_URL`, then start:
 
 ```bash
+npm run doctor
 docker compose up -d --build
 docker compose ps
 curl http://localhost:8787/health
@@ -96,12 +97,43 @@ For one administrator key, use `API_KEY`. For multiple scoped keys, use `API_KEY
 
 ```bash
 npm ci
-npm test
-npm run docs:check
+cp .env.example .env
+# Configure .env, then:
+npm run doctor
+npm run check
 npm run dev
 ```
 
 Node.js 22 is used in CI and Docker. Node.js 20 or newer is supported.
+
+## Useful commands
+
+| Command | Purpose |
+|---|---|
+| `npm run doctor` | Validate local configuration without printing secrets |
+| `npm run check` | Clean build, full test suite and OpenAPI parity |
+| `npm run dev` | Start the development server with reload |
+| `npm start` | Clean build and start the API |
+| `npm run docker:rebuild` | Rebuild and recreate only the API container, preserving volumes |
+
+## Renaming or moving the checkout
+
+Docker Compose derives volume names from `COMPOSE_PROJECT_NAME`, not only from the folder name. Keep this value unchanged after the first start. Otherwise Docker creates new empty volumes and the saved instances appear to disappear.
+
+Before renaming or moving an existing installation:
+
+```bash
+grep '^COMPOSE_PROJECT_NAME=' .env
+docker compose config --volumes
+```
+
+If an older installation already uses volumes such as `baileys_interactive_baileys_auth`, keep:
+
+```env
+COMPOSE_PROJECT_NAME=baileys_interactive
+```
+
+Never use `docker compose down -v` during an upgrade; `-v` deletes authentication and database volumes.
 
 ## Production notes
 

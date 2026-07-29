@@ -267,7 +267,23 @@ app.use((_req, res, next) => {
 });
 
 app.use((req, res, next) => {
-  if (req.path === '/docs' || req.path.startsWith('/docs-assets')) return next();
+  if (req.path === '/docs' || req.path.startsWith('/docs-assets')) {
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "object-src 'none'",
+        "script-src 'self' 'unsafe-inline'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "connect-src 'self'",
+      ].join('; ')
+    );
+    return next();
+  }
   res.setHeader(
     'Content-Security-Policy',
     [
