@@ -52,10 +52,7 @@ const pendingReconnectTimers = new NamedTimerRegistry();
 const pairingIssuedAt = new Map<string, number>();
 const authRecoveryIssuedAt = new Map<string, number>();
 const alwaysOnlineIntervals = new Map<string, NodeJS.Timeout>();
-const syncHistoryIntervals = new Map<string, NodeJS.Timeout>();
 const forceAppStateResync = new Set<string>();
-const syncHistoryInFlight = new Set<string>();
-const syncHistoryCursor = new Map<string, number>();
 let processShuttingDown = false;
 const runtimePath = path.resolve(process.cwd(), '.runtime');
 const startupStatePath = path.join(runtimePath, 'autostart-instances.json');
@@ -69,9 +66,7 @@ const mediaStoragePath = path.resolve(process.cwd(), 'data', 'chat-media');
 // file as a fallback during migration, but persist new state to /app/data.
 const mediaIndexPath = path.resolve(process.cwd(), 'data', 'chat-media-index.json');
 const legacyMediaIndexPath = path.join(runtimePath, 'chat-media-index.json');
-const CONTINUOUS_HISTORY_SYNC_MS = Math.max(30_000, Number(process.env.CONTINUOUS_HISTORY_SYNC_MS ?? 60_000));
-const CONTINUOUS_HISTORY_BATCH_CHATS = Math.max(1, Math.min(10, Number(process.env.CONTINUOUS_HISTORY_BATCH_CHATS ?? 4)));
-const CONTINUOUS_HISTORY_FETCH_COUNT = Math.max(20, Math.min(250, Number(process.env.CONTINUOUS_HISTORY_FETCH_COUNT ?? 100)));
+const HISTORY_FETCH_COUNT = Math.max(20, Math.min(250, Number(process.env.HISTORY_FETCH_COUNT ?? process.env.CONTINUOUS_HISTORY_FETCH_COUNT ?? 100)));
 const MESSAGE_WRAPPER_KEYS = [
   'ephemeralMessage',
   'viewOnceMessage',
@@ -1307,24 +1302,6 @@ function pruneGroupChatsFromCache(name: string): void {
   }
 }
 
-/** Generation guard for the humanize-driven setTimeout chain (mesma técnica
- *  do alwaysOnline). Sem isso, um setTimeout pendente pode disparar
- *  fetchMessageHistory após a desconexão. */
-const syncHistoryGen = new Map<string, number>();
-
-function stopContinuousHistorySync(name: string): void {
-  const timer = syncHistoryIntervals.get(name);
-  if (timer) {
-    // Antes era setInterval; agora pode ser setTimeout (modo humanize). clearTimeout
-    // funciona com qualquer Timeout do Node.
-    clearTimeout(timer);
-    syncHistoryIntervals.delete(name);
-  }
-  syncHistoryGen.set(name, (syncHistoryGen.get(name) ?? 0) + 1);
-  syncHistoryCursor.delete(name);
-  syncHistoryInFlight.delete(name);
-}
-
 function extractMessagesFromHistoryResponse(raw: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(raw)) {
     return raw.filter((item) => typeof item === 'object' && item !== null) as Array<Record<string, unknown>>;
@@ -1346,125 +1323,6 @@ function extractMessagesFromHistoryResponse(raw: unknown): Array<Record<string, 
     return obj.historyMessages.filter((item) => typeof item === 'object' && item !== null) as Array<Record<string, unknown>>;
   }
   return [];
-}
-
-async function runContinuousHistorySync(name: string, ctx: InstanceContext): Promise<void> {
-  if (syncHistoryInFlight.has(name)) return;
-  syncHistoryInFlight.add(name);
-  try {
-    if (instances.get(name) !== ctx || ctx.status !== 'connected') return;
-
-    const settings = getInstanceGeneral(name);
-    if (!settings.syncFullHistory) return;
-
-    const anySock = ctx.sock as any;
-    const hasFetchHistory = typeof anySock.fetchMessageHistory === 'function';
-    const hasResyncState = typeof anySock.resyncAppState === 'function';
-    if (!hasFetchHistory && !hasResyncState) return;
-
-    const list = getInstanceChatList(name).filter((chat) => !(settings.ignoreGroups && chat.jid.endsWith('@g.us')));
-    if (list.length === 0) {
-      if (hasResyncState) {
-        try {
-          await anySock.resyncAppState(['critical_block', 'regular']);
-        } catch {
-          // best effort
-        }
-      }
-      return;
-    }
-
-    // PRIO-1 (humanize): reduzimos chats por tick (default 2) e adicionamos
-    // sleep aleatório entre cada fetchMessageHistory para que o burst não saia
-    // como uma rajada simultânea de 6 stanzas.
-    const humanize = getHumanizeSettings(name);
-    const batchSize = humanize.enabled ? humanize.historyBatchChats : CONTINUOUS_HISTORY_BATCH_CHATS;
-
-    const start = syncHistoryCursor.get(name) ?? 0;
-    const limit = Math.min(Math.max(1, batchSize), list.length);
-    const selected: Array<(typeof list)[number]> = [];
-    for (let i = 0; i < limit; i++) {
-      const idx = (start + i) % list.length;
-      selected.push(list[idx]);
-    }
-    syncHistoryCursor.set(name, (start + limit) % list.length);
-
-    let isFirst = true;
-    for (const chat of selected) {
-      if (instances.get(name) !== ctx || ctx.status !== 'connected') break;
-      if (!hasFetchHistory) break;
-      if (!isFirst && humanize.enabled) {
-        await humanSleep(humanRandomIntBetween(humanize.historyFetchSleepMinMs, humanize.historyFetchSleepMaxMs));
-        // Re-check após o sleep — pode ter desconectado nesse meio-tempo.
-        if (instances.get(name) !== ctx || ctx.status !== 'connected') break;
-      }
-      isFirst = false;
-      const existing = getInstanceChatMessages(name, chat.jid);
-      const oldest = existing.length > 0 ? existing[0] : undefined;
-      const oldestTimestamp = oldest ? normalizeTimestamp(oldest.timestamp) : undefined;
-      const oldestKey = oldest
-        ? {
-            remoteJid: chat.jid,
-            id: oldest.id,
-            fromMe: oldest.fromMe,
-          }
-        : undefined;
-
-      try {
-        const response = await anySock.fetchMessageHistory(
-          CONTINUOUS_HISTORY_FETCH_COUNT,
-          oldestKey,
-          oldestTimestamp
-        );
-        const messages = extractMessagesFromHistoryResponse(response);
-        if (messages.length > 0) {
-          // Chunked async para não bloquear o event loop em batches grandes.
-          await ingestHistoryMessagesChunked(name, messages);
-        }
-      } catch {
-        // best effort continuous sync
-      }
-    }
-  } finally {
-    syncHistoryInFlight.delete(name);
-  }
-}
-
-function startContinuousHistorySync(name: string, ctx: InstanceContext): void {
-  stopContinuousHistorySync(name);
-  const settings = getInstanceGeneral(name);
-  if (!settings.syncFullHistory) return;
-
-  // PRIO-1 (humanize): intervalo base ~10min com jitter ±30%. Eliminamos o
-  // tick fixo de 7s (que era flagrante padrão de bot). Implementado como
-  // cadeia de setTimeout self-rescheduling para que cada próximo agendamento
-  // pegue um valor jittered novo.
-  const humanize = getHumanizeSettings(name);
-  const baseMs = humanize.enabled ? humanize.historySyncBaseMs : CONTINUOUS_HISTORY_SYNC_MS;
-  const jitterPct = humanize.enabled ? humanize.historySyncJitterPct : 0;
-
-  // Primeira execução: pequeno delay aleatório (3–15s no modo humanize) para
-  // descorrelacionar de "connection === 'open'" — assim o catch-up não sai
-  // junto com o messaging-history.set inicial.
-  const firstDelay = humanize.enabled ? humanRandomIntBetween(3000, 15_000) : 0;
-  const gen = (syncHistoryGen.get(name) ?? 0);
-
-  const scheduleNext = (delayMs: number) => {
-    const handle = setTimeout(async () => {
-      if (syncHistoryGen.get(name) !== gen) return;
-      if (instances.get(name) !== ctx || ctx.status !== 'connected') return;
-      try {
-        await runContinuousHistorySync(name, ctx);
-      } catch {
-        // best-effort
-      }
-      if (syncHistoryGen.get(name) !== gen) return;
-      scheduleNext(humanJitter(baseMs, jitterPct));
-    }, delayMs);
-    handle.unref?.();
-    syncHistoryIntervals.set(name, handle as unknown as NodeJS.Timeout);
-  };
-  scheduleNext(firstDelay);
 }
 
 async function resolveProxyAgent(instance: string): Promise<{ agent: unknown | null; error?: string }> {
@@ -1505,8 +1363,6 @@ export function applyInstanceRuntimeSettings(name: string): { ok: boolean; appli
 
   stopAlwaysOnline(name);
   startAlwaysOnline(name, ctx);
-  stopContinuousHistorySync(name);
-  startContinuousHistorySync(name, ctx);
   pruneGroupChatsFromCache(name);
 
   return {
@@ -3282,9 +3138,8 @@ export async function createInstance(
     if (ctx.status === 'qr' && ctx.qr) {
       return { ok: true, instance: name, qr: ctx.qr };
     }
-    // disconnected ou connecting: para intervalos órfãos, remove do Map e fecha socket
+    // disconnected ou connecting: cancela timers órfãos, remove do Map e fecha socket
     stopAlwaysOnline(name);
-    stopContinuousHistorySync(name);
     instances.delete(name);
     reconnectAttempts.delete(name);
     closeSocket(ctx.sock);
@@ -3521,7 +3376,6 @@ export async function createInstance(
         }
 
         startAlwaysOnline(name, ctx);
-        startContinuousHistorySync(name, ctx);
 
         // Nota: não chamamos assertSessions para o próprio JID (note-to-self) porque
         // o WA recusa buscar pre-keys do próprio número. A sessão Signal é reconstruída
@@ -3598,7 +3452,6 @@ export async function createInstance(
             stoppedByUser: false,
           });
           stopAlwaysOnline(name);
-          stopContinuousHistorySync(name);
           pendingReconnectTimers.schedule(name, 2000, () => createInstance(name, folder));
           return;
         }
@@ -3626,7 +3479,6 @@ export async function createInstance(
               stoppedByUser: false,
             });
             stopAlwaysOnline(name);
-            stopContinuousHistorySync(name);
             pendingReconnectTimers.schedule(name, 1200, () => createInstance(name, folder));
             return;
           }
@@ -3640,7 +3492,6 @@ export async function createInstance(
             reconnectAttempts.delete(name);
             const authWasReset = maybeResetInstanceAuthState(name, authPath, 'auth_corrupt_after_close');
             stopAlwaysOnline(name);
-            stopContinuousHistorySync(name);
             if (pairingActive && authWasReset) {
               ctx.status = 'connecting';
               ctx.qr = null;
@@ -3670,7 +3521,6 @@ export async function createInstance(
             log.whatsapp.child(name).warn(`pairing_window_close  code=${String(code)}  destructive_recovery=${String(config.whatsapp.autoResetCorruptAuth)}`);
             closeSocket(ctx.sock);
             stopAlwaysOnline(name);
-            stopContinuousHistorySync(name);
             const authWasReset = maybeResetInstanceAuthState(name, authPath, 'pairing_window_close');
             if (!authWasReset) {
               log.whatsapp.child(name).warn(`pairing_window_close  preserve_auth_and_reconnect  code=${String(code)}`);
@@ -3717,7 +3567,6 @@ export async function createInstance(
           log.whatsapp.child(name).warn(`auth_invalid_session_dropped  code=${String(code)}  previousStatus=${previousStatus}  reset_auth=true`);
           closeSocket(ctx.sock);
           stopAlwaysOnline(name);
-          stopContinuousHistorySync(name);
           const authWasReset = maybeResetInstanceAuthState(name, authPath, 'auth_invalid_session_dropped');
           if (!authWasReset) {
             log.whatsapp.child(name).warn(`auth_invalid_session_dropped  reset_blocked  code=${String(code)}`);
@@ -3773,14 +3622,12 @@ export async function createInstance(
             stoppedByUser: false,
           });
           stopAlwaysOnline(name);
-          stopContinuousHistorySync(name);
           pendingReconnectTimers.schedule(name, delayMs, () => createInstance(name, folder));
         } else {
           log.whatsapp.child(name).error(`reconnect_exhausted — esgotadas ${attempts} tentativas de reconexão, instância desconectada`);
-          // Cleanup completo: remover do Map, parar intervalos, atualizar estado persistido.
-          // Sem cleanup, o socket morto e os intervalos ficam em memória indefinidamente.
+          // Cleanup completo: remover do Map, cancelar timers e atualizar estado persistido.
+          // Sem cleanup, o socket morto e os timers ficam em memória indefinidamente.
           stopAlwaysOnline(name);
-          stopContinuousHistorySync(name);
           closeSocket(ctx.sock);
           instances.delete(name);
           reconnectAttempts.delete(name);
@@ -4392,7 +4239,6 @@ export function disconnectInstance(name: string, options?: { keepAutostart?: boo
   chatCache.delete(name);
   clearInstanceMediaBinaries(name, true);
   stopAlwaysOnline(name);
-  stopContinuousHistorySync(name);
   return true;
 }
 
@@ -4429,7 +4275,6 @@ export async function logoutInstance(name: string, authFolder: string): Promise<
     chatCache.delete(name);
     clearInstanceMediaBinaries(name, true);
     stopAlwaysOnline(name);
-    stopContinuousHistorySync(name);
   }
   const authPath = path.resolve(process.cwd(), authFolder, name);
   try {
@@ -4990,7 +4835,7 @@ export async function syncInstanceChatHistory(
   }
 
   const maxBatches = Math.max(1, Math.min(Number(options?.maxBatches ?? 15), 50));
-  const fetchCount = Math.max(10, Math.min(Number(options?.fetchCount ?? CONTINUOUS_HISTORY_FETCH_COUNT), 500));
+  const fetchCount = Math.max(10, Math.min(Number(options?.fetchCount ?? HISTORY_FETCH_COUNT), 500));
 
   let imported = 0;
   let batches = 0;

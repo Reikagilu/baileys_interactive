@@ -59,6 +59,7 @@ export interface GeneralConfig {
     ignoreGroups: boolean;
     alwaysOnline: boolean;
     autoReadMessages: boolean;
+    /** Request a one-shot full history sync when the WhatsApp socket connects. */
     syncFullHistory: boolean;
     readStatus: boolean;
     /**
