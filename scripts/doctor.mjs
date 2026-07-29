@@ -12,9 +12,22 @@ if (major < 20) failures.push(`Node.js 20+ is required (found ${process.versions
 if (result.error) failures.push('Missing .env. Run: cp .env.example .env');
 
 const apiKey = String(process.env.API_KEY ?? '').trim();
+const apiKeysJson = String(process.env.API_KEYS_JSON ?? '').trim();
 const placeholders = /replace|change-me|your-|example|generate/i;
-if (apiKey.length < 32 || placeholders.test(apiKey)) {
-  failures.push('API_KEY must be a random value with at least 32 characters. Generate one with: openssl rand -hex 32');
+const validKey = (value) => value.length >= 32 && !placeholders.test(value);
+let scopedKeys = [];
+if (apiKeysJson) {
+  try {
+    const parsed = JSON.parse(apiKeysJson);
+    const records = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' ? Object.values(parsed) : []);
+    scopedKeys = records.filter((record) => record && record.enabled !== false).map((record) => String(record.key ?? '').trim());
+    if (!records.length || scopedKeys.some((key) => !validKey(key))) failures.push('API_KEYS_JSON must contain enabled records with random keys of at least 32 characters.');
+  } catch {
+    failures.push('API_KEYS_JSON must be valid JSON in object or array form.');
+  }
+}
+if (!validKey(apiKey) && !scopedKeys.some(validKey)) {
+  failures.push('Configure API_KEY or API_KEYS_JSON with a random key of at least 32 characters. Generate one with: openssl rand -hex 32');
 }
 
 const serverUrl = String(process.env.SERVER_URL ?? '').trim();

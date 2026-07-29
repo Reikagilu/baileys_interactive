@@ -16,7 +16,7 @@ import { requestContext } from './middleware/request-context.js';
 import { sendError, sendOk } from './utils/api-response.js';
 import { getAllInstances, getInstance, getInstanceChatMediaBinary, reconnectPreviouslyActiveInstances, disconnectInstance } from './services/whatsapp.js';
 import { getWebhookMetrics } from './services/webhooks.js';
-import { requireApiKey } from './middleware/api-auth.js';
+import { getApiKeyConfiguration, requireApiKey } from './middleware/api-auth.js';
 import { normalizeInstanceName, isValidInstanceName } from './utils/helpers.js';
 import { verifyMediaUrlToken } from './utils/media-signature.js';
 import { log } from './utils/logger.js';
@@ -152,14 +152,17 @@ import { sendInstanceTextMessage, sendInstanceMediaMessage } from './services/wh
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const swaggerAssetsDir = swaggerUiDist.getAbsoluteFSPath();
-const hasConfiguredApiKeys = Boolean(config.apiKey.trim() || config.apiKeysJson.trim());
+const apiKeyConfiguration = getApiKeyConfiguration();
+const hasConfiguredApiKeys = apiKeyConfiguration.records.length > 0 && apiKeyConfiguration.errors.length === 0;
 
+if (apiKeyConfiguration.errors.length) {
+  throw new Error(`Invalid API key configuration: ${apiKeyConfiguration.errors.join('; ')}`);
+}
 if (process.env.NODE_ENV === 'production' && !hasConfiguredApiKeys) {
   throw new Error('API key configuration is required in production. Set API_KEY or API_KEYS_JSON.');
 }
-
 if (!hasConfiguredApiKeys) {
-  log.security.warn('API auth DESABILITADA — configure API_KEY ou API_KEYS_JSON para proteger a API.');
+  log.security.warn('API auth sem chaves — rotas protegidas responderão 503 até a configuração ser corrigida.');
 }
 
 if (!config.security.chatwootWebhookSecret.trim()) {
@@ -240,15 +243,10 @@ function rateLimit(scope: string, max: number, windowMs: number) {
   };
 }
 
-const docsAuth = hasConfiguredApiKeys && !config.security.publicDocsEnabled
-  ? requireApiKey(['ops:read'])
-  : (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
-const metricsAuth = hasConfiguredApiKeys && !config.security.publicMetricsEnabled
-  ? requireApiKey(['ops:read'])
-  : (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
-const readyAuth = hasConfiguredApiKeys && !config.security.publicReadyEnabled
-  ? requireApiKey(['ops:read'])
-  : (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
+const publicEndpoint = (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
+const docsAuth = config.security.publicDocsEnabled ? publicEndpoint : requireApiKey(['ops:read']);
+const metricsAuth = config.security.publicMetricsEnabled ? publicEndpoint : requireApiKey(['ops:read']);
+const readyAuth = config.security.publicReadyEnabled ? publicEndpoint : requireApiKey(['ops:read']);
 const webhookLimiter = rateLimit('chatwoot-webhook', config.security.webhookRateLimitMax, config.security.webhookRateLimitWindowMs);
 const apiLimiter = rateLimit('api', config.security.apiRateLimitMax, config.security.apiRateLimitWindowMs);
 

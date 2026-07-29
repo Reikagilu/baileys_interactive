@@ -10,10 +10,12 @@
     "skipLibCheck": true,
     "declaration": false,
     "sourceMap": false,
-    "noEmitOnError": false,
+    "noEmitOnError": true,
     "allowJs": false
   },
-  "include": ["src/**/*"],
+  "include": [
+    "src/**/*"
+  ],
   "exclude": [
     "node_modules",
     "dist"

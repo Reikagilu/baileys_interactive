@@ -3,10 +3,15 @@ import type { Request, Response, NextFunction } from 'express';
 import { config } from '../config.js';
 import { sendError } from '../utils/api-response.js';
 
-interface KeyRecord {
+export interface KeyRecord {
   keyId: string;
   key: string;
   scopes: string[];
+}
+
+export interface ApiKeyConfiguration {
+  records: KeyRecord[];
+  errors: string[];
 }
 
 interface ApiPrincipal {
@@ -15,65 +20,93 @@ interface ApiPrincipal {
 }
 
 let cachedSource = '';
-let cachedRecords: KeyRecord[] = [];
+let cachedConfiguration: ApiKeyConfiguration = { records: [], errors: [] };
 
-/**
- * Comparação de strings timing-safe com padding para prevenir timing oracle
- * por comprimento. Idêntico ao padrão de safeEqual em index.ts.
- * A versão anterior fazia early-return em ab.length !== bb.length, vazando
- * o comprimento esperado da key via canal de tempo.
- */
 function safeKeyEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   const maxLen = Math.max(ab.length, bb.length);
   const pa = Buffer.concat([ab, Buffer.alloc(maxLen - ab.length)]);
   const pb = Buffer.concat([bb, Buffer.alloc(maxLen - bb.length)]);
-  // timingSafeEqual exige buffers de mesmo tamanho — garantido pelo padding acima.
-  // O check de comprimento ao final é necessário para correção: dois buffers
-  // com padding podem ter conteúdo igual mas origens de tamanho diferente.
   return timingSafeEqual(pa, pb) && ab.length === bb.length;
 }
 
-function normalizeScopes(scopes: unknown): string[] {
-  if (!Array.isArray(scopes)) return [];
+function normalizeScopes(scopes: unknown): string[] | null {
+  if (scopes === undefined) return [];
+  if (!Array.isArray(scopes)) return null;
   return scopes.map((scope) => String(scope || '').trim()).filter(Boolean);
 }
 
-function parseConfiguredKeys(): KeyRecord[] {
-  const source = `${config.apiKey}|${config.apiKeysJson}`;
-  if (source === cachedSource) return cachedRecords;
+/** Parse both the documented object form and the array form used by older installs. */
+export function parseApiKeyConfiguration(apiKey: string, apiKeysJson: string): ApiKeyConfiguration {
   const records: KeyRecord[] = [];
-  if (config.apiKey && config.apiKey.trim()) {
-    records.push({ keyId: 'default', key: config.apiKey.trim(), scopes: ['*'] });
-  }
-  if (config.apiKeysJson.trim()) {
+  const errors: string[] = [];
+  const defaultKey = apiKey.trim();
+  if (defaultKey) records.push({ keyId: 'default', key: defaultKey, scopes: ['*'] });
+
+  const jsonSource = apiKeysJson.trim();
+  if (jsonSource) {
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(config.apiKeysJson);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (!item || typeof item !== 'object') continue;
-          const key = String((item as any).key ?? '').trim();
-          if (!key) continue;
-          const enabledRaw = (item as any).enabled;
-          if (enabledRaw === false) continue;
-          const keyId =
-            String((item as any).id ?? `key_${records.length + 1}`).trim() ||
-            `key_${records.length + 1}`;
-          const scopes = normalizeScopes((item as any).scopes);
-          // Default para [] (sem acesso) em vez de ['*'] (superuser), para não
-          // criar keys root acidentalmente quando o campo scopes for omitido.
-          // Use ['*'] explicitamente no JSON quando quiser acesso total.
-          records.push({ keyId, key, scopes });
-        }
-      }
+      parsed = JSON.parse(jsonSource);
     } catch {
-      // ignore invalid JSON and fallback to API_KEY only
+      return { records, errors: ['API_KEYS_JSON is not valid JSON'] };
+    }
+
+    let entries: Array<[string | undefined, unknown]> = [];
+    if (Array.isArray(parsed)) {
+      entries = parsed.map((item) => [undefined, item]);
+    } else if (parsed && typeof parsed === 'object') {
+      entries = Object.entries(parsed as Record<string, unknown>);
+    } else {
+      errors.push('API_KEYS_JSON must be an array or object');
+    }
+
+    for (const [objectId, item] of entries) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        errors.push('API_KEYS_JSON contains a non-object key record');
+        continue;
+      }
+      const raw = item as Record<string, unknown>;
+      if (raw.enabled === false) continue;
+      const key = String(raw.key ?? '').trim();
+      if (!key) {
+        errors.push('API_KEYS_JSON contains an enabled record without key');
+        continue;
+      }
+      const scopes = normalizeScopes(raw.scopes);
+      if (scopes === null) {
+        errors.push('API_KEYS_JSON record scopes must be an array');
+        continue;
+      }
+      const fallbackId = objectId || `key_${records.length + 1}`;
+      const keyId = String(raw.id ?? fallbackId).trim();
+      if (!keyId) {
+        errors.push('API_KEYS_JSON contains a record without id');
+        continue;
+      }
+      records.push({ keyId, key, scopes });
     }
   }
-  cachedSource = source;
-  cachedRecords = records;
-  return records;
+
+  const ids = new Set<string>();
+  const keys = new Set<string>();
+  for (const record of records) {
+    if (ids.has(record.keyId)) errors.push(`duplicate API key id: ${record.keyId}`);
+    if (keys.has(record.key)) errors.push(`duplicate API key material: ${record.keyId}`);
+    ids.add(record.keyId);
+    keys.add(record.key);
+  }
+  return { records, errors };
+}
+
+export function getApiKeyConfiguration(): ApiKeyConfiguration {
+  const source = `${config.apiKey}|${config.apiKeysJson}`;
+  if (source !== cachedSource) {
+    cachedSource = source;
+    cachedConfiguration = parseApiKeyConfiguration(config.apiKey, config.apiKeysJson);
+  }
+  return cachedConfiguration;
 }
 
 function hasRequiredScope(principalScopes: string[], requiredScopes: string[]): boolean {
@@ -88,44 +121,30 @@ function hasRequiredScope(principalScopes: string[], requiredScopes: string[]): 
 
 export function requireApiKey(requiredScopes: string[] = []) {
   return (req: Request, res: Response, next: NextFunction) => {
-    const records = parseConfiguredKeys();
-    if (!records.length) {
-      // Sem keys configuradas: em produção o processo deveria ter abortado
-      // no boot (index.ts:116). Em dev/test, permitir acesso sem auth.
-      next();
-      return;
+    const configuration = getApiKeyConfiguration();
+    if (configuration.errors.length || !configuration.records.length) {
+      return sendError(res, 503, 'api_auth_not_configured', 'API authentication is unavailable.');
     }
     const rawKey = String(req.header('x-api-key') ?? '').trim();
-    // Rejeitar headers excessivamente longos antes de alocar Buffers.
     const key = rawKey.length > 512 ? '' : rawKey;
-    if (!key) {
-      return sendError(res, 401, 'missing_api_key');
-    }
-    // Iterar TODAS as records mesmo após encontrar match para prevenir timing
-    // oracle por posição da key na lista (records.find interrompe cedo).
+    if (!key) return sendError(res, 401, 'missing_api_key');
+
     let matched: KeyRecord | undefined;
-    for (const record of records) {
+    for (const record of configuration.records) {
       if (safeKeyEqual(record.key, key)) matched = record;
     }
-    if (!matched) {
-      return sendError(res, 401, 'invalid_api_key');
-    }
+    if (!matched) return sendError(res, 401, 'invalid_api_key');
     if (!hasRequiredScope(matched.scopes, requiredScopes)) {
       return sendError(res, 403, 'insufficient_scope', 'API key is valid but lacks required permissions.', {
         requiredScopes,
         keyId: matched.keyId,
       });
     }
-    const principal: ApiPrincipal = {
-      keyId: matched.keyId,
-      scopes: matched.scopes,
-    };
-    res.locals.principal = principal;
+    res.locals.principal = { keyId: matched.keyId, scopes: matched.scopes } satisfies ApiPrincipal;
     next();
   };
 }
 
 export function getApiPrincipal(res: Response): ApiPrincipal | null {
-  const principal = res.locals?.principal;
-  return principal ?? null;
+  return res.locals?.principal ?? null;
 }

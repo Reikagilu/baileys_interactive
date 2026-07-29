@@ -1,3 +1,0 @@
-services:
-  baileys_interactive:
-    command: ["node", "--no-warnings=ExperimentalWarning", "dist/index.js"]

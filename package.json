@@ -6,13 +6,11 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "npm run clean && tsc",
-    "build:local": "bash ./build.sh",
     "docker:rebuild": "bash ./docker-rebuild.sh",
     "test": "npm run build && node --test dist/tests/**/*.test.js",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "worker:webhooks": "node dist/workers/webhook-delivery-worker.js",
-    "start:stack": "node dist/index.js & node dist/workers/webhook-delivery-worker.js",
     "postinstall": "node scripts/patch-baileys.mjs",
     "docs:check": "npm run build && node --test dist/tests/openapi-contract.test.js",
     "doctor": "node scripts/doctor.mjs",

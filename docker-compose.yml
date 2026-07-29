@@ -10,6 +10,11 @@ services:
     container_name: baileys_interactive
     restart: unless-stopped
     init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
 
     ports:
       - "8787:8787"
@@ -31,6 +36,7 @@ services:
           # principal continua livre para o WebSocket do Baileys.
           cpus: "2.0"
           memory: 2G
+          pids: 256
         reservations:
           cpus: "0.5"
           memory: 512M
