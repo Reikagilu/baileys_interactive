@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { parseConfiguredWaWebVersion } from './utils/wa-web-version.js';
 
 dotenv.config();
 
@@ -28,6 +29,8 @@ export const config = {
     // explicitamente habilitado. Isso evita logout por falso positivo em
     // estados transitórios/corrupção parcial de arquivos.
     autoResetCorruptAuth: parseBoolean(process.env.WHATSAPP_AUTO_RESET_CORRUPT_AUTH, false),
+    // Empty means online discovery; an explicit value pins every new socket.
+    webVersion: parseConfiguredWaWebVersion(process.env.WHATSAPP_WEB_VERSION),
   },
   audit: {
     logPath: process.env.AUDIT_LOG_PATH ?? 'data/audit.log',

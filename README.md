@@ -58,6 +58,10 @@ curl -sS -X POST "$BEYOUND_URL/v1/instances" \
 
 The response contains a QR data URL while the instance is waiting for pairing. You can also use `POST /v1/instances/{name}/pairing-code`.
 
+### WhatsApp Web protocol version
+
+Set `WHATSAPP_WEB_VERSION=2.3000.1044254868` in `.env` to pin the protocol used by every newly created or reconnected socket. Leave it empty to discover the current revision from `web.whatsapp.com`; if discovery fails, Beyound uses its validated bundled fallback. Changing the value requires recreating/reconnecting sockets. Invalid values fail fast at startup.
+
 ## API documentation
 
 Beyound ships a complete OpenAPI 3.1 contract:

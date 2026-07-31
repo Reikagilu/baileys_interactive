@@ -36,6 +36,7 @@ import { log } from '../utils/logger.js';
 import { validateOutboundUrl } from '../utils/url-security.js';
 import { NamedTimerRegistry } from '../utils/named-timer-registry.js';
 import { outboundDeliveryMessageId } from '../utils/outbound-delivery-key.js';
+import { formatWaWebVersion, resolveWaWebVersion } from '../utils/wa-web-version.js';
 import {
   sleep as humanSleep,
   randomIntBetween as humanRandomIntBetween,
@@ -3207,14 +3208,14 @@ export async function createInstance(
 
     const { state, saveCreds } = authState;
 
-    let version: [number, number, number];
-    try {
-      const wa = await fetchLatestWaWebVersion({});
-      const v = wa.version;
-      version = Array.isArray(v) && v.length >= 3 ? [v[0], v[1], v[2]] : [2, 3000, 1032884366];
-    } catch {
-      version = [2, 3000, 1032884366];
-    }
+    const selectedWebVersion = await resolveWaWebVersion(
+      config.whatsapp.webVersion,
+      () => fetchLatestWaWebVersion({}),
+    );
+    const version = selectedWebVersion.version;
+    log.whatsapp.child(name).info(
+      `wa_web_version source=${selectedWebVersion.source} version=${formatWaWebVersion(version)}`,
+    );
 
     const generalSettings = getInstanceGeneral(name);
     const proxyAgentResult = await resolveProxyAgent(name);
